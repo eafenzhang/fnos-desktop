@@ -1,0 +1,6 @@
+# vendored 上游资源必须保持字节精确（NOTICE 里记录了 SHA-256，EOL 转换会使其失效）
+.ref/** -text
+src-tauri/assets/** -text
+
+# 其余文本文件按仓库默认处理
+*.md text
