@@ -71,13 +71,13 @@ pub fn build_init_script(cfg: &Config) -> String {
         return String::new();
     }
 
-    let mut asset_map = serde_json::Map::new();
-    for (name, text) in assets().files {
-        // content-script.js 由本函数末尾直接执行，不需要经 getURL 暴露
-        asset_map.insert((*name).to_string(), json!(text));
-    }
     // `prefect_icon/*.png` 是二进制，不走这里的 `assets`：Task 13 按配置选择后用单独的
     // `binaryAssets` 键承载。此处刻意完全不输出该键 —— shim.js 把它默认成 `{}`（shim.js:9）。
+    // 同理，`content-script.js` 由本函数末尾直接执行，不需要经 getURL 暴露。
+    let mut asset_map = serde_json::Map::new();
+    for (name, text) in assets().files {
+        asset_map.insert((*name).to_string(), json!(text));
+    }
 
     let payload = json!({
         "meta": Meta {
@@ -98,7 +98,8 @@ pub fn build_init_script(cfg: &Config) -> String {
          {content}\n",
         ver = SHELL_VERSION,
         commit = MODS_COMMIT,
-        payload = serde_json::to_string(&payload).unwrap(),
+        payload = serde_json::to_string(&payload)
+            .expect("payload is a serde Value and always serializes"),
         shim = SHIM_JS,
         boot = BOOTSTRAP_JS,
         content = CONTENT_SCRIPT_JS,
@@ -110,10 +111,19 @@ mod tests {
     use super::*;
     use crate::config::Config;
 
+    /// 解析脚本开头的配置段：`window.__FNOS_SHELL__ = {…};` 里的那个对象。
+    fn payload_json(script: &str) -> serde_json::Value {
+        let start = script.find('{').expect("配置段起始 '{'");
+        let end = script.find("};\n").expect("配置段结束 '};'");
+        serde_json::from_str(&script[start..=end]).expect("配置段必须是合法 JSON")
+    }
+
     #[test]
     fn script_has_four_sections_in_order() {
         let s = build_init_script(&Config::default());
-        let i_cfg = s.find("__FNOS_SHELL__").expect("config section");
+        // 锚点必须带 ` = `：shim.js/bootstrap.js 里也有 `W.__FNOS_SHELL__`，只用
+        // `__FNOS_SHELL__` 会让载荷整体挪到 shim 之下时本测试仍然通过。
+        let i_cfg = s.find("window.__FNOS_SHELL__ = ").expect("config section");
         let i_shim = s.find("fnos-desktop-shell").expect("shim section");
         let i_boot = s.find("__FNOS_BOOTSTRAP__").expect("bootstrap section");
         let i_cs = s.find("hasFnOSSignature").expect("upstream content-script");
@@ -128,20 +138,52 @@ mod tests {
         let mut cfg = Config::default();
         cfg.mods.brand_color = "#123456".into();
         let s = build_init_script(&cfg);
-        for name in [
+        assert!(s.contains("\"brandColor\":\"#123456\""));
+
+        // 必须断言**解析后**的 `assets` 对象。对整串做 `s.contains(name)` 恒真：7 个 CSS 名已由
+        // bootstrap.js 的 CSS_FILES 列出（bootstrap.js:23），`mod.js` 出现在 shim.js/bootstrap.js，
+        // `content-script.js` 只出现在 shim.js 的注释里（shim.js:2）。所以清空 `assets()`、或把某个
+        // 键改名（`include_str!` 只校验路径，编译器从不校验键字符串）都不会让旧断言变红。
+        let v = payload_json(&s);
+        let assets = v
+            .get("assets")
+            .and_then(|a| a.as_object())
+            .expect("载荷必须有 assets 对象");
+
+        let mut got: Vec<&str> = assets.keys().map(String::as_str).collect();
+        got.sort_unstable();
+        let mut want = [
             "basic_mod.css",
-            "mod.js",
-            "content-script.js",
             "windows_titlebar_mod.css",
             "mac_titlebar_mod.css",
             "classic_launchpad_mod.css",
             "spotlight_launchpad_mod.css",
             "desktop_icon_mod.css",
             "lockscreen_mod.css",
-        ] {
-            assert!(s.contains(name), "载荷缺少资源键 {name}");
+            "mod.js",
+            "prefect_icon/icon-map.json",
+        ];
+        want.sort_unstable();
+        assert_eq!(
+            got.as_slice(),
+            want.as_slice(),
+            "assets 键集必须恰好是这 9 个文本资源"
+        );
+        assert_eq!(assets.len(), 9, "assets 条目数必须恰好是 9");
+        assert!(
+            !assets.contains_key("content-script.js"),
+            "content-script.js 是末尾直接执行的上游脚本，不是 assets 条目"
+        );
+        for key in assets.keys() {
+            assert!(
+                !key.ends_with(".png"),
+                "assets 只承载文本，不得含二进制键 {key}"
+            );
         }
-        assert!(s.contains("\"brandColor\":\"#123456\""));
+        assert!(
+            v.get("binaryAssets").is_none(),
+            "本阶段刻意不输出 binaryAssets（Task 13 才按配置承载 .png）"
+        );
     }
 
     #[test]
