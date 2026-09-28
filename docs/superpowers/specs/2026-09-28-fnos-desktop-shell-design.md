@@ -173,6 +173,11 @@ Tauri initialization_script（每次顶层文档导航、HTML 解析前）
   ② shim.js                      安装 chrome.* 兼容层
   ③ bootstrap.js                 惰性 getURL、链接自检与 adoptedStyleSheets 兜底、mod.js 兜底执行
   ④ content-script.js            上游原样代码（自带签名判定与全部注入逻辑）
+     **勘误（2026-09-28，T7+8 实测）**：不能裸拼。WebView2 的 document-start 阶段 `document.head` 与
+     `document.documentElement` **都还是 null**，上游首次 `appendChild` 会抛错且被静默吞掉 → 整条注入链
+     从不执行。`injector.rs` 因此把上游执行**包在**一个「等 `documentElement` 出现（MutationObserver +
+     DOMContentLoaded 兜底）再跑」的壳里 —— 上游文件本身仍未修改，但这是**新增的第 5 项包装改动**，
+     必须同步写进 `assets/fnos-mods/NOTICE`。
 ```
 
 - 配置变更：Rust 落盘 → `webview.eval` 派发 `storage.onChanged` → 上游增量分支生效（**不刷新页面**）
@@ -270,7 +275,7 @@ Tauri initialization_script（每次顶层文档导航、HTML 解析前）
 
 1. 设置窗 `invoke("set_config", {patch})`
 2. Rust 归一化 → 落盘 → `webview.eval` 派发 `storage.onChanged` 事件
-3. 上游增量分支（`cs:3039-3332`）就地生效；`injectEnabled` 翻转或 `homeUrl` 变更时才整页重载
+3. 上游增量分支（`cs:3039-3332`）就地生效。**勘误（2026-09-28，T7+8 实测）**：原文「`injectEnabled` 翻转或 `homeUrl` 变更时才整页重载」**不成立** —— 已注册的 `initialization_script` 在窗口存活期间无法替换，重载只会重跑旧载荷。正确做法是**销毁并按新载荷重建 main 窗口**（置 `recreating` 标志绕过 `CloseRequested` 的 `prevent_close()`+hide，待 `Destroyed` 事件中重建，因 tauri 只在此刻释放窗口 label 注册），随后 `sync_menus`。
 
 ---
 
@@ -328,7 +333,7 @@ Tauri initialization_script（每次顶层文档导航、HTML 解析前）
 | 命令 | 入参 | 返回 | 说明 |
 |---|---|---|---|
 | `get_config` | — | `{mods, local, shell, meta}` | `meta` 含版本、mods commit、WebView2 版本、配置路径 |
-| `set_config` | `{patch: Partial<Config>}` | `{config, applied, needsReload}` | 归一化 + 落盘 + 派发 `onChanged`；`needsReload=true` 仅在 `injectEnabled` 翻转或 `homeUrl` 变更时出现，此时调用方随后调用 `reload_main` |
+| `set_config` | `{patch: Partial<Config>}` | `{config, needsReload}` | 归一化 + 落盘 + 派发 `onChanged`；`needsReload=true` 仅在 `injectEnabled` 或 `homeUrl` 变更时出现，此时调用方随后调用 `reload_main`（该命令执行**窗口重建**，见 §6.6 勘误）。勘误：原文返回体还含 `applied`，无任何消费者，已删除 |
 | `reload_main` | `{url?}` | `()` | 重载/导航主窗口 |
 | `open_config_dir` | — | `()` | 打开配置目录 |
 | `reset_config` | `{scope}` | `{config}` | 重置为默认（含确认） |
