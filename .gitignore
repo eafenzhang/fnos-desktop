@@ -1,5 +1,6 @@
 # 构建产物
 target/
+src-tauri/target/
 _spike_tauri/src-tauri/target/
 
 # 依赖
