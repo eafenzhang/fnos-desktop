@@ -9,9 +9,25 @@
 * { box-sizing: border-box; }
 html, body { height: 100%; }
 body {
-  margin: 0; display: flex; background: var(--bg); color: var(--fg);
+  margin: 0; display: flex; flex-direction: column; background: var(--bg); color: var(--fg);
   font: 14px/1.6 "Microsoft YaHei", system-ui, sans-serif;
 }
+/* nav + main 的横向布局容器：状态条（Task 11）在它上方独占一行 */
+.shell { flex: 1 1 auto; display: flex; min-height: 0; }
+/* 顶部状态条（spec §12.3）：一行文字 + 最多两个动作按钮。四种态只改左侧色条与文字色，
+   高度不变——状态条不该因为状态变化而把下面的表单顶上顶下。 */
+.status {
+  flex: 0 0 auto; display: flex; align-items: center; gap: 10px;
+  padding: 8px 14px; border-bottom: 1px solid var(--line); border-left: 3px solid var(--dim);
+  background: #1f2023; color: #cfd2d6; font-size: 13px; min-height: 38px;
+  overflow-wrap: anywhere;
+}
+.status.ok { border-left-color: #30d158; color: #b8e6c4; }
+.status.warn { border-left-color: #ffd479; color: #f0dcae; }
+.status.error { border-left-color: #ff453a; color: #ff9a94; }
+.status.pending { border-left-color: var(--dim); color: var(--dim); }
+.status button { flex: 0 0 auto; padding: 3px 10px; font-size: 12px; }
+.status button[disabled] { opacity: .5; cursor: default; }
 nav { width: 190px; flex: 0 0 auto; padding: 14px 8px; background: var(--nav); overflow: auto; }
 .nav-item {
   display: block; width: 100%; text-align: left; padding: 8px 10px; margin: 0 0 2px;
@@ -41,6 +57,8 @@ h2.pane-title { font-size: 17px; margin: 0 0 14px; }
 .field input.error { outline: 1px solid #ff453a; border-color: #ff453a; }
 .field textarea { width: 100%; min-width: 0; font-family: Consolas, monospace; resize: vertical; }
 .hint { flex-basis: 100%; margin: 0; color: var(--dim); font-size: 12px; }
+/* 关于页的 WebView2 低版本提示（spec §12.3 的 corner-shape 行） */
+.hint.warn { flex-basis: auto; padding: 4px 0 10px; color: #f0dcae; }
 .color-box { display: flex; align-items: center; gap: 10px; }
 .normalized {
   background: var(--field); border: 1px solid var(--line); border-radius: 6px;

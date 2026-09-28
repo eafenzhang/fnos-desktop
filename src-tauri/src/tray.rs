@@ -33,10 +33,16 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     let inject = CheckMenuItem::with_id(app, "inject", "注入 mods", true, true, None::<&str>)?;
     let open_nas = MenuItem::with_id(app, "open_nas", "打开 NAS", true, None::<&str>)?;
     let toggle = MenuItem::with_id(app, "toggle", "显示 / 隐藏主窗口", true, None::<&str>)?;
+    // Task 11（spec §12.3：「主窗口加载失败/离线 → 内置错误页 + 重试」）：错误页本身没有
+    // 任何 IPC 授权，重试入口必须由宿主提供——这里是其中之一（另一个是设置窗状态条的「重试」）。
+    let reload = MenuItem::with_id(app, "reload", "重新加载主窗口", true, None::<&str>)?;
     let settings = MenuItem::with_id(app, "settings", "系统设置", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
     let sep = PredefinedMenuItem::separator(app)?;
-    let menu = Menu::with_items(app, &[&inject, &open_nas, &toggle, &settings, &sep, &quit])?;
+    let menu = Menu::with_items(
+        app,
+        &[&inject, &open_nas, &toggle, &reload, &settings, &sep, &quit],
+    )?;
 
     let inject_for_handler = inject.clone();
     TrayIconBuilder::with_id(TRAY_ID)
@@ -51,6 +57,7 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
             }
             "open_nas" => crate::commands::open_nas(app),
             "toggle" => toggle_main(app),
+            "reload" => crate::commands::reload_main_window(app),
             "settings" => crate::commands::open_settings(app),
             "quit" => {
                 crate::commands::save_window_geom(app);

@@ -363,6 +363,21 @@ fn bak_path(path: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
+/// [`Config::load_with_report`] 的结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LoadReport {
+    /// 本次加载是否因**文件内容不可用**而回落默认值，且损坏原件已留成 `<path>.bak`
+    /// （`.bak` 的写入结果参与判定：写不成功就不声称「已保留」）。
+    pub recovered_from_backup: bool,
+}
+
+/// 把损坏原文写成 `.bak`，并按「是否真的写成功」给出报告（Task 11 的状态条据此回显）。
+fn write_backup(path: &Path, text: &str) -> LoadReport {
+    LoadReport {
+        recovered_from_backup: std::fs::write(bak_path(path), text).is_ok(),
+    }
+}
+
 /// bool 强转：`true`/`false` 原样；字符串 `"true"`/`"1"`（忽略大小写/空白）→ true，
 /// `"false"`/`"0"` → false；其余（含 `null`）→ None（调用方删除该键）。
 fn as_bool(v: &Value) -> Option<bool> {
@@ -674,21 +689,38 @@ impl Config {
     ///
     /// 顺序：读字节 → UTF-8 解码（剥 BOM）→ 解析 `Value` → 按字段净化 → `from_value` → `normalize`。
     /// 读/解码错误把原件拷成 `<path>.bak`；语法损坏把文本写进 `<path>.bak`，两者都回落默认值。
-    pub fn load(path: &Path) -> Config {
+    ///
+    /// `recovered_from_backup` 的判据刻意收得很紧：**文件内容不可用 → 回落默认值，且损坏
+    /// 原件确实被留成了 `<path>.bak`** 才算。于是：
+    ///
+    /// - 文件不存在（全新安装）→ `false`（没有任何东西可恢复）；
+    /// - 逐字段类型损坏但整体可解析（走 `sanitize_config_value`）→ `false`（配置没丢）；
+    /// - `.bak` 没写成功（磁盘满 / 无权限）→ `false`：宁可不提示，也不谎称「已保留 .bak」。
+    pub fn load_with_report(path: &Path) -> (Config, LoadReport) {
         let bytes = match std::fs::read(path) {
             Ok(b) => b,
             Err(_) => {
                 // 读失败（含文件不存在）：尽力拷原件留证，再回落默认
-                let _ = std::fs::copy(path, bak_path(path));
-                return Config::default();
+                let copied = std::fs::copy(path, bak_path(path)).is_ok();
+                return (
+                    Config::default(),
+                    LoadReport {
+                        recovered_from_backup: copied,
+                    },
+                );
             }
         };
         let mut text = match String::from_utf8(bytes) {
             Ok(t) => t,
             Err(_) => {
                 // 非 UTF-8（UTF-16 / 二进制）：拷原件留证，否则损坏证据会被丢掉
-                let _ = std::fs::copy(path, bak_path(path));
-                return Config::default();
+                let copied = std::fs::copy(path, bak_path(path)).is_ok();
+                return (
+                    Config::default(),
+                    LoadReport {
+                        recovered_from_backup: copied,
+                    },
+                );
             }
         };
         // Notepad 默认会写 UTF-8 BOM；不剥掉的话 serde_json 直接报错 → 整份配置被丢弃
@@ -698,26 +730,19 @@ impl Config {
 
         let value: Value = match serde_json::from_str(&text) {
             Ok(v) => v,
-            Err(_) => {
-                let _ = std::fs::write(bak_path(path), &text);
-                return Config::default();
-            }
+            Err(_) => return (Config::default(), write_backup(path, &text)),
         };
         if !value.is_object() {
             // 顶层不是对象（如 `[1,2]` / `"x"`）：没有可净化的字段，按损坏留证
-            let _ = std::fs::write(bak_path(path), &text);
-            return Config::default();
+            return (Config::default(), write_backup(path, &text));
         }
 
         match serde_json::from_value::<Config>(sanitize_config_value(value)) {
             Ok(mut c) => {
                 c.normalize();
-                c
+                (c, LoadReport::default())
             }
-            Err(_) => {
-                let _ = std::fs::write(bak_path(path), &text);
-                Config::default()
-            }
+            Err(_) => (Config::default(), write_backup(path, &text)),
         }
     }
 
@@ -741,6 +766,12 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 测试内的简写：绝大多数断言只关心**配置本身**，不关心回退报告；报告另有专门用例
+    ///（`load_reports_recovery_from_backup`）。生产代码走 `Config::load_with_report`。
+    fn load(path: &Path) -> Config {
+        Config::load_with_report(path).0
+    }
 
     #[test]
     fn defaults_match_upstream() {
@@ -912,13 +943,13 @@ mod tests {
             "磁盘上的值必须与生效值逐字节相同：{text}"
         );
         assert!(!text.contains("#c4b4a1"), "二次夹取的值不得落盘：{text}");
-        assert_eq!(Config::load(&p).mods.brand_color, applied);
+        assert_eq!(load(&p).mods.brand_color, applied);
 
         // 反复 save → load 不再漂移（修前第二次读回来就是 #c4b4a1）
         for _ in 0..3 {
-            Config::load(&p).save(&p).unwrap();
+            load(&p).save(&p).unwrap();
         }
-        assert_eq!(Config::load(&p).mods.brand_color, applied);
+        assert_eq!(load(&p).mods.brand_color, applied);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -935,17 +966,17 @@ mod tests {
         )
         .unwrap();
 
-        let first = Config::load(&p);
+        let first = load(&p);
         assert_eq!(first.mods.brand_color, "#c4b4a2");
         first.save(&p).unwrap();
         let disk = std::fs::read_to_string(&p).unwrap();
         assert!(disk.contains("\"brandColor\": \"#c4b4a2\""), "{disk}");
         assert!(!disk.contains("#c4b4a1"), "{disk}");
 
-        let second = Config::load(&p);
+        let second = load(&p);
         assert_eq!(second.mods.brand_color, "#c4b4a2");
         second.save(&p).unwrap();
-        assert_eq!(Config::load(&p).mods.brand_color, "#c4b4a2");
+        assert_eq!(load(&p).mods.brand_color, "#c4b4a2");
 
         // 已经归一化的手写值（区间内）也必须原样落盘
         std::fs::write(
@@ -953,7 +984,7 @@ mod tests {
             r##"{"schemaVersion":1,"mods":{"brandColor":"#3366CC"}}"##,
         )
         .unwrap();
-        let upper = Config::load(&p);
+        let upper = load(&p);
         assert_eq!(upper.mods.brand_color, "#3366cc");
         upper.save(&p).unwrap();
         assert!(std::fs::read_to_string(&p)
@@ -999,7 +1030,7 @@ mod tests {
         let mut c = Config::default();
         c.mods.brand_color = "#336699".into();
         c.save(&p).unwrap();
-        let back = Config::load(&p);
+        let back = load(&p);
         assert_eq!(back.mods.brand_color, "#336699");
         assert_eq!(back.schema_version, SCHEMA_VERSION);
 
@@ -1007,7 +1038,7 @@ mod tests {
         // 注意：load 必经 §6.5 归一化，深色 #010203（L≈0.8%）会被明度夹到 30% → #264d73，
         // 故此处断言「文件里的值确被读入并归一化」（≠ 默认色），而非原样保留。
         std::fs::write(&p, br##"{"mods":{"brandColor":"#010203"}}"##).unwrap();
-        let migrated = Config::load(&p);
+        let migrated = load(&p);
         assert_eq!(migrated.mods.brand_color, "#264d73");
         assert_ne!(migrated.mods.brand_color, DEFAULT_BRAND_COLOR);
         assert_eq!(migrated.schema_version, SCHEMA_VERSION);
@@ -1016,7 +1047,7 @@ mod tests {
         // 损坏 JSON：回退默认 + 生成 .bak（内容必须等于写入的损坏文本）
         let corrupt: &[u8] = b"{not json";
         std::fs::write(&p, corrupt).unwrap();
-        let broken = Config::load(&p);
+        let broken = load(&p);
         assert_eq!(broken.mods.brand_color, "#0066ff");
         let bak = dir.join("config.json.bak");
         assert!(bak.exists());
@@ -1103,6 +1134,60 @@ mod tests {
             lgot,
             vec!["customCssCode", "customJsCode", "loginWallpaperFileName"]
         );
+    }
+
+    /// Task 11（spec §12.3「config.json 损坏 → 回退默认 + 保留 .bak + 设置窗提示」）：
+    /// 「回退过」这件事必须能**被设置窗读到**，而不是只在磁盘上留个 `.bak` 让人自己发现。
+    ///
+    /// 判据刻意收得很紧：只有「文件内容不可用 → 回落默认值，且原件确实被留成了 `.bak`」
+    /// 才算恢复。文件不存在（全新安装）、逐字段类型损坏但整体可解析，都**不算**——
+    /// 状态条不能虚报一次「你的配置损坏了」。
+    #[test]
+    fn load_reports_recovery_from_backup() {
+        let dir = temp_dir("recovery-report");
+        let p = dir.join("config.json");
+        let bak = dir.join("config.json.bak");
+
+        // 1) 全新目录：文件不存在 → 默认值，但这不是「从备份恢复」
+        assert!(
+            !Config::load_with_report(&p).1.recovered_from_backup,
+            "文件不存在（全新安装）不得报告为已恢复"
+        );
+
+        // 2) 合法配置 → 不报告
+        let mut ok = Config::default();
+        ok.mods.brand_color = "#336699".into();
+        ok.save(&p).unwrap();
+        assert!(!Config::load_with_report(&p).1.recovered_from_backup);
+
+        // 3) 非法 JSON → 默认值 + 报告 + `.bak` 里是损坏原文
+        let broken: &[u8] = b"{not json";
+        std::fs::write(&p, broken).unwrap();
+        let _ = std::fs::remove_file(&bak);
+        let (cfg, report) = Config::load_with_report(&p);
+        assert_eq!(cfg.mods.brand_color, DEFAULT_BRAND_COLOR);
+        assert!(report.recovered_from_backup, "非法 JSON 必须报告已回退");
+        assert_eq!(std::fs::read(&bak).unwrap(), broken, "损坏原文必须留证");
+
+        // 4) 顶层不是对象（`[1,2]`）同样算损坏
+        std::fs::write(&p, b"[1,2]").unwrap();
+        assert!(Config::load_with_report(&p).1.recovered_from_backup);
+
+        // 5) 非 UTF-8（UTF-16 / 二进制）：拷原件留证 + 报告
+        std::fs::write(&p, [0xff, 0xfe, 0x41, 0x00]).unwrap();
+        assert!(Config::load_with_report(&p).1.recovered_from_backup);
+
+        // 6) 逐字段类型损坏但整体可解析 → 走 sanitize，不算整份回退（不虚报）
+        std::fs::write(&p, br#"{"mods":{"brandColor":42}}"#).unwrap();
+        assert!(
+            !Config::load_with_report(&p).1.recovered_from_backup,
+            "逐字段净化成功时不得报告为已回退"
+        );
+
+        // 7) `load()` 的旧签名仍然可用（报告被丢弃），两侧必须给出同一份配置
+        assert_eq!(load(&p), Config::load_with_report(&p).0);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -1212,14 +1297,14 @@ mod tests {
             br##"{"shell":{"homeUrl":"javascript:alert(1)","injectEnabled":true}}"##,
         )
         .unwrap();
-        let c = Config::load(&p);
+        let c = load(&p);
         assert_eq!(c.shell.home_url, DEFAULT_HOME_URL);
         // 同文件里的其它键不受牵连
         assert!(c.shell.inject_enabled);
 
         // 非字符串类型（对象/数组）走 `sanitize_string_field` 删除 → 默认值，同样不是 panic
         std::fs::write(&p, br#"{"shell":{"homeUrl":{"a":1}}}"#).unwrap();
-        assert_eq!(Config::load(&p).shell.home_url, DEFAULT_HOME_URL);
+        assert_eq!(load(&p).shell.home_url, DEFAULT_HOME_URL);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1298,7 +1383,7 @@ mod tests {
             br#"{"shell":{"window":{"w":0,"h":0,"x":null,"y":null}}}"#,
         )
         .unwrap();
-        let c = Config::load(&p);
+        let c = load(&p);
         assert_eq!((c.shell.window.w, c.shell.window.h), (1200.0, 820.0));
         // 同文件里的其它键不受牵连
         assert_eq!(c.shell.home_url, DEFAULT_HOME_URL);
@@ -1309,7 +1394,7 @@ mod tests {
             br#"{"shell":{"window":{"w":-5,"h":100000,"x":1,"y":2}}}"#,
         )
         .unwrap();
-        let c = Config::load(&p);
+        let c = load(&p);
         assert_eq!(c.shell.window.w, 1200.0);
         assert_eq!(c.shell.window.h, MAX_WINDOW_H);
         assert_eq!((c.shell.window.x, c.shell.window.y), (Some(1.0), Some(2.0)));
@@ -1323,7 +1408,7 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
         assert_eq!(v["shell"]["window"]["w"], 1200.0);
         assert_eq!(v["shell"]["window"]["h"], 820.0);
-        assert_eq!(Config::load(&p).shell.window.h, 820.0);
+        assert_eq!(load(&p).shell.window.h, 820.0);
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1352,7 +1437,7 @@ mod tests {
 
         let text = std::fs::read_to_string(&p).unwrap();
         assert!(!text.contains("javascript:alert(1)"), "非法 homeUrl 落盘了");
-        let back = Config::load(&p);
+        let back = load(&p);
         assert_eq!(back.shell.home_url, DEFAULT_HOME_URL);
         assert_eq!(back.shell.nas_target(), None);
         // 「保留原文但禁用」：非法 nasUrl 仍在文件里（用户可见可改），只是不被采用
@@ -1391,7 +1476,7 @@ mod tests {
             }"##,
         )
         .unwrap();
-        let c = Config::load(&p);
+        let c = load(&p);
 
         // 整份配置必须仍在（这些值都不是默认值）——单个坏类型键不得触发 wholesale reset
         assert_eq!(c.mods.font_family, "My Font");
@@ -1447,7 +1532,7 @@ mod tests {
                 ),
             )
             .unwrap();
-            let c = Config::load(&p);
+            let c = load(&p);
             assert_eq!(c.mods.desktop_icon_per_column, want, "raw={raw}");
             // 单个坏类型键不得丢掉同文件里的其它键
             assert_eq!(c.shell.home_url, "http://keep.local/", "raw={raw}");
@@ -1459,7 +1544,7 @@ mod tests {
             br#"{"mods":5,"shell":{"homeUrl":"http://keep.local/"}}"#,
         )
         .unwrap();
-        let c = Config::load(&p);
+        let c = load(&p);
         assert_eq!(c.mods.desktop_icon_per_column, 8);
         assert_eq!(c.mods.font_face_name, "FnOSCustomFont");
         assert_eq!(c.shell.home_url, "http://keep.local/");
@@ -1477,7 +1562,7 @@ mod tests {
         );
         std::fs::write(&p, &bytes).unwrap();
 
-        let c = Config::load(&p);
+        let c = load(&p);
         assert_eq!(c.mods.font_family, "BOM 字体");
         assert_eq!(c.mods.brand_color, "#336699");
         assert_eq!(c.schema_version, SCHEMA_VERSION);
@@ -1494,7 +1579,7 @@ mod tests {
         let corrupt: &[u8] = &[0xFF, 0xFE, 0x41, 0x00]; // UTF-16LE BOM + 'A'：非法 UTF-8
         std::fs::write(&p, corrupt).unwrap();
 
-        let c = Config::load(&p);
+        let c = load(&p);
         assert_eq!(c.mods.brand_color, DEFAULT_BRAND_COLOR); // 回落默认
         assert_eq!(c.mods.desktop_icon_per_column, 8);
         let bak = dir.join("config.json.bak");
@@ -1503,7 +1588,7 @@ mod tests {
 
         // 文件不存在：回落默认，且无可留证内容 → 不产生 .bak
         let missing = dir.join("nope.json");
-        let d = Config::load(&missing);
+        let d = load(&missing);
         assert_eq!(d.mods.brand_color, DEFAULT_BRAND_COLOR);
         assert!(!dir.join("nope.json.bak").exists());
         std::fs::remove_dir_all(&dir).ok();
@@ -1522,7 +1607,7 @@ mod tests {
                 ),
             )
             .unwrap();
-            let c = Config::load(&p);
+            let c = load(&p);
             assert_eq!(c.mods.desktop_icon_per_column, want, "raw={raw}");
             assert_eq!(c.mods.titlebar_style, "mac");
             assert_eq!(c.mods.launchpad_style, "spotlight");
@@ -1584,7 +1669,7 @@ mod tests {
         let text = std::fs::read_to_string(&p).unwrap();
         let v: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(v["mods"]["fontFamily"], "second");
-        assert_eq!(Config::load(&p).mods.font_family, "second");
+        assert_eq!(load(&p).mods.font_family, "second");
         assert!(!dir.join("config.json.tmp").exists());
         assert!(!dir.join("config.json.bak").exists());
         std::fs::remove_dir_all(&dir).ok();

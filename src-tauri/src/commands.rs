@@ -5,10 +5,71 @@ use serde::Serialize;
 use serde_json::Value;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use std::time::Duration;
+use tauri::webview::PageLoadEvent;
 use tauri::{AppHandle, Manager, Runtime, State, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 
 /// 设置窗 label（spec §7）：与 `capabilities/default.json` 的 `"windows": ["settings"]` 一致。
 pub const SETTINGS_WINDOW: &str = "settings";
+
+/// 内置错误页的资产名（相对 `tauri.conf.json` 的 `frontendDist` = `../ui/settings`）。
+///
+/// brief 写的是 `src-tauri/src/error_page.html`，但 `WebviewUrl::App` 只能解析**应用资产**，
+/// 编译进二进制旁边的 `.html` 根本不会被 App 协议服务；同理 `ui/error.html`（brief 里
+/// 「inside the configured frontendDist」的另一种读法）也不在 `ui/settings/` 之下，
+/// 会 404。故落在 `ui/settings/error.html`——它同时满足「是 ui 下的页面」（不是 Rust 源码
+/// 目录里的死文件）与「在 frontendDist 内」（能被服务）。
+pub const ERROR_PAGE_ASSET: &str = "error.html";
+
+/// 主窗口一次加载的看门狗超时（spec §12.3：`on_page_load` 迟迟不来 → 错误页）。
+const LOAD_TIMEOUT_SECS: u64 = 20;
+
+/// 错误页的自动重试退避：15s → 30s → 60s → 120s，第 5 次失败起不再自动重试。
+///
+/// 是**唯一**的退避事实来源：错误页正文里的「退避：15s → 30s → 60s → 120s」也由它生成
+/// （`ErrorInfo::retry_schedule`），页面不写死这份计划，免得两处漂移。
+const AUTO_RETRY_DELAYS_MS: [u64; 4] = [15_000, 30_000, 60_000, 120_000];
+
+/// 页面自检探针回传用的 `document.title` 前缀。
+///
+/// **必须是可打印 ASCII**：WebView2 在把 `document.title` 送到宿主之前会处理掉控制字符
+/// （实测：`\u0001FNOSPROBE\u0001…` 到达宿主时控制字符已经不见，`strip_prefix` 静默失配，
+/// 失败被当成了一个普通标题）。改用「真实网页标题不会以它开头」的可打印哨兵。
+pub const PROBE_TITLE_PREFIX: &str = "FNOSPROBE:";
+
+/// 注入到主窗口页面里的自检探针：回答「你是不是 Chromium 的网络错误页」。
+///
+/// 为什么需要它（Task 11 的实测结论，见报告）：wry 把 `PageLoadEvent::Finished` 直接挂在
+/// WebView2 的 `NavigationCompleted` 上，却**丢掉了 `IsSuccess`**
+/// （`wry-0.57.0/src/webview2/mod.rs:726-737` 只取 URL），所以「连接被拒绝 / 端口被拦」这类
+/// **快速失败**同样会发 `Finished`；而 `PageLoadPayload::url()` 用的是
+/// `ICoreWebView2::Source`，导航失败后它**仍然是请求的那个地址**
+/// （实测：`http://127.0.0.1:1/` 失败后上报的就是它自己，而不是 `chrome-error://`）。
+/// 所以「靠 URL 认错误页」只是一条廉价短路，真正干活的判定必须来自页面内部。
+///
+/// 而 20s 看门狗（spec 的「Finished 迟迟不来」）只能抓住「卡住不返回」，抓不住「立刻失败」。
+/// 于是补一条页面自检：Chromium 网络错误页有稳定的 `#main-frame-error` 或
+/// `<body class="neterror">`，把结论塞进 `document.title`，宿主再通过已有的
+/// `on_document_title_changed` 通道读回来（这是主窗口唯一一条「页面 → 宿主」的既有通路，
+/// 且不需要给主窗口任何 IPC 授权）。
+///
+/// 判定为「正常页面」时把标题还原（延迟 800ms 是为了让 WebView2 至少上报过一次——
+/// 同一帧内两次改动会被合并成最后一次）；判定为错误页时**不还原**：宿主会拦下这个标题
+/// 并换成自己的窗口标题，页面本身也没有值得保留的标题。
+pub const LOAD_PROBE_JS: &str = concat!(
+    "(function(){try{var d=document,ok=false;",
+    "try{ok=!!d.getElementById('main-frame-error')",
+    "||!!(d.body&&/(^|\\s)neterror(\\s|$)/.test(d.body.className||''));}catch(e){}",
+    "var m='';try{var el=d.getElementById('main-message')||d.getElementById('main-content');",
+    "if(el)m=String(el.textContent||'');}catch(e){}",
+    "if(!m){try{m=String((d.body&&d.body.innerText)||'');}catch(e){}}",
+    "m=m.replace(/\\s+/g,' ').slice(0,160);",
+    "var t0=String(d.title||'');",
+    "d.title='FNOSPROBE:'+JSON.stringify({err:ok,detail:m});",
+    "if(!ok)setTimeout(function(){try{",
+    "if(String(d.title).indexOf('FNOSPROBE:')===0)d.title=t0;}catch(e){}},800);",
+    "}catch(e){}})();"
+);
 
 pub struct AppState {
     pub config: Mutex<Config>,
@@ -23,6 +84,178 @@ pub struct AppState {
     /// 重建前主窗口的显示态，重建后原样恢复（Item 3）。整组一次性读取，
     /// 避免三个独立原子量在中途被改得不一致。
     pub recreate_display: Mutex<DisplayState>,
+    /// 主窗口加载观测（Task 11：状态条 + 错误页）。
+    pub load: Mutex<LoadState>,
+    /// 下一次重建要建成**内置错误页**（`Some` = 错误页 + 空初始化脚本）。
+    ///
+    /// 与 `recreate_url` 同一套一次性语义：`rebuild_main` 取走即清。
+    pub recreate_error: Mutex<Option<ErrorInfo>>,
+    /// 本次会话是否从 `config.json.bak` 恢复过（`get_config` 的 `meta.recoveredFromBackup`）。
+    /// 是**会话级**状态，不随 `set_config` / `reset_config` 复位——用户要的是「这次启动发生过
+    /// 配置损坏」这个事实，而不是「当前这份配置是否完好」。
+    pub recovered_from_backup: AtomicBool,
+}
+
+/// 主窗口一次加载所处的阶段（Task 11）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadPhase {
+    /// 已建窗，还没收到 `PageLoadEvent::Finished`（看门狗在跑）。
+    Loading,
+    /// 收到了 `Finished`，且没有任何失败信号。
+    Loaded,
+    /// 已判定失败（错误页就是这一态的表现）。
+    Failed,
+}
+
+/// 主窗口当前这一次加载的观测状态。
+///
+/// 一次「加载」= 一次建窗（含重建 / 自动重试）。`generation` 每次建窗自增，任何在飞的
+/// 看门狗线程与页面探针都用它做归属校验：旧世代的结果一律丢弃，于是重建、自动重试与
+/// 迟到的页面事件不会互相污染，也不会留下会误触发上一轮的定时器（线程睡满即自行退出，
+/// 不是常驻计时器）。
+#[derive(Debug, Clone)]
+pub struct LoadState {
+    pub generation: u64,
+    /// 本次加载的目标 URL（错误页期间仍是**失败的那个地址**，而不是 error.html）。
+    pub url: String,
+    pub phase: LoadPhase,
+    pub last_error: Option<String>,
+    /// **连续**失败次数（下一次成功加载后的再下一次建窗才清零，见 `begin_load`）：
+    /// 决定自动重试的退避档位与「重试已用尽」。
+    pub failures: u32,
+    /// 当前主窗口显示的是内置错误页。
+    pub error_page: bool,
+    /// 已发出页面自检探针、正在等它回话的世代（`None` = 没有在飞的探针）。
+    pub probe_generation: Option<u64>,
+    /// 错误页上计划中的自动重试秒数（`None` = 没有计划中的重试）。
+    pub next_retry_seconds: Option<u64>,
+}
+
+impl Default for LoadState {
+    fn default() -> Self {
+        Self {
+            generation: 0,
+            url: String::new(),
+            // 还没有建过窗：不是「正在加载」，也不该被当成失败
+            phase: LoadPhase::Loaded,
+            last_error: None,
+            failures: 0,
+            error_page: false,
+            probe_generation: None,
+            next_retry_seconds: None,
+        }
+    }
+}
+
+/// 交给错误页渲染的一份失败说明（`__FNOS_SET_ERROR__` 的入参）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ErrorInfo {
+    /// 失败的地址（不是 error.html 自己）。
+    pub url: String,
+    pub reason: String,
+    pub failures: u32,
+    pub next_retry_seconds: Option<u64>,
+    /// 自动重试已用尽（错误页据此改文案，不再显示倒计时）。
+    pub retry_stopped: bool,
+    /// 退避计划（秒），供页面写出「退避：15s → 30s → 60s → 120s」。
+    pub retry_schedule: Vec<u64>,
+}
+
+/// 「加载失败」的原因判定：只有 WebView2 自己的错误页 URL 才算。
+///
+/// wry 丢掉了 `IsSuccess`（见 [`LOAD_PROBE_JS`] 的注释），能拿到的最硬信号就是导航后的
+/// 文档 URL：失败的导航会落到 `chrome-error://chromewebdata/`。
+fn load_failure_reason(url: &str) -> Option<String> {
+    if url.starts_with("chrome-error://") {
+        return Some("WebView2 无法打开该地址（网络错误或地址不可达）".to_string());
+    }
+    None
+}
+
+/// 页面自检探针的回话 → 失败原因；`None` = 判定为「确实加载成功了」。
+///
+/// 只认明确的 `err: true`：解析不出来（页面把标题换成了别的东西 / 探针被 CSP 拦）时
+/// 一律**不**降级为失败——宁可漏报，也不要把正常页面误判成加载失败。
+fn probe_verdict(payload: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(payload).ok()?;
+    if value.get("err").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    let detail = value
+        .get("detail")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    Some(if detail.is_empty() {
+        "WebView2 报告该地址无法访问（网络错误）".to_string()
+    } else {
+        format!("WebView2 报告：{detail}")
+    })
+}
+
+/// origin 的 host 是否属于飞牛（`fnos.net` 或 `*.fnos.net`）。
+///
+/// 上游的签名正则要求前导点（`(\.fnos\.net)$`，`content-script.js:2746-2779`），所以
+/// **根域官网永远不注入**；这里判「是不是飞牛的域名」，注入与否由 [`is_recognized`] 与
+/// 上游判定分层处理（状态条据此区分「官网」与「WebUI」两种说法）。
+fn is_fnos_net_origin(origin: &str) -> bool {
+    let Ok(url) = tauri::Url::parse(origin) else {
+        return false;
+    };
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let host = host.to_ascii_lowercase();
+    host == "fnos.net" || host.ends_with(".fnos.net")
+}
+
+/// 是否就是**官网根域**（`https://fnos.net`）：它与 `*.fnos.net` 的 WebUI 是两种状态。
+fn is_official_home_origin(origin: &str) -> bool {
+    let Ok(url) = tauri::Url::parse(origin) else {
+        return false;
+    };
+    url.host_str()
+        .is_some_and(|host| host.eq_ignore_ascii_case("fnos.net"))
+}
+
+/// 当前页算不算「检测到了 fnOS WebUI」（spec §12.3 的状态条判据）。
+///
+/// 三个来源：官网根域 ∪ `mods.enabledOrigins` ∪ `shell.nasUrl` 的 origin。后者在
+/// `Config::normalize` 里已经并入白名单，这里再查一次是为了「手工搭出来、没跑过 normalize
+/// 的 Config」（单测）也给出同一个答案——两处判据同源，不会出现「设置窗说未检测到、
+/// 但注入确实生效」。
+///
+/// 白名单比较**大小写不敏感**：上游按 `location.origin` 严格比较（cs:2948），而
+/// `normalize()` 落盘时已统一小写；这里再宽松一次是为了内存里被手改过的那份也不误判。
+fn is_recognized(cfg: &Config, origin: Option<&str>) -> bool {
+    let Some(origin) = origin else {
+        return false;
+    };
+    if is_fnos_net_origin(origin) {
+        return true;
+    }
+    if cfg
+        .mods
+        .enabled_origins
+        .iter()
+        .any(|o| o.eq_ignore_ascii_case(origin))
+    {
+        return true;
+    }
+    cfg.shell
+        .nas_url_parsed()
+        .map(|u| u.origin().ascii_serialization())
+        .as_deref()
+        == Some(origin)
+}
+
+/// 第 `failures` 次连续失败之后该等多久再自动重试；`None` = 不再自动重试。
+fn auto_retry_delay_ms(failures: u32) -> Option<u64> {
+    if failures == 0 {
+        return None;
+    }
+    AUTO_RETRY_DELAYS_MS.get(failures as usize - 1).copied()
 }
 
 /// 重建时必须原样保留的窗口显示态（Item 3）。
@@ -77,6 +310,9 @@ pub struct Meta {
     pub mods_version: String,
     pub config_path: String,
     pub webview_version: Option<String>,
+    /// 本次会话是否从 `config.json.bak` 恢复过（Task 11 / spec §12.3 的「配置损坏」一行）。
+    /// 设置窗状态条据此**回显**，而不是让一次静默回退只留在磁盘上的 `.bak` 里。
+    pub recovered_from_backup: bool,
 }
 
 #[derive(Serialize)]
@@ -96,25 +332,40 @@ pub struct SetResult {
     pub needs_reload: bool,
 }
 
-pub fn load_config<R: Runtime>(app: &AppHandle<R>) -> Config {
+pub fn load_config<R: Runtime>(app: &AppHandle<R>) -> (Config, bool) {
     let path = Config::config_path();
-    let cfg = Config::load(&path);
+    let (cfg, report) = Config::load_with_report(&path);
     let _ = cfg.save(&path);
+    // 首启的装配顺序是「先读配置、再 `manage(AppState)`」，所以这一刻通常还没有 state，
+    // 回退标记必须**返回给调用方**并由 `save_and_install_state` 带进去；`try_state` 分支
+    // 是给将来「运行期重新装载配置」留的对称路径。
     if let Some(state) = app.try_state::<AppState>() {
         *state.config.lock().unwrap() = cfg.clone();
+        state
+            .recovered_from_backup
+            .store(report.recovered_from_backup, Ordering::SeqCst);
     }
-    cfg
+    (cfg, report.recovered_from_backup)
 }
 
 fn current<R: Runtime>(app: &AppHandle<R>) -> Config {
     app.state::<AppState>().config.lock().unwrap().clone()
 }
 
+/// `config_view` 的 `meta.recoveredFromBackup` 取值处（会话级状态，不在 `Config` 里）。
+fn recovered_from_backup<R: Runtime>(app: &AppHandle<R>) -> bool {
+    app.state::<AppState>()
+        .recovered_from_backup
+        .load(Ordering::SeqCst)
+}
+
 /// 组装 IPC 返回的配置视图。
 ///
 /// 刻意**不**接收 `AppHandle`：`config_view` 用不到 app 句柄（`tauri::webview_version()`
 /// 是不需要 app 的自由函数），带上它只会产生 `unused variable: app` 警告（R18 要求 0 警告）。
-fn config_view(cfg: &Config) -> ConfigView {
+/// 唯一的例外是 `recovered_from_backup`——它不是配置字段，由唯一持有 `AppHandle` 的调用方
+/// 读出来后传进来。
+fn config_view(cfg: &Config, recovered_from_backup: bool) -> ConfigView {
     ConfigView {
         schema_version: cfg.schema_version,
         mods: cfg.mods.clone(),
@@ -132,6 +383,7 @@ fn config_view(cfg: &Config) -> ConfigView {
             // `pub fn webview_version() -> Result<String>`），取不到时为 `None`
             //（例如 WebView2 运行时缺失），不 panic。
             webview_version: tauri::webview_version().ok(),
+            recovered_from_backup,
         },
     }
 }
@@ -139,7 +391,8 @@ fn config_view(cfg: &Config) -> ConfigView {
 #[tauri::command]
 pub fn get_config<R: Runtime>(app: AppHandle<R>) -> ConfigView {
     let cfg = current(&app);
-    config_view(&cfg)
+    let recovered = recovered_from_backup(&app);
+    config_view(&cfg, recovered)
 }
 
 #[tauri::command]
@@ -173,7 +426,7 @@ pub fn set_config<R: Runtime>(
         eprintln!("[fnos] 托盘同步失败: {e}");
     }
     Ok(SetResult {
-        config: config_view(&cfg),
+        config: config_view(&cfg, recovered_from_backup(&app)),
         needs_reload,
     })
 }
@@ -238,6 +491,9 @@ fn build_main_window_with<R: Runtime>(
     cfg: &Config,
     start_visible: bool,
 ) -> tauri::Result<WebviewWindow<R>> {
+    // 建窗即登记一次「加载开始」：`generation` 会被下面的回调捕获，用于丢弃旧世代的
+    // 迟到事件（重建 / 自动重试期间尤其重要）。
+    let generation = begin_load(app, url.as_str());
     let mut builder = WebviewWindowBuilder::new(app, MAIN_WINDOW, WebviewUrl::External(url))
         .title("fnOS")
         // 不变式（Item 2）：`cfg.shell.window` 已经由 `Config::normalize`
@@ -249,13 +505,17 @@ fn build_main_window_with<R: Runtime>(
         // 同步到窗口标题：wry 只在 `WebviewBuilder::with_document_title_changed_handler`
         // 被注册时才转发 `DocumentTitleChanged`（wry-0.57.0/src/webview2/mod.rs:689），
         // 而 tauri 默认不注册（`webview/mod.rs:361` 里 `document_title_changed_handler: None`）。
-        // 不注册的话标题恒为上面的 `"fnOS"`。
-        .on_document_title_changed(|window, title| {
-            let _ = window.set_title(&title);
-        })
+        // 不注册的话标题恒为上面的 `"fnOS"`。Task 11 起这条通路还多一个用途：页面自检探针
+        // 的回话（见 `LOAD_PROBE_JS` / `handle_title`）。
+        .on_document_title_changed(|window, title| handle_title(&window, &title))
         // 每次页面加载打一行：既是现场排障手段，也是「重建确实换了一张新窗口」的证据。
-        .on_page_load(|_window, payload| {
-            eprintln!("[fnos] 主窗口页面已加载: {}", payload.url());
+        .on_page_load(move |window, payload| {
+            on_page_event(
+                window.app_handle(),
+                generation,
+                payload.event(),
+                payload.url().as_str(),
+            );
         });
 
     let script = injector::build_init_script(cfg);
@@ -268,7 +528,284 @@ fn build_main_window_with<R: Runtime>(
 
     let window = builder.build()?;
     tray::apply_window_geom(&window, cfg);
+    // 「加载完成」迟迟不来就切错误页（spec §12.3）。看门狗是**独立线程**，睡满即自行退出；
+    // 它靠 `generation` 判断自己是否还属于当前这一轮，所以重建 / 自动重试不会留下会误触发
+    // 上一轮的定时器，也没有任何常驻计时器（无泄漏）。
+    arm_load_watchdog(app, generation);
     Ok(window)
+}
+
+/// 建**内置错误页**窗口（Task 11 / spec §12.3「主窗口加载失败/离线」）。
+///
+/// 与[`build_main_window_with`] 的关键差别是**不注册任何 initialization_script**：mods 载荷
+/// 绝不在错误页运行。这里刻意不为了省几行复用正常路径再「传个空串」——那条路径的语义是
+/// 「injectEnabled 关了所以不注册」，与「错误页永远不注册」是两件事，混在一起将来很容易被
+/// 一次重构抹掉。上游的签名判定同样不参与：错误页是应用自己的资产，与候选站点无关。
+///
+/// 失败说明（地址 / 原因 / 退避计划）通过 `PageLoadEvent::Finished` 后的 `eval` 交给页面：
+/// 主窗口没有任何 IPC 授权（capability 只授 `settings` 窗），错误页不可能自己去查。
+fn build_error_window<R: Runtime>(
+    app: &AppHandle<R>,
+    info: &ErrorInfo,
+    cfg: &Config,
+    start_visible: bool,
+) -> tauri::Result<WebviewWindow<R>> {
+    set_error_state(app, info);
+    let payload = serde_json::to_string(info).unwrap_or_else(|_| "{}".into());
+    let mut builder =
+        WebviewWindowBuilder::new(app, MAIN_WINDOW, WebviewUrl::App(ERROR_PAGE_ASSET.into()))
+            .title("fnOS — 页面加载失败")
+            .inner_size(cfg.shell.window.w, cfg.shell.window.h)
+            .on_document_title_changed(|window, title| handle_title(&window, &title))
+            .on_page_load(move |window, payload_event| {
+                if payload_event.event() != PageLoadEvent::Finished {
+                    return;
+                }
+                eprintln!(
+                    "[fnos] 错误页已加载（地址 {}；本页不注册 mods 初始化脚本）",
+                    payload_event.url()
+                );
+                let _ = window.eval(format!(
+                    "window.__FNOS_SET_ERROR__ && window.__FNOS_SET_ERROR__({payload});"
+                ));
+            });
+    if !start_visible {
+        builder = builder.visible(false);
+    }
+    let window = builder.build()?;
+    tray::apply_window_geom(&window, cfg);
+    Ok(window)
+}
+
+/// 登记一次「加载开始」：自增世代、记下目标 URL、进入 `Loading`。
+///
+/// 连续失败计数在这里决定去留：上一轮就是 `Failed`（自动重试 / 用户重试）时**继续累计**，
+/// 于是退避按 15s → 30s → 60s → 120s 递进、第 5 次停下来；上一轮正常（`Loaded`）时清零。
+fn begin_load<R: Runtime>(app: &AppHandle<R>, url: &str) -> u64 {
+    let state = app.state::<AppState>();
+    let mut load = state.load.lock().unwrap();
+    let keep_failures = load.phase == LoadPhase::Failed;
+    load.generation = load.generation.wrapping_add(1);
+    load.url = url.to_string();
+    load.phase = LoadPhase::Loading;
+    load.error_page = false;
+    load.last_error = None;
+    load.probe_generation = None;
+    load.next_retry_seconds = None;
+    if !keep_failures {
+        load.failures = 0;
+    }
+    load.generation
+}
+
+/// 把观测状态改写成「正在显示错误页」（错误页窗口建好之前调用）。
+fn set_error_state<R: Runtime>(app: &AppHandle<R>, info: &ErrorInfo) -> u64 {
+    let state = app.state::<AppState>();
+    let mut load = state.load.lock().unwrap();
+    load.generation = load.generation.wrapping_add(1);
+    load.url = info.url.clone();
+    load.phase = LoadPhase::Failed;
+    load.error_page = true;
+    load.probe_generation = None;
+    load.last_error = Some(info.reason.clone());
+    load.next_retry_seconds = info.next_retry_seconds;
+    load.generation
+}
+
+/// 主窗口 `document.title` 变化：探针回话走这条路，其余照旧镜像到窗口标题。
+pub fn handle_title<R: Runtime>(window: &WebviewWindow<R>, title: &str) {
+    if let Some(payload) = title.strip_prefix(PROBE_TITLE_PREFIX) {
+        // 探针标题是「页面 → 宿主」的回传通道，不是给用户看的标题：不镜像、只处理。
+        on_load_probe(window.app_handle(), payload);
+        return;
+    }
+    // 现场排障 + 运行期证据（错误页会把自检结论写进标题，见 ui/settings/error.html）。
+    eprintln!("[fnos] 主窗口标题: {title}");
+    let _ = window.set_title(title);
+}
+
+/// 主窗口页面加载事件。
+///
+/// 只看 `Finished`：`Started` 每次导航都会来，没有判定价值。**注意 wry 的
+/// `PageLoadEvent::Finished` 挂在 WebView2 的 `NavigationCompleted` 上却丢掉了
+/// `IsSuccess`**（wry-0.57.0/src/webview2/mod.rs:726-737 只取 URL），所以「连接被拒绝」
+/// 这类快速失败同样会发 `Finished`。于是有两条判定通道：
+///
+/// 1. 导航后的文档 URL 是 WebView2 的错误页（`chrome-error://`）→ 直接判失败；
+/// 2. 页面自检探针（[`LOAD_PROBE_JS`]）回报 Chromium 网络错误页的 DOM 标记 → 判失败
+///    （这是快速失败的主通道，通道 1 是它之前的廉价短路）。
+///
+/// 两条都没报警时按「加载成功」处理，并且**不设任何兜底降级**：宁可不报，也不要把正常
+/// 页面判成加载失败（真·卡死不返回的情形由看门狗兜住）。
+pub fn on_page_event<R: Runtime>(
+    app: &AppHandle<R>,
+    generation: u64,
+    event: PageLoadEvent,
+    url: &str,
+) {
+    if event != PageLoadEvent::Finished {
+        return;
+    }
+    eprintln!("[fnos] 主窗口页面已加载: {url}");
+    {
+        let state = app.state::<AppState>();
+        let mut load = state.load.lock().unwrap();
+        if load.generation != generation || load.phase != LoadPhase::Loading {
+            return; // 旧世代的迟到事件（重建 / 自动重试竞态）
+        }
+        // 收到 Finished = 这一次加载有结果了 → 看门狗退场（它的判据是 `phase == Loading`）
+        load.phase = LoadPhase::Loaded;
+        load.url = url.to_string();
+        load.probe_generation = Some(generation);
+    }
+    if let Some(reason) = load_failure_reason(url) {
+        eprintln!("[fnos] URL 判定为 WebView2 错误页：{url}");
+        mark_failed(app, generation, url, &reason);
+        return;
+    }
+    // URL 上看不出失败（实测失败导航的 Source 仍是请求地址）→ 让页面自己回答
+    eprintln!("[fnos] 页面 URL 未显示错误页，交由页面自检探针判定: {url}");
+    if let Some(window) = app.get_webview_window(MAIN_WINDOW) {
+        let _ = window.eval(LOAD_PROBE_JS);
+    }
+}
+
+/// 页面自检探针的回话；只有明确的「这是错误页」才降级。
+fn on_load_probe<R: Runtime>(app: &AppHandle<R>, payload: &str) {
+    let Some(reason) = probe_verdict(payload) else {
+        return;
+    };
+    let (generation, url) = {
+        let state = app.state::<AppState>();
+        let mut load = state.load.lock().unwrap();
+        // 只认「为这一世代发出、且尚在本轮内」的探针回话
+        if load.probe_generation != Some(load.generation) || load.phase != LoadPhase::Loaded {
+            return;
+        }
+        load.probe_generation = None;
+        (load.generation, load.url.clone())
+    };
+    eprintln!("[fnos] 页面自检判定为加载失败：{reason}");
+    mark_failed(app, generation, &url, &reason);
+}
+
+/// 判定失败：记账（连续失败次数 / 原因）并切到内置错误页。
+fn mark_failed<R: Runtime>(app: &AppHandle<R>, generation: u64, url: &str, reason: &str) {
+    {
+        let state = app.state::<AppState>();
+        let mut load = state.load.lock().unwrap();
+        if load.generation != generation || load.phase == LoadPhase::Failed {
+            return;
+        }
+        load.phase = LoadPhase::Failed;
+        load.error_page = false;
+        load.url = url.to_string();
+        load.last_error = Some(reason.to_string());
+        load.failures = load.failures.saturating_add(1);
+        load.probe_generation = None;
+    }
+    eprintln!("[fnos] 主窗口加载失败：{url} — {reason}");
+    show_error_page(app, url, reason);
+}
+
+/// 切换主窗口到内置错误页，并安排一次自动重试。
+///
+/// 复用既有的重建机制（销毁旧窗口 → `Destroyed` 回调里建同 label 新窗口），只是这一轮的
+/// 建窗目标是错误页 + 空初始化脚本（`recreate_error` → `rebuild_main`）。
+fn show_error_page<R: Runtime>(app: &AppHandle<R>, failed_url: &str, reason: &str) {
+    // 退避档位由「连续失败次数」决定；用尽后不再自动重试（错误页正文会如实说明）
+    let failures = {
+        let state = app.state::<AppState>();
+        let mut load = state.load.lock().unwrap();
+        load.next_retry_seconds = auto_retry_delay_ms(load.failures).map(|ms| ms / 1000);
+        load.failures
+    };
+    let delay = auto_retry_delay_ms(failures);
+    let info = ErrorInfo {
+        url: failed_url.to_string(),
+        reason: reason.to_string(),
+        failures,
+        next_retry_seconds: delay.map(|ms| ms / 1000),
+        retry_stopped: delay.is_none(),
+        retry_schedule: AUTO_RETRY_DELAYS_MS.iter().map(|ms| ms / 1000).collect(),
+    };
+    *app.state::<AppState>().recreate_error.lock().unwrap() = Some(info);
+    if let Err(e) = trigger_recreate(app) {
+        eprintln!("[fnos] 切换错误页失败: {e}");
+        // 建不出来就别把错误页目标挂在那里，否则下一次重建会莫名其妙变成错误页
+        let _ = app
+            .state::<AppState>()
+            .recreate_error
+            .lock()
+            .unwrap()
+            .take();
+        return;
+    }
+    if let Some(delay_ms) = delay {
+        schedule_auto_retry(app.clone(), delay_ms);
+    }
+}
+
+/// 加载看门狗：`LOAD_TIMEOUT_SECS` 内没有 `Finished` → 按失败处理（spec §12.3）。
+fn arm_load_watchdog<R: Runtime>(app: &AppHandle<R>, generation: u64) {
+    let handle = app.clone();
+    let spawned = std::thread::Builder::new()
+        .name("fnos-load-watchdog".into())
+        .spawn(move || {
+            std::thread::sleep(Duration::from_secs(LOAD_TIMEOUT_SECS));
+            let (stale, url) = {
+                let state = handle.state::<AppState>();
+                let load = state.load.lock().unwrap();
+                (
+                    load.generation != generation || load.phase != LoadPhase::Loading,
+                    load.url.clone(),
+                )
+            };
+            if stale {
+                return;
+            }
+            let reason = format!("页面在 {LOAD_TIMEOUT_SECS} 秒内没有完成加载（超时）");
+            eprintln!("[fnos] {reason}");
+            mark_failed(&handle, generation, &url, &reason);
+        });
+    if let Err(e) = spawned {
+        eprintln!("[fnos] 加载看门狗线程启动失败（超时兜底失效）: {e}");
+    }
+}
+
+/// 错误页的自动重试（退避见 [`AUTO_RETRY_DELAYS_MS`]）。
+///
+/// 认领判据是「仍在错误页、且这次计划还没被消费」：用户先手动重试（`recreate_main_window`
+/// 会把 `error_page` 置回 false）时这里安静退出，不会多建一张窗口。线程睡满即退出。
+fn schedule_auto_retry<R: Runtime>(app: AppHandle<R>, delay_ms: u64) {
+    let spawned = std::thread::Builder::new()
+        .name("fnos-auto-retry".into())
+        .spawn(move || {
+            std::thread::sleep(Duration::from_millis(delay_ms));
+            let go = {
+                let state = app.state::<AppState>();
+                let mut load = state.load.lock().unwrap();
+                if load.error_page
+                    && load.phase == LoadPhase::Failed
+                    && load.next_retry_seconds.is_some()
+                {
+                    load.next_retry_seconds = None;
+                    true
+                } else {
+                    false
+                }
+            };
+            if !go {
+                return;
+            }
+            eprintln!("[fnos] 错误页自动重试（退避 {delay_ms} ms）");
+            if let Err(e) = recreate_main_window(&app, None) {
+                eprintln!("[fnos] 自动重试重建主窗口失败: {e}");
+            }
+        });
+    if let Err(e) = spawned {
+        eprintln!("[fnos] 自动重试线程启动失败: {e}");
+    }
 }
 
 /// 主窗口地址：`url` 覆盖 → 配置 `homeUrl` → `DEFAULT_HOME_URL`，逐级回落。
@@ -288,17 +825,23 @@ pub fn resolve_main_url(cfg: &Config, url_override: Option<&str>) -> tauri::Url 
     }
 }
 
-/// 真正建新主窗口：消费一次性 URL 覆盖与显示态，建完后同步托盘菜单并**无论成败**清
-/// `recreating`（否则一次失败会让下次关窗绕过 `closeToTray`）。
+/// 真正建新主窗口：消费一次性 URL 覆盖 / 错误页目标与显示态，建完后同步托盘菜单并
+/// **无论成败**清 `recreating`（否则一次失败会让下次关窗绕过 `closeToTray`）。
 fn rebuild_main<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     let state = app.state::<AppState>();
     let cfg = current(app);
     let override_url = state.recreate_url.lock().unwrap().take();
-    let url = resolve_main_url(&cfg, override_url.as_deref());
+    let error_info = state.recreate_error.lock().unwrap().take();
     let display = *state.recreate_display.lock().unwrap();
 
-    let built =
-        build_main_window_with(app, url, &cfg, display.start_visible()).map_err(|e| e.to_string());
+    let built = match error_info {
+        Some(info) => build_error_window(app, &info, &cfg, display.start_visible()),
+        None => {
+            let url = resolve_main_url(&cfg, override_url.as_deref());
+            build_main_window_with(app, url, &cfg, display.start_visible())
+        }
+    }
+    .map_err(|e| e.to_string());
     state.recreating.store(false, Ordering::SeqCst);
     if let Err(e) = tray::sync_menus(app, &cfg) {
         eprintln!("[fnos] 托盘同步失败: {e}");
@@ -310,29 +853,15 @@ fn rebuild_main<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     Ok(())
 }
 
-/// 重建主窗口，让 `injectEnabled` / `homeUrl` 立刻生效（gap (a)）。
+/// 触发一次「销毁旧主窗口 → `Destroyed` 回调里重建」。
 ///
-/// 为什么必须换窗口：`initialization_script` 走的是 WebView2 的
-/// `AddScriptToExecuteOnDocumentCreated`，同一次导航不会重新注册，窗口活着的期间**无法**
-/// 替换；`__FNOS_APPLY_CONFIG__` 只能推 `mods` / `local`。round 0 的
-/// `location.reload()` 因此永远关不掉注入。
-///
+/// 调用方负责先把这一轮的目标摆好（`recreate_url` / `recreate_error`）。
 /// 时序：置 `recreating` → 记下显示态（可见 / 最小化 / 最大化）+ 存几何 → `close()` 旧窗口
 /// → 关闭请求这次不再被拦 → `Destroyed` 回调（`on_main_destroyed`）里建同 label 新窗口
 /// → 套回显示态 → 清标志 → `sync_menus`。
 /// **不能**在 `close()` 之后立刻建：label 注册表在 `Destroyed` 才释放，否则
 /// `WindowLabelAlreadyExists`。
-pub fn recreate_main_window<R: Runtime>(
-    app: &AppHandle<R>,
-    url: Option<String>,
-) -> Result<(), String> {
-    // 先落 URL 覆盖：即便此刻已有一轮重建在飞，这一轮的 `Destroyed` 也会用上它
-    if let Some(raw) = url {
-        let parsed =
-            config::parse_web_url(&raw).ok_or_else(|| format!("非法 URL，拒绝导航：{raw}"))?;
-        *app.state::<AppState>().recreate_url.lock().unwrap() = Some(parsed.to_string());
-    }
-
+fn trigger_recreate<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     let state = app.state::<AppState>();
     if state.recreating.swap(true, Ordering::SeqCst) {
         return Ok(()); // 已在重建中：交给那一轮的 `Destroyed` 收尾
@@ -359,6 +888,38 @@ pub fn recreate_main_window<R: Runtime>(
         return Err(e.to_string());
     }
     Ok(())
+}
+
+/// 重建主窗口，让 `injectEnabled` / `homeUrl` 立刻生效（gap (a)），或从错误页回到真实页面。
+///
+/// 为什么必须换窗口：`initialization_script` 走的是 WebView2 的
+/// `AddScriptToExecuteOnDocumentCreated`，同一次导航不会重新注册，窗口活着的期间**无法**
+/// 替换；`__FNOS_APPLY_CONFIG__` 只能推 `mods` / `local`。round 0 的
+/// `location.reload()` 因此永远关不掉注入。
+///
+/// Task 11：这条路径也是**唯一**的「重试」实现（设置窗状态条、托盘「重新加载主窗口」、
+/// 错误页自动重试都走它）。它显式清掉待建的错误页目标——用户/调度要的是真实页面。
+pub fn recreate_main_window<R: Runtime>(
+    app: &AppHandle<R>,
+    url: Option<String>,
+) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    // 要真实页面：丢掉任何挂着的错误页目标（否则重试会原地回到错误页）
+    let _ = state.recreate_error.lock().unwrap().take();
+    // 先落 URL 覆盖：即便此刻已有一轮重建在飞，这一轮的 `Destroyed` 也会用上它
+    if let Some(raw) = url {
+        let parsed =
+            config::parse_web_url(&raw).ok_or_else(|| format!("非法 URL，拒绝导航：{raw}"))?;
+        *state.recreate_url.lock().unwrap() = Some(parsed.to_string());
+    }
+    trigger_recreate(app)
+}
+
+/// 托盘「重新加载主窗口」：按配置的 `homeUrl` 重建主窗口（从错误页恢复的正路之一）。
+pub fn reload_main_window<R: Runtime>(app: &AppHandle<R>) {
+    if let Err(e) = recreate_main_window(app, None) {
+        eprintln!("[fnos] 重新加载主窗口失败: {e}");
+    }
 }
 
 /// `main` 窗口的 `Destroyed` 回调（`main.rs` 转发）。
@@ -391,6 +952,65 @@ pub fn reload_main<R: Runtime>(app: AppHandle<R>, url: Option<String>) -> Result
     // 合法时**真正重建**主窗口（gap (a)），于是设置窗既有的
     // `if (res.needsReload) reloadMain(null)` 流程能拿到一份新载荷。
     recreate_main_window(&app, url)
+}
+
+/// `get_page_state` 的返回体（Task 11 状态条的**唯一**数据来源）。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PageStateView {
+    /// 主窗口当前地址；错误页期间是**失败的那个地址**（不是 error.html）。
+    pub url: String,
+    /// `url` 的 origin（解析不出来时 `None`）——「把当前页加入白名单」用它。
+    pub origin: Option<String>,
+    /// 是否算「检测到了 fnOS WebUI」（官网根域 / 白名单 / nasUrl 的 origin）。
+    pub recognized: bool,
+    /// 是否就是官网根域（`fnos.net`）：它按设计**不**注入，状态条要单独说明。
+    pub official_home: bool,
+    /// 上一次加载是否失败（错误页 = 这一态的表现）。
+    pub load_failed: bool,
+    /// 当前主窗口是否为内置错误页。
+    pub error_page: bool,
+    /// 已建窗但还没收到 `PageLoadEvent::Finished`。
+    pub loading: bool,
+    /// 失败原因（给状态条/错误页用）。
+    pub last_error: Option<String>,
+    /// 错误页上计划中的自动重试秒数。
+    pub next_retry_seconds: Option<u64>,
+    /// 注入开关的当前值（状态条要写「注入开关：开启/关闭」）。
+    pub inject_enabled: bool,
+}
+
+/// 读主窗口的观测状态。**只读**、且只授予设置窗（`capabilities/default.json`）——
+/// 主窗口（含内置错误页）没有任何命令授权，绝不出现「页面自己上报状态」的通道（R2）。
+#[tauri::command]
+pub fn get_page_state<R: Runtime>(app: AppHandle<R>) -> PageStateView {
+    let cfg = current(&app);
+    let snapshot = app.state::<AppState>().load.lock().unwrap().clone();
+    // 活着的窗口 URL 优先（它能反映重定向 / 页内导航）；错误页例外——那时 URL 是应用资产
+    // （`http://tauri.localhost/error.html`），对用户没有意义。
+    let live = app
+        .get_webview_window(MAIN_WINDOW)
+        .and_then(|w| w.url().ok())
+        .map(|u| u.to_string());
+    let url = if snapshot.error_page {
+        snapshot.url.clone()
+    } else {
+        live.unwrap_or_else(|| snapshot.url.clone())
+    };
+    let origin = config::origin_of(&url);
+    let official_home = origin.as_deref().is_some_and(is_official_home_origin);
+    PageStateView {
+        recognized: !snapshot.error_page && is_recognized(&cfg, origin.as_deref()),
+        url,
+        origin,
+        official_home,
+        load_failed: snapshot.phase == LoadPhase::Failed,
+        error_page: snapshot.error_page,
+        loading: snapshot.phase == LoadPhase::Loading,
+        last_error: snapshot.last_error.clone(),
+        next_retry_seconds: snapshot.next_retry_seconds,
+        inject_enabled: cfg.shell.inject_enabled,
+    }
 }
 
 #[tauri::command]
@@ -484,7 +1104,7 @@ pub fn reset_config<R: Runtime>(app: AppHandle<R>, scope: String) -> Result<Conf
             eprintln!("[fnos] 重置后重建主窗口失败: {e}");
         }
     }
-    Ok(config_view(&cfg))
+    Ok(config_view(&cfg, recovered_from_backup(&app)))
 }
 
 // ---------- Rust 内部（非 IPC） ----------
@@ -549,7 +1169,14 @@ pub fn open_nas<R: Runtime>(app: &AppHandle<R>) {
 ///
 /// round 0 里叫 `apply_home_url`，但名字与行为不符——它不「应用」任何地址，只是
 /// **保存配置 + 安装 `AppState`**，故改名。（建窗地址由 `resolve_main_url` 决定。）
-pub fn save_and_install_state<R: Runtime>(app: &AppHandle<R>, cfg: &Config) {
+///
+/// `recovered_from_backup` 只能从这里进来：`load_config` 跑的时候 `AppState` 还没被
+/// `manage`，那时读不到托管状态（Task 11 的配置损坏回显就靠这个参数带过来）。
+pub fn save_and_install_state<R: Runtime>(
+    app: &AppHandle<R>,
+    cfg: &Config,
+    recovered_from_backup: bool,
+) {
     let path = Config::config_path();
     let _ = cfg.save(&path);
     app.manage(AppState {
@@ -557,6 +1184,9 @@ pub fn save_and_install_state<R: Runtime>(app: &AppHandle<R>, cfg: &Config) {
         recreating: AtomicBool::new(false),
         recreate_url: Mutex::new(None),
         recreate_display: Mutex::new(DisplayState::default()),
+        load: Mutex::new(LoadState::default()),
+        recreate_error: Mutex::new(None),
+        recovered_from_backup: AtomicBool::new(recovered_from_backup),
     });
 }
 
@@ -663,5 +1293,129 @@ mod tests {
         );
         // JS 侧（ui/settings/normalize.js 的 `clampLightness`）仍不是不动点，本轮不动它；
         // 不变式改由「JS 只夹用户刚输入的值、绝不夹 Rust 归一化过的值」维持（fix round 1 的 A）。
+    }
+
+    // ---------- Task 11：状态条 / 错误页的纯判据 ----------
+
+    /// `*.fnos.net`（含根域）的识别：上游签名正则要求前导点，所以根域与子域必须分开处理。
+    #[test]
+    fn fnos_net_host_is_recognized_by_suffix_only() {
+        assert!(is_fnos_net_origin("https://fnos.net"));
+        assert!(is_fnos_net_origin("http://fnos.net"));
+        assert!(is_fnos_net_origin("https://abc.fnos.net"));
+        assert!(is_fnos_net_origin("https://a.b.fnos.net:8000"));
+        // 后缀必须落在**标签边界**上：`evil-fnos.net` / `fnos.net.evil.com` 都不是飞牛域名
+        assert!(!is_fnos_net_origin("https://evil-fnos.net"));
+        assert!(!is_fnos_net_origin("https://fnos.net.evil.com"));
+        assert!(!is_fnos_net_origin("http://127.0.0.1:8793"));
+        assert!(!is_fnos_net_origin("not an origin"));
+        assert!(!is_fnos_net_origin("chrome-error://chromewebdata/"));
+    }
+
+    /// 「官网根域」与「WebUI 子域」是两种状态：前者按设计不注入，后者才可能是 WebUI。
+    #[test]
+    fn official_home_is_the_bare_root_domain_only() {
+        assert!(is_official_home_origin("https://fnos.net"));
+        assert!(is_official_home_origin("http://fnos.net"));
+        assert!(!is_official_home_origin("https://abc.fnos.net"));
+        assert!(!is_official_home_origin("http://127.0.0.1:8793"));
+        assert!(!is_official_home_origin("garbage"));
+    }
+
+    /// 判定「当前页是不是 fnOS WebUI」：官网根域 ∪ 白名单 ∪ nasUrl 的 origin（大小写不敏感）。
+    #[test]
+    fn recognized_covers_official_whitelist_and_nas_url() {
+        let mut cfg = Config::default();
+        assert!(!is_recognized(&cfg, None), "没有任何 URL 时不得声称命中");
+        assert!(
+            is_recognized(&cfg, Some("https://fnos.net")),
+            "官网根域属于「检测到了 fnOS」（只是不注入）"
+        );
+        assert!(is_recognized(&cfg, Some("https://abc.fnos.net")));
+        assert!(!is_recognized(&cfg, Some("http://127.0.0.1:8793")));
+
+        cfg.mods.enabled_origins = vec!["http://nas.local:5666".into()];
+        assert!(is_recognized(&cfg, Some("http://nas.local:5666")));
+        assert!(
+            is_recognized(&cfg, Some("http://NAS.LOCAL:5666")),
+            "白名单匹配必须大小写不敏感（上游按 location.origin 比较）"
+        );
+        assert!(!is_recognized(&cfg, Some("http://nas.local:80")));
+
+        // nasUrl 的 origin：即便这份 Config 没跑过 `normalize()`（例如测试里手搭的）也算命中
+        let mut raw = Config::default();
+        raw.shell.nas_url = "http://192.168.1.10:5666/webui/".into();
+        assert!(is_recognized(&raw, Some("http://192.168.1.10:5666")));
+        assert!(is_recognized(&raw, Some("http://192.168.1.10:5667")) == false);
+    }
+
+    /// 自动重试退避：15s → 30s → 60s → 120s，第 5 次起不再重试（错误页要如实写出来）。
+    #[test]
+    fn auto_retry_backoff_is_bounded() {
+        assert_eq!(auto_retry_delay_ms(0), None, "没有失败就不该有重试计划");
+        assert_eq!(auto_retry_delay_ms(1), Some(15_000));
+        assert_eq!(auto_retry_delay_ms(2), Some(30_000));
+        assert_eq!(auto_retry_delay_ms(3), Some(60_000));
+        assert_eq!(auto_retry_delay_ms(4), Some(120_000));
+        assert_eq!(
+            auto_retry_delay_ms(5),
+            None,
+            "退避用尽后必须停止（不能无限重试）"
+        );
+        assert_eq!(auto_retry_delay_ms(99), None);
+    }
+
+    /// wry 丢掉 `NavigationCompleted::IsSuccess`，所以「导航失败」只能靠 URL 认出来。
+    #[test]
+    fn load_failure_is_detected_from_the_chrome_error_url() {
+        assert!(load_failure_reason("chrome-error://chromewebdata/").is_some());
+        assert!(load_failure_reason("http://127.0.0.1:8793/index.html").is_none());
+        assert!(load_failure_reason("https://fnos.net/").is_none());
+    }
+
+    /// 页面自检探针（走 document.title 回传）的判定：只有明确的 `err:true` 才算失败。
+    #[test]
+    fn probe_verdict_only_fails_on_explicit_error() {
+        let hit = probe_verdict(r#"{"err":true,"detail":"127.0.0.1 拒绝了我们的连接请求"}"#)
+            .expect("err:true 必须判定为失败");
+        assert!(
+            hit.contains("127.0.0.1"),
+            "必须带上 WebView2 给出的原因：{hit}"
+        );
+        assert!(
+            probe_verdict(r#"{"err":false,"detail":""}"#).is_none(),
+            "正常页面不得被判成失败"
+        );
+        assert!(
+            probe_verdict("not json").is_none(),
+            "解析不出来时不得擅自降级"
+        );
+        assert!(probe_verdict("[]").is_none());
+        // err:true 但拿不到文案：仍要给出一个可读的原因，而不是空串
+        let bare = probe_verdict(r#"{"err":true,"detail":""}"#).expect("err:true 仍须失败");
+        assert!(!bare.trim().is_empty());
+    }
+
+    /// 宿主解析探针用的前缀必须与注入脚本里那个字面量**同源**，否则失败会被静默吞掉。
+    #[test]
+    fn probe_prefix_and_script_agree() {
+        assert!(!PROBE_TITLE_PREFIX.is_empty());
+        // JS 里可打印 ASCII 直接写，控制字符写成 `\uXXXX` 转义（见 LOAD_PROBE_JS）
+        let escaped: String = PROBE_TITLE_PREFIX
+            .chars()
+            .map(|c| {
+                if c.is_ascii_graphic() {
+                    c.to_string()
+                } else {
+                    format!("\\u{:04x}", c as u32)
+                }
+            })
+            .collect();
+        assert!(
+            LOAD_PROBE_JS.contains(&format!("'{}'", escaped)),
+            "注入脚本里的前缀必须由 PROBE_TITLE_PREFIX 逐字转义而来：{escaped}"
+        );
+        assert!(LOAD_PROBE_JS.contains("main-frame-error"));
+        assert!(!LOAD_PROBE_JS.contains("__FNOS_SHELL__"));
     }
 }

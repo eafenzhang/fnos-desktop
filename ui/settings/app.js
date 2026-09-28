@@ -16,13 +16,20 @@
 // - **关于页外链**：不在窗内导航，交给 Rust `open_url` → 系统默认浏览器。
 import { SCHEMA, UPSTREAM_REPO, VENDOR_DIR } from './schema.js';
 import { MODS_KEYS, normalizeModsEntry, parseHttpOrigin, DEFAULT_BRAND_COLOR } from './normalize.js';
+import { addCurrentOriginToWhitelist, cornerShapeHint, statusBar, statusFor } from './status.js';
 import * as api from './bridge.js';
 
 /** 配置的三个段（键前缀）。 */
 const SECTIONS = ['mods', 'local', 'shell'];
 
-/** 界面状态。导出供单测与 Task 11 的状态条读取。 */
-export const state = { config: null, active: null, error: null };
+/**
+ * 界面状态。导出供单测与状态条读取。
+ *
+ * `page` 是 Rust 侧 `get_page_state` 的**最近一次**回包（主窗口 URL / 是否命中白名单 /
+ * 上次加载是否失败）。它与 `config` 相互独立：主窗口可以只导航不改配置，所以
+ * `refresh()` 必须两条都取（见那里的注释）。
+ */
+export const state = { config: null, active: null, error: null, page: null };
 
 // ---------- DOM 小工具 ----------
 
@@ -126,9 +133,14 @@ async function commit(key, value, node) {
     const res = await api.setConfig(setPath({}, path, normalizeForSubmit(path, value)));
     adoptConfig(res.config);
     // gap (a)：只有 injectEnabled / homeUrl 变更才会是 true，此时必须重建主窗口
-    if (res.needsReload) await api.reloadMain(null);
+    if (res.needsReload) {
+      await api.reloadMain(null);
+      // 重建会换掉主窗口那一整次加载：状态条必须跟着换，否则会一直显示旧页面的判定
+      state.page = await fetchPageState();
+    }
     state.error = null;
     render();
+    renderStatus();
   } catch (e) {
     state.error = `保存「${key}」失败：${message(e)}`;
     render();
@@ -291,6 +303,113 @@ function fieldEl(item) {
   return appendHint(wrap, item);
 }
 
+// ---------- 顶部状态条（Task 11 / spec §12.3） ----------
+
+/**
+ * 取一次主窗口的观测状态。
+ *
+ * 失败时**返回 null**（而不是抛）：状态条于是显示「主窗口状态未知」，这与「取到了，
+ * 确实没检测到 WebUI」是两件事——不许把一次 IPC 失败说成「未检测到 fnOS WebUI」。
+ */
+async function fetchPageState() {
+  try {
+    const page = await api.getPageState();
+    return page && typeof page === 'object' ? page : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+/** 判据是否还停在「加载失败」这一态（重试后的轮询用于决定何时停）。 */
+function stillFailed(page) {
+  return !!page && (page.loadFailed === true || page.loading === true);
+}
+
+/**
+ * 「重试」：走既有 `reload_main`（Rust 侧销毁主窗口并按配置的 homeUrl + 新载荷重建）。
+ *
+ * 重建是异步的，紧接着取一次 `get_page_state` 大概率还是旧的失败态（窗口还没建回来），
+ * 所以这里轮询一小会儿：状态条于是从「加载失败」走到真实结果，而不是卡在旧快照上。
+ * `errorPage` 是内置错误页，**没有**任何 IPC 授权（capability 只给 settings 窗），
+ * 所以重试入口只能在设置窗与托盘——这正是本函数存在的理由。
+ */
+async function retryMain() {
+  state.error = null;
+  renderStatus(true);
+  try {
+    await api.reloadMain(null);
+  } catch (e) {
+    state.error = `重试失败：${message(e)}`;
+    state.page = await fetchPageState();
+    render();
+    renderStatus();
+    return;
+  }
+  const deadline = Date.now() + 8000;
+  do {
+    await new Promise((r) => setTimeout(r, 600));
+    state.page = await fetchPageState();
+    renderStatus(true);
+  } while (Date.now() < deadline && stillFailed(state.page));
+  render();
+  renderStatus();
+}
+
+/**
+ * 「把当前页加入白名单」：走既有 `set_config` patch 路径写入 `mods.enabledOrigins`。
+ *
+ * origin 的合法性由 `status.js::addCurrentOriginToWhitelist` + Rust 的
+ * `Config::normalize` 双保险（后者会把非 `scheme://host[:port]` 的东西挡在语义之外，
+ * 且 `enabledOrigins` 只做 trim/小写/去重），这里拿到的 origin 来自
+ * `get_page_state`（Rust 用 `config::origin_of` 解析出来的），不是页面上抓来的字符串。
+ *
+ * 写完**显式重建主窗口**：注入载荷是建窗时注册到 WebView2 的（`initialization_script`
+ * 无法在活窗口上替换），而 `needsReload` 只覆盖 `injectEnabled`/`homeUrl`——不重建的话
+ * 这次加入要等下一次导航才生效。重建后「下一次加载即注入」当场成立。
+ */
+async function whitelistCurrentOrigin() {
+  const origin = state.page && state.page.origin;
+  if (!origin) return;
+  const next = addCurrentOriginToWhitelist(origin, (state.config.mods || {}).enabledOrigins);
+  try {
+    const res = await api.setConfig({ mods: { enabledOrigins: next } });
+    adoptConfig(res.config);
+    state.error = null;
+    await api.reloadMain(null);
+  } catch (e) {
+    state.error = `加入白名单失败：${message(e)}`;
+  }
+  state.page = await fetchPageState();
+  render();
+  renderStatus();
+}
+
+/**
+ * 把状态条重新画一遍（`status.js::statusFor` 是唯一的判据来源）。
+ *
+ * `busy` 只影响按钮可用性：重试期间的按钮置灰，避免连点堆出多次重建。
+ */
+function renderStatus(busy) {
+  const model = statusFor(state.config, state.page);
+  const el = statusBar(model.text, model.kind);
+  if (!el) return;
+  for (const action of model.actions) {
+    if (action === 'retry') {
+      const b = button('重试');
+      b.id = 'statusRetry';
+      b.disabled = !!busy;
+      b.addEventListener('click', () => { retryMain(); });
+      el.appendChild(b);
+    } else if (action === 'whitelist') {
+      const b = button('把当前页加入白名单');
+      b.id = 'statusWhitelist';
+      b.disabled = !!busy;
+      b.addEventListener('click', () => { whitelistCurrentOrigin(); });
+      el.appendChild(b);
+    }
+  }
+}
+
 // ---------- 关于页（spec §10：合规与品牌） ----------
 
 function metaRow(label, value, tag, className) {
@@ -312,6 +431,17 @@ function renderAbout(pane) {
   card.appendChild(metaRow('mods commit', meta.modsCommit || '未知'));
   card.appendChild(metaRow('mods 版本', meta.modsVersion || '未知'));
   card.appendChild(metaRow('WebView2 版本', webviewVersion || '未知（未取到运行时版本）'));
+  // spec §12.3 / §14：`corner-shape`（squircle 圆角）需要 Chromium/WebView2 139+；
+  // 低于门槛时只说「会退化为普通圆角」，取不到版本时什么都不说（见 status.js 的注释）。
+  const shapeHint = cornerShapeHint(webviewVersion);
+  if (shapeHint) {
+    card.appendChild(el('p', {
+      id: 'cornerShapeHint',
+      className: 'hint warn',
+      text: shapeHint,
+      attrs: { role: 'note' },
+    }));
+  }
   card.appendChild(metaRow('配置文件', meta.configPath || '未知', 'code', 'row-value path'));
   pane.appendChild(card);
 
@@ -435,37 +565,48 @@ function sameConfig(a, b) {
 }
 
 /**
- * 重取配置并就地重渲染（Review finding C）。
+ * 重取配置**与主窗口状态**并就地重渲染（Review finding C + Task 11）。
  *
  * 为什么需要：托盘「注入 mods」勾选项走 `commands::set_inject_enabled`，它只改
  * `AppState` + 落盘 + `sync_menus`，**不向设置窗发任何事件**；而本窗只在 `boot()` 取过
  * 一次配置，于是带外改动后它会一直显示过期值，直到关掉重开。窗口重新获得焦点时刷新是
  * 最小实现：不引入事件总线、不改 Rust 侧。
  *
- * `render()` 会保留 `state.active`（当前分组）与 `pane.scrollTop`（滚动位置），
- * 所以刷新不会把用户弹回第一组。另外**配置没变就不重渲染**：否则每次 alt-tab 回来都会
- * 重建 DOM，把用户正在输入、尚未提交的文本（例如 NAS 地址）一起丢掉。
+ * Task 11 的状态条复用同一个钩子，但它要的数据比配置多一份：主窗口**可以在不改任何
+ * 配置**的情况下导航（用户在页面里点链接、托盘「打开 NAS」、错误页自动重试……），
+ * 所以 `get_page_state` 必须每次刷新都取——不能挂在「配置变了」这个条件上。反过来，
+ * 配置没变时依旧**不重渲染 #pane**（否则每次 alt-tab 回来都会重建 DOM、丢掉用户正在
+ * 输入却尚未提交的文本）。
  *
- * **Task 11 的状态条直接复用这个 `refresh()`**（它需要的正是同一个「带外变更 → 重取」
- * 钩子）：把 `boot()` 里的 `focus` 监听留在这里，别在状态条里另建一套事件/轮询机制。
+ * `render()` 会保留 `state.active`（当前分组）与 `pane.scrollTop`（滚动位置），
+ * 所以刷新不会把用户弹回第一组。
  */
 export async function refresh() {
   if (refreshing) return;
   refreshing = true;
   let next = null;
+  let failure = null;
   try {
     next = await api.getConfig();
   } catch (e) {
-    state.error = `刷新配置失败：${message(e)}`;
-    refreshing = false;
+    failure = e;
+  }
+  const page = await fetchPageState();
+  refreshing = false;
+  state.page = page;
+  if (failure) {
+    state.error = `刷新配置失败：${message(failure)}`;
+    renderStatus();
     render();
     return;
   }
-  refreshing = false;
-  if (sameConfig(state.config, next)) return;
-  adoptConfig(next);
-  state.error = null;
-  render();
+  const changed = !sameConfig(state.config, next);
+  if (changed) {
+    adoptConfig(next);
+    state.error = null;
+  }
+  renderStatus();
+  if (changed) render();
 }
 
 /** 取一次配置并渲染。导出以便单测；无 DOM 时模块加载不会自动执行（见文件末尾）。 */
@@ -475,7 +616,9 @@ export async function boot() {
   } catch (e) {
     state.error = `读取配置失败：${message(e)}`;
   }
+  state.page = await fetchPageState();
   render();
+  renderStatus();
   window.addEventListener('focus', () => { refresh(); });
 }
 

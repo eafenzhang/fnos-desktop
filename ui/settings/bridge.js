@@ -44,3 +44,9 @@ export function openConfigDir() { return invoke('open_config_dir'); }
 export function resetConfig(scope) { return invoke('reset_config', { scope }); }
 /** 用系统默认浏览器打开外部链接（关于页的上游仓库）。Rust 侧只放行 http(s)。 */
 export function openUrl(url) { return invoke('open_url', { url }); }
+/**
+ * 主窗口的观测状态（Task 11）：`get_page_state` 是**只读**命令，`capabilities/default.json`
+ * 只把它授予 label 为 `settings` 的窗口——主窗口（含内置错误页）拿不到任何命令授权，
+ * 所以页面永远无法自己声称「已注入」或改写这个判定。
+ */
+export function getPageState() { return invoke('get_page_state'); }

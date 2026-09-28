@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>fnOS — 页面加载失败</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; background: #1b1c1e; color: #e8e8ea; display: flex;
+    align-items: center; justify-content: center;
+    font: 14px/1.7 "Microsoft YaHei", system-ui, sans-serif;
+  }
+  main {
+    max-width: 620px; margin: 24px; padding: 22px 26px;
+    background: #232427; border: 1px solid #2e3034; border-radius: 12px;
+  }
+  h1 { font-size: 18px; margin: 0 0 14px; color: #ff9a94; }
+  p { margin: 0 0 10px; }
+  .k { color: #8b9096; }
+  code { font-family: Consolas, monospace; color: #7ab8ff; word-break: break-all; }
+  #erretry { color: #ffd479; }
+  #ercheck { color: #8b9096; font-size: 12px; margin-top: 16px; }
+  #ertips { color: #c8ccd1; border-top: 1px solid #2e3034; padding-top: 12px; margin-top: 16px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>页面加载失败</h1>
+  <p id="eurl"><span class="k">地址：</span><code>读取中…</code></p>
+  <p id="ereason"><span class="k">原因：</span>读取中…</p>
+  <p id="erretry"></p>
+  <p id="ertips">可以这样重试：托盘菜单 →「重新加载主窗口」；或打开<b>设置窗</b>（托盘 →「系统设置」），在顶部状态条点「重试」。</p>
+  <p id="ercheck"></p>
+</main>
+<script>
+// 内置错误页（spec §12.3「主窗口加载失败/离线」）。
+//
+// 这个页面由**主窗口**承载，而 capabilities/default.json 只把命令授予 label 为
+// `settings` 的窗口、remote-deny.json 又对主窗口的一切远程来源显式 deny —— 所以本页
+// 既不能、也不需要调任何 IPC：失败地址/原因/退避计划全部由宿主在
+// `PageLoadEvent::Finished` 之后用 `window.eval` 塞进 `__FNOS_SET_ERROR__`。
+//
+// 另一条不变量：这里**永远不该**出现 mods（宿主建这张窗口时刻意不注册任何
+// initialization_script，见 commands::build_error_window）。下面的自检把它变成可观测的
+// 事实并写进 document.title —— 宿主把 document.title 镜像到窗口标题并打一行 stderr，
+// 于是「错误页没有 mods 载荷」可以在运行期被外部读到，而不是只能靠读代码相信。
+(function () {
+  var modsLoaded = false;
+  try {
+    if (typeof window.__FNOS_SHELL__ !== 'undefined') modsLoaded = true;
+    if (window.__FNOS_BOOTSTRAP__) modsLoaded = true;
+    if (document.getElementById('fnos-ui-mods-basic-style') ||
+        document.getElementById('fnos-ui-mods-script') ||
+        document.getElementById('fnos-ui-mods-theme-style')) modsLoaded = true;
+  } catch (e) { modsLoaded = true; }
+  try {
+    document.title = 'fnOS — 页面加载失败（' + (modsLoaded ? '异常：检测到 mods 载荷' : '未注入 mods') + '）';
+  } catch (e) { }
+  var check = document.getElementById('ercheck');
+  if (check) {
+    check.textContent = modsLoaded
+      ? '自检：本页检测到 mods 注入痕迹（不符合预期，请报告）'
+      : '自检：本页未加载任何 mods 载荷 / 样式（符合预期）';
+  }
+
+  var timer = null;
+  function scheduleText(list) {
+    if (!Array.isArray(list) || !list.length) return '';
+    var secs = [];
+    for (var i = 0; i < list.length; i++) secs.push(String(list[i]) + 's');
+    return secs.join(' → ');
+  }
+  window.__FNOS_SET_ERROR__ = function (info) {
+    info = info || {};
+    var url = document.getElementById('eurl');
+    if (url) {
+      url.textContent = '';
+      var k = document.createElement('span');
+      k.className = 'k';
+      k.textContent = '地址：';
+      var c = document.createElement('code');
+      c.textContent = String(info.url || '未知');
+      url.appendChild(k);
+      url.appendChild(c);
+    }
+    var reason = document.getElementById('ereason');
+    if (reason) reason.textContent = '原因：' + String(info.reason || '未知');
+    var retry = document.getElementById('erretry');
+    if (!retry) return;
+    if (timer) { clearInterval(timer); timer = null; }
+    if (info.retryStopped) {
+      retry.textContent = '已连续失败 ' + String(info.failures || 0) + ' 次，自动重试已停止（退避用尽）。请用上面的手动方式重试。';
+      return;
+    }
+    var left = Number(info.nextRetrySeconds) || 0;
+    if (left <= 0) { retry.textContent = ''; return; }
+    var plan = scheduleText(info.retrySchedule);
+    function paint() {
+      var suffix = plan ? '（退避：' + plan + '，最多 ' + String(info.retrySchedule.length) + ' 次）' : '';
+      retry.textContent = left > 0
+        ? '将在 ' + left + ' 秒后自动重试' + suffix
+        : '正在自动重试…';
+    }
+    paint();
+    timer = setInterval(function () {
+      left = left - 1;
+      paint();
+      if (left <= 0) { clearInterval(timer); timer = null; }
+    }, 1000);
+  };
+})();
+</script>
+</body>
+</html>

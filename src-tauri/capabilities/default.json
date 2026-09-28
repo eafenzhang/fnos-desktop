@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "settings-only",
-  "description": "只允许设置窗调用应用命令；远程页面无任何授权",
+  "description": "只允许设置窗调用应用命令；远程页面无任何授权（Task 11 的 get_page_state 同样只授设置窗）",
   "windows": ["settings"],
   "permissions": [
     "core:default",
@@ -10,6 +10,7 @@
     "allow-reload-main",
     "allow-open-config-dir",
     "allow-open-url",
-    "allow-reset-config"
+    "allow-reset-config",
+    "allow-get-page-state"
   ]
 }

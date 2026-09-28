@@ -24,8 +24,10 @@ fn main() {
             }
         }))
         .setup(|app| {
-            let cfg = commands::load_config(app.handle());
-            commands::save_and_install_state(app.handle(), &cfg);
+            // Task 11：`load_config` 的第二个返回值是「本次会话是否从 config.json.bak 回退」，
+            // 必须经 `save_and_install_state` 带进 AppState（读配置时状态还没被 manage）。
+            let (cfg, recovered_from_backup) = commands::load_config(app.handle());
+            commands::save_and_install_state(app.handle(), &cfg, recovered_from_backup);
 
             // Finding 1：这里不再有 `cfg.shell.home_url.parse().expect("home url")`——
             // 地址经 `resolve_main_url` 逐级校验回落（覆盖 → homeUrl → 默认常量），
@@ -78,6 +80,9 @@ fn main() {
             // capabilities/default.json；build.rs 的 AppManifest::commands 也必须同步）
             commands::open_url,
             commands::reset_config,
+            // Task 11 的状态条数据源（R2：设置窗**查询**，不做页面→宿主上报）。
+            // 同样只授予 settings 窗——主窗口（含内置错误页）拿不到任何命令。
+            commands::get_page_state,
         ])
         .run(tauri::generate_context!())
         .expect("fnOS 启动失败");

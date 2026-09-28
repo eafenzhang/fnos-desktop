@@ -12,6 +12,7 @@
     "deny-set-config",
     "deny-reload-main",
     "deny-open-config-dir",
-    "deny-reset-config"
+    "deny-reset-config",
+    "deny-get-page-state"
   ]
 }
