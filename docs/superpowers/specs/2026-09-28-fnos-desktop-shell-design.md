@@ -120,7 +120,7 @@ config (纯数据) ──► injector (纯函数) ──► main/tray/commands (
 ### 5.1 上游机制的确切事实（已核实，非推测）
 
 - 上游 `content-script.js`（3337 行）在 `document_start` 运行，先等 `storage` 与签名判定，再注入。
-- **6 个 CSS 文件走外链**：`<link id="fnos-ui-mods-*-style" rel=stylesheet href=chrome.runtime.getURL('xxx.css')>`（`cs:2612-2635`、`2449-2455`、`2396-2409`）。
+- **7 个 CSS 文件走外链**：`<link id="fnos-ui-mods-*-style" rel=stylesheet href=chrome.runtime.getURL('xxx.css')>`（`cs:2612-2635`、`2449-2455`、`2396-2409`）。勘误（2026-09-28，由 T4 实测）：正文原写「6 个」漏计 `lockscreen_mod.css`，权威集合是 basic / windows_titlebar / mac_titlebar / classic_launchpad / spotlight_launchpad / desktop_icon / lockscreen 共 7 个（`cs:2402` 锁定）。
 - **`mod.js` 走外链** `<script src=getURL('mod.js')>`（`cs:2666-2676`）；`mod.js` **零 `chrome.*`**、**不读配置**（自足脚本）。
 - **参数化内容才内联**：主题色 10 阶调色板、字体 `@font-face`、自定义 CSS/JS、桌面图标网格变量。
 - `safeRuntimeGetURL` 在 `chrome?.runtime?.id` 缺失时返回 `''`，而 `injectStyle` 里 `if (!nextHref) return;` → **缺 shim 就完全注入失败**（`cs:242-252`、`2621-2622`）。
@@ -176,7 +176,7 @@ Tauri initialization_script（每次顶层文档导航、HTML 解析前）
 
 ### 5.6 载荷体积（M1 需实测）
 
-约 400 KB/次导航（`content-script.js` 113KB + 6 CSS 218KB + `mod.js` 63KB + 配置）。探针实测 195KB CSS 在 `initAt≈200ms` 完成注入，属可接受范围；M1 记录真实首个内容渲染时间，若退化明显再改为「按需注入 CSS」。
+约 400 KB/次导航（`content-script.js` 113KB + 7 CSS 约 218KB + `mod.js` 63KB + 配置；勘误：原写「6 CSS」，权威数量见 §5.1）。探针实测 195KB CSS 在 `initAt≈200ms` 完成注入，属可接受范围；M1 记录真实首个内容渲染时间，若退化明显再改为「按需注入 CSS」。
 
 ---
 
