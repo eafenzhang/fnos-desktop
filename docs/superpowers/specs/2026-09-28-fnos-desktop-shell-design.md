@@ -150,7 +150,7 @@ config (纯数据) ──► injector (纯函数) ──► main/tray/commands (
 远程页面上，`chrome-extension://` 不可用，`tauri://` / `http://asset.localhost` 会撞混合内容或 CSP。方案：
 
 1. **主路径**：`getURL(path)` 返回 `data:text/css;base64,…`（内容取自注入的原始文本，惰性 base64）
-2. **兜底 A**：`bootstrap.js` 在 `DOMContentLoaded` 后自检 6 个已知 link 的 `link.sheet === null`（被 CSP/协议拦截）
+2. **兜底 A**：`bootstrap.js` 在 `DOMContentLoaded` 后自检受管 link 的 `link.sheet === null`（被 CSP/协议拦截）。勘误（2026-09-28，T5 评审）：受管 link 是 **5 个 id**（`CSS_IDS`：basic / titlebar / launchpad / desktop-icon-mod / lockscreen，对应 7 个 CSS 文件），原文误写「6 个」
 3. **兜底 B（CSP 免疫）**：改用 `document.adoptedStyleSheets` + `CSSStyleSheet.replaceSync()` 安装同一份 CSS —— 可构造样式表**不受 `style-src` 约束**
 
 **绝不使用**：本地 HTTP 服务（https 页面下的混合内容）、`tauri://` 直链（跨源 + CSP）。
