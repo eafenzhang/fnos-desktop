@@ -1,8 +1,13 @@
-// 设置窗归一化（spec §6.5 / §8.4）：显示的值必须是**归一化之后**的值，
-// 与 Rust 侧 `Config::normalize` 同语义，避免「设置窗显示 A、页面按 B 生效」。
+// 设置窗归一化（spec §6.5 / §8.4）：设置窗显示的值必须与页面**实际生效**的值一致。
+//
+// 本轮（fix round 1）修正了这条不变式的实现位置：生效值由 Rust 的 `Config::normalize`
+// 决定，IPC 回包就是权威值，界面**原样采纳**；本文件的 `normalizeMods` 只用于「用户刚
+// 输入的值 → 提交 patch」这一段。因此这里锁的是两件事：
+//   1. `normalizeMods` 的语义与 Rust 逐步对应（下面每一条都写明 Rust 对应物）；
+//   2. 二次夹取的危险性（`app.js::adoptConfig` 的回归测试在 tests/settings.test.mjs）。
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { normalizeMods, clampLightness, DEFAULT_BRAND_COLOR } from '../ui/settings/normalize.js';
+import { normalizeMods, clampLightness, normalizeOrigin, DEFAULT_BRAND_COLOR } from '../ui/settings/normalize.js';
 
 test('明度夹取与非法值回落', () => {
   assert.equal(clampLightness('#ffffff'), '#b3b3b3');
@@ -22,6 +27,42 @@ test('枚举与数字回落', () => {
   assert.equal(out.desktopIconPerColumn, 16);
   assert.equal(out.fontWeight, '');
   assert.equal(out.lockscreenDefaultUsername.length, 80);
+});
+
+test('desktopIconPerColumn 的两个边界：0 夹到下限 4，非数字回落 8', () => {
+  // Rust 侧是 `clamp(4, 16)` + `sanitize_u32_field`（非 u32 → 删除该键 → serde 默认 8）。
+  assert.equal(normalizeMods({ desktopIconPerColumn: 0 }).desktopIconPerColumn, 4);
+  assert.equal(normalizeMods({ desktopIconPerColumn: -5 }).desktopIconPerColumn, 4);
+  assert.equal(normalizeMods({ desktopIconPerColumn: 'abc' }).desktopIconPerColumn, 8);
+  assert.equal(normalizeMods({ desktopIconPerColumn: null }).desktopIconPerColumn, 8);
+  assert.equal(normalizeMods({ desktopIconPerColumn: undefined }).desktopIconPerColumn, 8);
+  assert.equal(normalizeMods({ desktopIconPerColumn: NaN }).desktopIconPerColumn, 8);
+  // 非数字类型与空串：Rust `as_f64` 全部取不到值 → 8；JS 的 `Number('')`/`Number(true)`
+  // 会得到 0/1，必须显式排除，否则设置窗显示 4 而 Rust 里是 8。
+  assert.equal(normalizeMods({ desktopIconPerColumn: '' }).desktopIconPerColumn, 8);
+  assert.equal(normalizeMods({ desktopIconPerColumn: '   ' }).desktopIconPerColumn, 8);
+  assert.equal(normalizeMods({ desktopIconPerColumn: true }).desktopIconPerColumn, 8);
+  assert.equal(normalizeMods({ desktopIconPerColumn: [] }).desktopIconPerColumn, 8);
+  assert.equal(normalizeMods({ desktopIconPerColumn: '0x10' }).desktopIconPerColumn, 8);
+  assert.equal(normalizeMods({ desktopIconPerColumn: Infinity }).desktopIconPerColumn, 8);
+  // 数字字符串按十进制解析（Rust `as_f64` 同样接受）
+  assert.equal(normalizeMods({ desktopIconPerColumn: '9' }).desktopIconPerColumn, 9);
+  assert.equal(normalizeMods({ desktopIconPerColumn: '12.5' }).desktopIconPerColumn, 13);
+  // 小数四舍五入后夹取（Rust `as_u32` 先 round 再 clamp）
+  assert.equal(normalizeMods({ desktopIconPerColumn: 4.6 }).desktopIconPerColumn, 5);
+});
+
+test('用户名截断按码点：星平面字符不被切断（= Rust chars().take(80)）', () => {
+  const emoji = '😀'; // U+1F600：UTF-16 里是代理对（length 2），码点 1 个
+  assert.equal(emoji.length, 2);
+  const out = normalizeMods({ lockscreenDefaultUsername: emoji.repeat(100) });
+  assert.equal(Array.from(out.lockscreenDefaultUsername).length, 80);
+  assert.equal(out.lockscreenDefaultUsername, emoji.repeat(80));
+  // 混排：前 79 个星平面字符 + 1 个 BMP 字符后截断，尾部不留孤立代理项
+  const mixed = emoji.repeat(79) + 'A' + emoji.repeat(20);
+  const cut = normalizeMods({ lockscreenDefaultUsername: mixed }).lockscreenDefaultUsername;
+  assert.equal(cut, emoji.repeat(79) + 'A');
+  assert.equal(cut.length, 79 * 2 + 1); // 码元数 = 码点数，未切断代理对
 });
 
 test('redrawMap 只保留合法 prefect_icon 路径', () => {
@@ -52,6 +93,20 @@ test('白名单与 Rust normalize 对齐：trim + 小写 + 去重 + 丢空', () 
     enabledOrigins: [' HTTP://NAS.LOCAL:8000 ', 'http://nas.local:8000', 'https://a.b', '', '   ']
   });
   assert.deepEqual(out.enabledOrigins, ['http://nas.local:8000', 'https://a.b']);
+});
+
+test('白名单小写只折 ASCII（= Rust to_ascii_lowercase，不是 Unicode toLowerCase）', () => {
+  // Rust `config.rs:584` 用 `to_ascii_lowercase()`：非 ASCII 大写字母保持原样。
+  // 若这里用 `String#toLowerCase()`，同一份配置在设置窗里显示的条目会与页面比对的
+  // 条目差一个字符（§8.4 的缺陷类别），文档表格声称的「一一对应」也就不成立。
+  assert.equal(normalizeOrigin(' HTTP://ПРИМЕР.РФ:8000 '), 'http://ПРИМЕР.РФ:8000');
+  assert.equal(normalizeOrigin('HTTP://NAS.ПРИМЕР.local'), 'http://nas.ПРИМЕР.local');
+  // 对照：Unicode 折叠会把西里尔大写也压下去（旧实现的行为）
+  assert.notEqual('ПРИМЕР'.toLowerCase(), 'ПРИМЕР');
+  assert.deepEqual(
+    normalizeMods({ enabledOrigins: ['HTTP://ПРИМЕР.РФ:8000', 'http://ПРИМЕР.РФ:8000'] }).enabledOrigins,
+    ['http://ПРИМЕР.РФ:8000']
+  );
 });
 
 test('幂等：归一化两次与一次结果相同（避免每次 set_config 后值漂移）', () => {

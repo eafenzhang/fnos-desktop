@@ -5,7 +5,7 @@
 // （`tauri-2.12.0/scripts/core.js:81` 用 `Object.defineProperty` 定义 `invoke`，
 // 与 `withGlobalTauri` 无关）。两条路径都试，取先可用的那条。
 //
-// 命令授权不在这里：`capabilities/default.json` 只把 5 个 `allow-*` 授予
+// 命令授权不在这里：`capabilities/default.json` 只把 6 个 `allow-*` 授予
 // label 为 `settings` 的窗口，其它窗口（含远程页面）调同一命令会被 ACL 拒绝。
 
 /** 当前可用的 invoke 实现；都不可用时抛错（由调用方 catch 并显示到界面上）。 */
@@ -42,3 +42,5 @@ export function setConfig(patch) { return invoke('set_config', { patch }); }
 export function reloadMain(url) { return invoke('reload_main', { url: url ?? null }); }
 export function openConfigDir() { return invoke('open_config_dir'); }
 export function resetConfig(scope) { return invoke('reset_config', { scope }); }
+/** 用系统默认浏览器打开外部链接（关于页的上游仓库）。Rust 侧只放行 http(s)。 */
+export function openUrl(url) { return invoke('open_url', { url }); }

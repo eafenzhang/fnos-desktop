@@ -1,20 +1,28 @@
 // 设置窗主逻辑：schema 驱动渲染 + IPC 提交（spec §8）。
 //
 // 三条硬约束：
-// 1. **显示的值 = 归一化后的值**（§8.4）：`state.config.mods` 一律先过 `normalizeMods`，
+// 1. **显示的值 = 生效的值**（§8.4）：`state.config.mods` 一律原样采纳 `get_config` /
+//    `set_config` 的返回（Rust 已经归一化过，它就是权威值），**不再二次归一化**——
+//    `clampLightness` 不是不动点，二次夹取会让界面显示 `#c4b4a1` 而页面按 `#c4b4a2`
+//    生效。归一化只保留给「用户刚输入的值」，在提交 patch 之前跑一次（见 `commit`）。
 //    任何渲染都只读 `state.config`，绝不把 IPC 原始值或用户刚输入的原文画到界面上。
 // 2. **提交后就地重渲染**：`set_config` 返回的是 Rust 归一化后的权威配置，
 //    以它为准刷新界面（因此「取色器选了 #ffffff，右侧显示 #b3b3b3」是同一份数据的两个视图）。
 // 3. `needsReload` 为真（只有 `shell.injectEnabled` / `shell.homeUrl` 会）时随后调
 //    `reload_main`——Rust 侧销毁并按新载荷重建主窗口（§6.6 勘误）。
+//
+// 另外两条窗口级行为：
+// - **焦点刷新**（`refresh`）：托盘等带外改动不发事件，重新获得焦点时重取配置。
+// - **关于页外链**：不在窗内导航，交给 Rust `open_url` → 系统默认浏览器。
 import { SCHEMA, UPSTREAM_REPO, VENDOR_DIR } from './schema.js';
-import { normalizeMods, normalizeOrigin, DEFAULT_BRAND_COLOR } from './normalize.js';
+import { MODS_KEYS, normalizeModsEntry, parseHttpOrigin, DEFAULT_BRAND_COLOR } from './normalize.js';
 import * as api from './bridge.js';
 
 /** 配置的三个段（键前缀）。 */
 const SECTIONS = ['mods', 'local', 'shell'];
 
-const state = { config: null, active: null, error: null };
+/** 界面状态。导出供单测与 Task 11 的状态条读取。 */
+export const state = { config: null, active: null, error: null };
 
 // ---------- DOM 小工具 ----------
 
@@ -71,19 +79,51 @@ function setPath(obj, path, value) {
   return obj;
 }
 
-/** 把 IPC 返回的配置收进 state：`mods` 必须先归一化（§8.4）。 */
-function adoptConfig(raw) {
+/**
+ * 把 IPC 返回的配置收进 state。
+ *
+ * **`mods` 原样采纳，不做任何归一化**（Review finding A / §8.4）。理由：
+ * Rust 的 `Config::normalize` 在 `load` 与**每次** `set_config` 都跑过，`get_config` /
+ * `set_config` 回包里的 `mods` 就是「页面实际生效的那份值」。JS 侧再夹一次会引入
+ * 一个单通道偏差，因为 `clampLightness` **不是不动点**：
+ *
+ *   `#cec1b2` --Rust--> `#c4b4a2` --JS 再夹一次--> `#c4b4a1`
+ *
+ * 于是设置窗显示 `#c4b4a1`（取色器与 `f_mods_brandColor_value` 都是它），而页面按
+ * `#c4b4a2` 生效——正是 §8.4 要根除的「显示 A、生效 B」。实测 20 万随机色里约 40 个
+ * 落在这种「再夹一次就变」的带上，所以手写/历史遗留颜色很容易踩到。
+ *
+ * 归一化只剩一个合法入口：用户刚输入的值，在提交 patch 之前（`commit` →
+ * `normalizeModsEntry`）。回归测试见 `tests/settings.test.mjs` 的 `#cec1b2` 案例。
+ */
+export function adoptConfig(raw) {
   if (!raw || typeof raw !== 'object') return;
-  state.config = { ...raw, mods: normalizeMods(raw.mods) };
+  // 只做「形状」兜底（缺 `mods` 时给空对象，避免渲染期到处判空），不改任何值。
+  const mods = raw.mods && typeof raw.mods === 'object' ? raw.mods : {};
+  state.config = { ...raw, mods };
 }
 
 // ---------- 提交 ----------
 
+/**
+ * 提交前的最后一次归一化：**只对 `mods.*` 白名单键**做（与 Rust 同义）。
+ *
+ * 这是归一化的唯一入口——它作用在「用户刚输入的值」上，绝不作用在 IPC 回包上
+ * （`adoptConfig` 的注释说明了二次夹取的危害）。`shell.*` / `local.*` 原样提交，
+ * 由 Rust 侧按各自规则处理。
+ */
+function normalizeForSubmit(path, value) {
+  const [section, ...rest] = path.split('.');
+  const sub = rest.join('.');
+  return section === 'mods' && MODS_KEYS.includes(sub) ? normalizeModsEntry(sub, value) : value;
+}
+
 /** 提交一个设置项：`set_config` → 需要时 `reload_main` → 用返回的权威配置重渲染。 */
 async function commit(key, value, node) {
   if (node) node.classList.add('pending');
+  const path = resolvePath(key);
   try {
-    const res = await api.setConfig(setPath({}, resolvePath(key), value));
+    const res = await api.setConfig(setPath({}, path, normalizeForSubmit(path, value)));
     adoptConfig(res.config);
     // gap (a)：只有 injectEnabled / homeUrl 变更才会是 true，此时必须重建主窗口
     if (res.needsReload) await api.reloadMain(null);
@@ -202,20 +242,22 @@ function fieldEl(item) {
       addInput.placeholder = 'https://nas.example.com:8000';
       const add = button('添加');
       add.id = `${id}_addbtn`;
+      // 可见的错误提示（不是只把边框标红）：`role=alert` 让读屏与 UIA 都能拿到它。
+      const addErr = el('p', { id: `${id}_adderr`, className: 'origin-error', attrs: { role: 'alert' } });
       const doAdd = () => {
-        let origin = '';
-        try {
-          // 与 Rust `origin_of` 同义：只取 scheme://host[:port]，并小写化
-          origin = normalizeOrigin(new URL(addInput.value.trim()).origin);
-        } catch (e) {
-          origin = '';
-        }
+        // 只接受 http(s) 绝对地址（Review finding B）。旧写法 `new URL(v).origin` 对
+        // `nas.example.com:8000` / `nas:8000` / `mailto:` / `data:` / `javascript:` 返回
+        // **字符串 `"null"`**，而 `"null"` 是 truthy，`if (!origin)` 拦不住 → junk 落盘成
+        // 一个永远匹配不上的白名单条目。
+        const origin = parseHttpOrigin(addInput.value);
         if (!origin) {
           addInput.classList.add('error');
+          addErr.textContent = '只接受 http:// 或 https:// 开头的完整地址，例如 http://nas.local:5666（未写入任何内容）';
           addInput.focus();
           return;
         }
         addInput.classList.remove('error');
+        addErr.textContent = '';
         addInput.value = '';
         const next = list.concat([origin]).filter((o, i, a) => a.indexOf(o) === i);
         commit(key, next, wrap);
@@ -223,7 +265,7 @@ function fieldEl(item) {
       add.addEventListener('click', doAdd);
       addInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') doAdd(); });
       addRow.append(addInput, add);
-      box.appendChild(addRow);
+      box.append(addRow, addErr);
       wrap.appendChild(box);
       break;
     }
@@ -263,7 +305,7 @@ function renderAbout(pane) {
   // Rust 侧字段是 `webview_version` + `#[serde(rename_all = "camelCase")]`，serde 只把
   // `_v` 变成 `V`，因此真实 JSON 键是 **`webviewVersion`**（不是 `webViewVersion`）。
   // 任务书/spec §8.3 的写法是 `webViewVersion`，这里两个都读：契约写法差异不该表现为
-  // 「关于页永远显示未知」。本轮真机验证正是这样抓到它的（详见 task-9-report.md）。
+  // 「关于页永远显示未知」（本轮真机 UIA 断言正是靠这一点区分出 `undefined` 的）。
   const webviewVersion = meta.webViewVersion || meta.webviewVersion;
   const card = el('div', { className: 'card' });
   card.appendChild(metaRow('应用版本', meta.shellVersion || '未知'));
@@ -314,19 +356,31 @@ function renderAbout(pane) {
   linkLine.appendChild(document.createTextNode('上游项目：'));
   const link = el('a', { text: UPSTREAM_REPO });
   link.href = UPSTREAM_REPO;
-  // `target=_blank` 是**必需的**，不是装饰：wry 在 `new_window_handler` 为 None 时
-  // 直接 `args.SetHandled(true)`（wry-0.57.0/src/webview2/mod.rs 的 NewWindowRequested
-  // 分支），新窗口请求被吞掉 = 点击不动；若不加 target，则会在**设置窗自身**里导航到
-  // GitHub——UI 被顶掉、capability 又只授权本地来源，设置窗就废了。
-  // 这里刻意不 preventDefault：将来 Rust 侧补上 on_new_window（系统浏览器打开）后链接自动可用。
-  link.target = '_blank';
   link.rel = 'noopener noreferrer';
   link.id = 'upstreamLink';
+  // 外链**不在窗内导航**，交给 Rust `open_url` 用系统默认浏览器打开（Review finding D）。
+  //
+  // 为什么必须 preventDefault：不加的话 Chromium 会在**设置窗自身**里导航到 GitHub——
+  // UI 被顶掉，而 `capabilities/default.json` 只授权本地来源，加载后的远程页面调不动
+  // 任何命令，设置窗等于废掉。`target=_blank` 也救不了：wry 在 `new_window_handler`
+  // 为 None 时直接 `args.SetHandled(true)`（wry-0.57.0/src/webview2/mod.rs 的
+  // NewWindowRequested 分支，tauri 默认不注册），新窗口请求被静默吞掉 = 点了不跳转。
+  // `href` 仍然保留：URL 可见、可复制、在无障碍树里仍是 Hyperlink。
+  link.addEventListener('click', async (e) => {
+    e.preventDefault();
+    try {
+      await api.openUrl(UPSTREAM_REPO);
+      state.error = null;
+    } catch (err) {
+      state.error = `打开上游链接失败：${message(err)}`;
+      render();
+    }
+  });
   linkLine.appendChild(link);
   legal.appendChild(linkLine);
   legal.appendChild(el('p', {
     className: 'legal-line dim',
-    text: `上游许可全文与版权声明：${VENDOR_DIR}/LICENSE（另有 ${VENDOR_DIR}/NOTICE：来源仓库、锁定 commit、各文件 SHA-256、本壳的包装性改动清单）。链接仅作展示，当前窗口未注册外部打开处理器，点击不会跳转，需手动复制到浏览器。`
+    text: `上游许可全文与版权声明：${VENDOR_DIR}/LICENSE（另有 ${VENDOR_DIR}/NOTICE：来源仓库、锁定 commit、各文件 SHA-256、本壳的包装性改动清单）。点击上面的链接会用系统默认浏览器打开；若被系统策略拦截，可手动复制地址。`
   }));
   pane.appendChild(legal);
 }
@@ -372,13 +426,63 @@ function render() {
   pane.scrollTop = scroll;
 }
 
-async function boot() {
+/** 正在刷新（防止焦点事件与 boot / commit 的两次 getConfig 互相穿插）。 */
+let refreshing = false;
+
+/** 粗粒度比较：IPC 配置是纯 JSON（mods/local/shell/meta），序列化结果一致即视为没变。 */
+function sameConfig(a, b) {
+  return !!a && !!b && JSON.stringify(a) === JSON.stringify(b);
+}
+
+/**
+ * 重取配置并就地重渲染（Review finding C）。
+ *
+ * 为什么需要：托盘「注入 mods」勾选项走 `commands::set_inject_enabled`，它只改
+ * `AppState` + 落盘 + `sync_menus`，**不向设置窗发任何事件**；而本窗只在 `boot()` 取过
+ * 一次配置，于是带外改动后它会一直显示过期值，直到关掉重开。窗口重新获得焦点时刷新是
+ * 最小实现：不引入事件总线、不改 Rust 侧。
+ *
+ * `render()` 会保留 `state.active`（当前分组）与 `pane.scrollTop`（滚动位置），
+ * 所以刷新不会把用户弹回第一组。另外**配置没变就不重渲染**：否则每次 alt-tab 回来都会
+ * 重建 DOM，把用户正在输入、尚未提交的文本（例如 NAS 地址）一起丢掉。
+ *
+ * **Task 11 的状态条直接复用这个 `refresh()`**（它需要的正是同一个「带外变更 → 重取」
+ * 钩子）：把 `boot()` 里的 `focus` 监听留在这里，别在状态条里另建一套事件/轮询机制。
+ */
+export async function refresh() {
+  if (refreshing) return;
+  refreshing = true;
+  let next = null;
+  try {
+    next = await api.getConfig();
+  } catch (e) {
+    state.error = `刷新配置失败：${message(e)}`;
+    refreshing = false;
+    render();
+    return;
+  }
+  refreshing = false;
+  if (sameConfig(state.config, next)) return;
+  adoptConfig(next);
+  state.error = null;
+  render();
+}
+
+/** 取一次配置并渲染。导出以便单测；无 DOM 时模块加载不会自动执行（见文件末尾）。 */
+export async function boot() {
   try {
     adoptConfig(await api.getConfig());
   } catch (e) {
     state.error = `读取配置失败：${message(e)}`;
   }
   render();
+  window.addEventListener('focus', () => { refresh(); });
 }
 
-boot();
+// 只有真实页面才自动启动：Node 单测 `import` 本模块时没有 DOM，直接 `boot()` 会抛错，
+// 于是「导入 app.js 测内部逻辑」就变得不可行（Review 打磨项）。判据用 `#pane` 而不是
+// 只看 `typeof document`：只有 DOM、没有页面骨架时同样不该启动。
+const hasPane = typeof document !== 'undefined'
+  && typeof document.getElementById === 'function'
+  && !!document.getElementById('pane');
+if (hasPane) boot();

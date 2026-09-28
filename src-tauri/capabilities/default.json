@@ -9,6 +9,7 @@
     "allow-set-config",
     "allow-reload-main",
     "allow-open-config-dir",
+    "allow-open-url",
     "allow-reset-config"
   ]
 }

@@ -58,6 +58,10 @@ h2.pane-title { font-size: 17px; margin: 0 0 14px; }
 .origin-row.add { margin-top: 6px; }
 .origin-row.add input { min-width: 0; flex: 1 1 240px; }
 .origin-empty { margin: 0; color: var(--dim); font-size: 12px; }
+/* 白名单「添加」被拒时的可见错误（不是只标红边框）：Review finding B 要求
+   「拒绝并给出可见错误」，运行时验证用 UIA 读这段文本。 */
+.origin-error { flex-basis: 100%; margin: 4px 0 0; color: #ff9a94; font-size: 12px; }
+.origin-error:empty { display: none; }
 .row { display: flex; justify-content: space-between; gap: 16px; padding: 8px 0; border-bottom: 1px solid var(--line); }
 .row:last-child { border-bottom: none; }
 .row-label { color: #c8ccd1; flex: 0 0 auto; }

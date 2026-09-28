@@ -404,6 +404,52 @@ pub fn open_config_dir() -> Result<(), String> {
     Ok(())
 }
 
+/// 用**系统默认浏览器**打开外部链接（spec §10：关于页的上游仓库链接）。
+///
+/// 为什么需要它（Review finding D）：关于页的 `<a>` 在既有架构里是死链——
+/// 不加 `target="_blank"` 时 Chromium 会在**设置窗自身**里导航到 GitHub（UI 被顶掉，
+/// 而 `capabilities/default.json` 只授权本地来源，加载后的远程页面调不动任何命令）；
+/// 加了 `target="_blank"` 时 wry 在 `new_window_handler` 为 `None` 时直接
+/// `args.SetHandled(true)`（wry-0.57.0/src/webview2/mod.rs 的 `NewWindowRequested` 分支，
+/// tauri 默认不注册），新窗口请求被静默吞掉 = 点了不跳转。正路是把「打开外部链接」
+/// 交给 shell，UI 只负责 `preventDefault` + `invoke('open_url')`。
+///
+/// **安全不变式**：URL 先过 `config::parse_web_url`（scheme 必须是 `http`/`https`、
+/// 必须带 host，且判定前 trim）。`javascript:` / `data:` / `file:` / `mailto:` /
+/// 无 scheme（`nas.example.com:8000`）一律 `Err`——绝不会有未校验文本进入进程创建。
+#[tauri::command]
+pub fn open_url(url: String) -> Result<(), String> {
+    let parsed =
+        external_url(&url).ok_or_else(|| format!("只允许 http/https 链接，已拒绝：{url}"))?;
+    open_in_browser(parsed.as_str())
+}
+
+/// `open_url` 的校验部分，单独拆出来是为了能单测（断言拒绝路径不必真的开浏览器）。
+fn external_url(raw: &str) -> Option<tauri::Url> {
+    config::parse_web_url(raw)
+}
+
+/// 把已经校验过的 http(s) URL 交给系统默认浏览器。
+///
+/// 选 `explorer <url>` 而不是 `cmd /C start "" <url>`：前者把 URL 作为**一个**
+/// `CreateProcess` 参数直接交给 explorer（ShellExecute 语义），完全不经过 cmd.exe 的
+/// 参数/元字符解析（`&`、`^`、`%`、`!` 都不需要转义，也不需要 `start` 那个
+/// 「第一个带引号的参数会被当成窗口标题」的坑）。后者等于把「已校验文本」再交给一个
+/// 命令行解释器去解析，多一层不需要的解析面。`open_config_dir` 用的也是同一个
+/// `explorer` 进程，两处行为一致、可预期。
+///
+/// `explorer.exe` 的退出码不表示成败（对 URL 这类转发恒为 1），所以只 `spawn` 不 `wait`。
+fn open_in_browser(url: &str) -> Result<(), String> {
+    std::process::Command::new("explorer")
+        .arg(url)
+        .spawn()
+        .map_err(|e| format!("打开系统默认浏览器失败：{e}"))?;
+    // 排障 + 验证用：一次成功的「交给系统浏览器」在应用 stderr 留一行。运行时验证靠它
+    // 确认点击真的走到了这条命令（而不是被 webview 吞掉），与建窗时的页面加载日志同风格。
+    eprintln!("[fnos] open_url -> 系统默认浏览器: {url}");
+    Ok(())
+}
+
 #[tauri::command]
 pub fn reset_config<R: Runtime>(app: AppHandle<R>, scope: String) -> Result<ConfigView, String> {
     let mut cfg = current(&app);
@@ -546,4 +592,74 @@ pub fn save_window_geom<R: Runtime>(app: &AppHandle<R>) {
     cfg.shell.window.clamp_to_usable();
     let _ = cfg.save(&Config::config_path());
     *app.state::<AppState>().config.lock().unwrap() = cfg;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `open_url` 的闸门：只有绝对 http(s) URL 能过。
+    #[test]
+    fn external_url_accepts_only_absolute_http_and_https() {
+        assert!(external_url("https://github.com/aurysian-yan/fnOS_UI_Mods").is_some());
+        assert!(external_url("http://nas.local:5666").is_some());
+        // 判定前 trim（与 `parse_web_url` 一致），且路径/查询串不参与判定
+        assert!(external_url("  http://nas.local:8000/ui/index.html?a=1  ").is_some());
+
+        for bad in [
+            "nas.example.com:8000", // 无 scheme：`Url::parse` 当相对地址 → 解析失败
+            "nas:8000",             // scheme 合法但不是 http(s)
+            "localhost:8000",
+            "mailto:a@b.c",
+            "data:text/html,<script>alert(1)</script>",
+            "javascript:alert(1)",
+            "file:///C:/Windows/System32/calc.exe",
+            "ftp://nas.local",
+            "http://", // 没有 host
+            "https://",
+            "",
+            "   ",
+        ] {
+            assert!(external_url(bad).is_none(), "应当拒绝：{bad:?}");
+        }
+    }
+
+    /// 命令级拒绝路径（不触发任何进程创建，因此可以进单测）。
+    #[test]
+    fn open_url_rejects_non_http_without_spawning_anything() {
+        for bad in [
+            "javascript:alert(1)",
+            "nas.example.com:8000",
+            "mailto:a@b.c",
+        ] {
+            let err = open_url(bad.into()).expect_err("必须返回 Err");
+            assert!(
+                err.contains("http/https"),
+                "错误信息应说明只允许 http(s)：{err}"
+            );
+        }
+    }
+
+    /// finding A 的算术前提：Rust 把 `#cec1b2` 夹成什么，以及那个值是不是 JS
+    /// `clampLightness` 的不动点。
+    ///
+    /// 设置窗「显示值 = 生效值」的不变式就靠「Rust 已归一化、JS 不再夹一次」成立，
+    /// 所以这里把 Rust 的实际输出钉住；JS 侧的对应断言（`clampLightness('#cec1b2')`
+    /// 与 `clampLightness(那个值)`）在 tests/settings.test.mjs。
+    #[test]
+    fn brand_color_clamp_of_the_finding_a_input() {
+        assert_eq!(
+            crate::config::normalize_brand_color("#cec1b2"),
+            "#c4b4a2",
+            "JS clampLightness('#cec1b2') 也是 #c4b4a2，两侧必须同值"
+        );
+        // 而且它**不是幂等的**：再夹一次就是 #c4b4a1。所以「谁对同一个值跑了两遍」在哪一侧
+        // 都是缺陷——pre-fix 的 JS `adoptConfig` 是，`Config::save` 里那次多余的
+        // `normalize()`（config.rs:689，注释写的是「幂等」）也是。
+        assert_eq!(
+            crate::config::normalize_brand_color("#c4b4a2"),
+            "#c4b4a1",
+            "非幂等性本身就是 A 类缺陷的根因，锁住它"
+        );
+    }
 }
