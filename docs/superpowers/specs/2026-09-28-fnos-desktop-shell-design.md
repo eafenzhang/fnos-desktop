@@ -159,13 +159,17 @@ config (纯数据) ──► injector (纯函数) ──► main/tray/commands (
 
 上游只在签名命中后才注入 `mod.js`，因此**不能**无条件提前执行（否则官网页面会挂上窗口动画）。
 
-设计：`getURL('mod.js')` 返回的 data URL 内容 = **`mod.js` 原文 + `window.__FNOS_MOD_EXECUTED__ = true;`**。`bootstrap.js` 用 `MutationObserver` 观察 `script#fnos-ui-mods-script` 的出现；若 ~100ms 后标记仍未置位（说明 data: 脚本被 CSP 拦），则由 bootstrap 直接执行 `mod.js` 原文——此时刻与上游语义一致，且执行发生在 `initialization_script` 上下文中，**不受 CSP 约束**。
+设计：`getURL('mod.js')` 返回的 data URL 内容 = **`mod.js` 原文 + `window.__FNOS_MOD_EXECUTED__ = true;`**。`bootstrap.js` 用 `MutationObserver` 观察 `script#fnos-ui-mods-script` 的出现；若 ~100ms 后标记仍未置位（说明 data: 脚本被 CSP 拦），则由 bootstrap 直接执行 `mod.js` 原文——此时刻与上游语义一致。**元素始终不出现时不得执行**（上游未确认签名就不会注入，此时跑 `mod.js` 会把窗口动画挂到非飞牛页面）。
+
+勘误（2026-09-28，T5 评审）：原文称该兜底「不受 CSP 约束」**不准确**。CSS 兜底走 `adoptedStyleSheets`，确实不受 `style-src` 约束；但 `mod.js` 兜底用的是 `new Function` / 间接 `eval`，**同属 eval 家族、受同一条 `script-src`（缺 `unsafe-eval`）约束**。页面 CSP 严格时两条执行路径会同时失效，此时唯一路径是上游自己的 `data:` `<script src>`（需 `script-src` 允许 `data:`）。bootstrap 因此在双重失败时置 `window.__FNOS_MOD_FALLBACK_FAILED__ = true` 且不置执行标记，使该情形可观测；真实 WebUI 上的实测列入 Task 10 验收。
 
 ### 5.5 注入时序
 
 ```
 Tauri initialization_script（每次顶层文档导航、HTML 解析前）
-  ① window.__FNOS_SHELL__ = { version, modsCommit, mods:{...25键}, local:{...}, assets:{ "basic_mod.css": "<原文>", ... } }
+  ① window.__FNOS_SHELL__ = { meta: { shellVersion, modsCommit, modsVersion }, mods:{...25键}, local:{...}, assets:{ "basic_mod.css": "<原文>", ... }, binaryAssets:{ "prefect_icon/x.png": "<base64>" } }
+     （勘误 2026-09-28：原文误写为顶层 version/modsCommit、且漏了 binaryAssets；`meta` 的键名是 camelCase，
+      由 Task 6 的 `#[serde(rename_all = "camelCase")]` 保证——否则 shim/bootstrap 会静默回落 '0.0.0'）
   ② shim.js                      安装 chrome.* 兼容层
   ③ bootstrap.js                 惰性 getURL、链接自检与 adoptedStyleSheets 兜底、mod.js 兜底执行
   ④ content-script.js            上游原样代码（自带签名判定与全部注入逻辑）
