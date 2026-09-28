@@ -314,13 +314,19 @@ function renderAbout(pane) {
   linkLine.appendChild(document.createTextNode('上游项目：'));
   const link = el('a', { text: UPSTREAM_REPO });
   link.href = UPSTREAM_REPO;
+  // `target=_blank` 是**必需的**，不是装饰：wry 在 `new_window_handler` 为 None 时
+  // 直接 `args.SetHandled(true)`（wry-0.57.0/src/webview2/mod.rs 的 NewWindowRequested
+  // 分支），新窗口请求被吞掉 = 点击不动；若不加 target，则会在**设置窗自身**里导航到
+  // GitHub——UI 被顶掉、capability 又只授权本地来源，设置窗就废了。
+  // 这里刻意不 preventDefault：将来 Rust 侧补上 on_new_window（系统浏览器打开）后链接自动可用。
+  link.target = '_blank';
   link.rel = 'noopener noreferrer';
   link.id = 'upstreamLink';
   linkLine.appendChild(link);
   legal.appendChild(linkLine);
   legal.appendChild(el('p', {
     className: 'legal-line dim',
-    text: `上游许可全文与版权声明：${VENDOR_DIR}/LICENSE（另有 ${VENDOR_DIR}/NOTICE：来源仓库、锁定 commit、各文件 SHA-256、本壳的包装性改动清单）。此处链接仅作展示，当前窗口未注册外部打开处理器，需手动复制到浏览器。`
+    text: `上游许可全文与版权声明：${VENDOR_DIR}/LICENSE（另有 ${VENDOR_DIR}/NOTICE：来源仓库、锁定 commit、各文件 SHA-256、本壳的包装性改动清单）。链接仅作展示，当前窗口未注册外部打开处理器，点击不会跳转，需手动复制到浏览器。`
   }));
   pane.appendChild(legal);
 }
