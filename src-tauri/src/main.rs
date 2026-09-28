@@ -1,3 +1,6 @@
+mod config;
+mod paths;
+
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 
 fn main() {
