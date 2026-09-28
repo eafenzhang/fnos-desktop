@@ -228,8 +228,40 @@ impl Default for Config {
     }
 }
 
-/// #rrggbb（或 #rgb）→ HSL，把明度夹到 30%–70%，再转回 #rrggbb。
-/// 非法输入回落默认色。
+/// 品牌色明度的合法区间（HSL 的 L，取值 0.0–1.0）。
+const BRAND_LIGHTNESS_MIN: f64 = 0.30;
+const BRAND_LIGHTNESS_MAX: f64 = 0.70;
+
+/// 「已经在区间内」的判定必须带上的 8 位量化容差。
+///
+/// 夹取把 `l` 钉在边界上，再由 `to()` 把三个通道各自四舍五入到 8 位：每个通道最多偏
+/// 0.5/255，于是**夹取结果重新算出来的 `l` 最多偏离边界 0.5/255**。若判据写成严格的
+/// `[0.30, 0.70]`，夹取结果就不是不动点：
+///
+/// - `#ffffff` → `#b3b3b3`（`l = 179/255 = 0.70196 > 0.70`）——它「看起来稳定」只是因为
+///   灰度重算后仍落在 179；
+/// - `#cec1b2` → `#c4b4a2`（同一个 `0.70196`）——再夹一次就变成 `#c4b4a1`，于是
+///   `Config::save`（写盘前再 `normalize()` 一次）落盘的值与内存/生效值差一个通道。
+///
+/// 1/255 是 0.5/255 的两倍，留出浮点误差余量。区间因此实际判定为
+/// `[0.30 - 1/255, 0.70 + 1/255]`：这是「不许改动夹取结果」的**必要条件**——
+/// 要让 `#ffffff → #b3b3b3` 保持不变，`0.70196` 就必须被算作「已在区间内」。
+const BRAND_LIGHTNESS_EPSILON: f64 = 1.0 / 255.0;
+
+/// `#rrggbb`（或 `#rgb`）→ HSL：明度不在 30%–70% 时夹到边界再转回 `#rrggbb`，
+/// **已经在区间内（含 [`BRAND_LIGHTNESS_EPSILON`] 的量化容差）时原样返回**规范化后的输入。
+/// 非法输入回落默认色。输出永远是小写 6 位。
+///
+/// **幂等（不动点）**：`f(f(x)) == f(x)` 对任意输入成立，由构造保证——区间内直接返回
+/// `x` 的规范写法；区间外的返回值其明度最多偏离边界 0.5/255 < `BRAND_LIGHTNESS_EPSILON`，
+/// 故第二次调用必然走「原样返回」这一支。
+///
+/// 这条不变式是 `Config::save` 敢在写盘前再 `normalize()` 一次的前提，也是 §8.4
+///「显示即生效」的前提：内存、注入载荷、磁盘必须是同一个字符串。
+///
+/// - `#cec1b2`（L=75.3%）→ 夹取 → `#c4b4a2`，再作用一次仍是 `#c4b4a2`
+///   （修前是 `#c4b4a1`：磁盘与生效值分叉）
+/// - `#ffffff` → `#b3b3b3`、`#000000` → `#4d4d4d`、`bogus` → `#0066ff`（越界/非法行为不变）
 pub fn normalize_brand_color(input: &str) -> String {
     let raw = input.trim();
     let hex = raw.strip_prefix('#').unwrap_or(raw);
@@ -242,18 +274,31 @@ pub fn normalize_brand_color(input: &str) -> String {
         6 => hex.to_string(),
         _ => return DEFAULT_BRAND_COLOR.into(),
     };
-    let (r, g, b) = match (
+    let (ru, gu, bu) = match (
         u8::from_str_radix(&expanded[0..2], 16),
         u8::from_str_radix(&expanded[2..4], 16),
         u8::from_str_radix(&expanded[4..6], 16),
     ) {
-        (Ok(r), Ok(g), Ok(b)) => (r as f64 / 255.0, g as f64 / 255.0, b as f64 / 255.0),
+        (Ok(r), Ok(g), Ok(b)) => (r, g, b),
         _ => return DEFAULT_BRAND_COLOR.into(),
     };
+    // 输入的规范写法（小写 6 位，`#06f` → `#0066ff`）。故意用解析出的字节重新格式化，
+    // 而不是给输入做小写化：`u8::from_str_radix` 接受前导 `+`（`"#+f0000"` 能解析成
+    // `#0f0000`），直接小写输入会把 `+` 原样带进结果。
+    let canonical = format!("#{ru:02x}{gu:02x}{bu:02x}");
+    let (r, g, b) = (ru as f64 / 255.0, gu as f64 / 255.0, bu as f64 / 255.0);
 
     let max = r.max(g).max(b);
     let min = r.min(g).min(b);
     let l = (max + min) / 2.0;
+    // 幂等的关键一步：区间内（含量化容差）原样返回，夹取结果因此必是不动点。
+    if (BRAND_LIGHTNESS_MIN - BRAND_LIGHTNESS_EPSILON
+        ..=BRAND_LIGHTNESS_MAX + BRAND_LIGHTNESS_EPSILON)
+        .contains(&l)
+    {
+        return canonical;
+    }
+
     let d = max - min;
     let s = if d == 0.0 {
         0.0
@@ -270,7 +315,7 @@ pub fn normalize_brand_color(input: &str) -> String {
         60.0 * ((r - g) / d + 4.0)
     };
     let h = if h < 0.0 { h + 360.0 } else { h };
-    let l = l.clamp(0.30, 0.70);
+    let l = l.clamp(BRAND_LIGHTNESS_MIN, BRAND_LIGHTNESS_MAX);
 
     let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
     let x = c * (1.0 - ((h / 60.0) % 2.0 - 1.0).abs());
@@ -725,6 +770,196 @@ mod tests {
         assert_eq!(normalize_brand_color("#0066ff"), "#0066ff"); // 合法值保持不变
         assert_eq!(normalize_brand_color("nope"), "#0066ff"); // 非法值回落默认
         assert_eq!(normalize_brand_color("#06f"), "#0066ff"); // 展开短写法
+    }
+
+    /// 缺陷（fix round 2）：`normalize_brand_color` 必须是不动点。
+    ///
+    /// 修前 `#c4b4a2`（L = 179/255 = 0.70196，只比上界高 0.5/255）会被**再夹一次**成
+    /// `#c4b4a1`，而 `Config::save` 写盘前正好会再 `normalize()` 一次——落盘值与内存/
+    /// 注入载荷/页面生效值就此差一个通道（§8.4「显示即生效」被破坏）。
+    ///
+    /// 任务书里写的 `normalize_brand_color("#cec1b2") == "#cec1b2"` 在算术上不成立：
+    /// `#cec1b2` 的 HSL 明度是 **75.3%**，本就在 `[0.30, 0.70]` 之外，必须被夹一次成
+    /// `#c4b4a2`（否则「明度夹到 30%–70%」的既有契约失效，也与 `commands.rs` 的
+    /// finding-A 断言冲突）。真正要锁的不变式是「**已经归一化**的值再归一化不变」，
+    /// 即下面的不动点断言 + `brand_color_clamp_is_a_fixed_point_over_representative_colors`。
+    #[test]
+    fn brand_color_clamp_is_idempotent() {
+        // 越界输入的单次夹取行为逐条不变（含任务书点名的四个）
+        assert_eq!(normalize_brand_color("#cec1b2"), "#c4b4a2"); // L=75.3% → 70% → 单次夹取
+        assert_eq!(normalize_brand_color("#ffffff"), "#b3b3b3");
+        assert_eq!(normalize_brand_color("#000000"), "#4d4d4d");
+        assert_eq!(normalize_brand_color("bogus"), "#0066ff");
+        assert_eq!(normalize_brand_color("#06f"), "#0066ff");
+        // 夹取结果必须是不动点（本轮修的就是这三行里的前两行）
+        assert_eq!(normalize_brand_color("#c4b4a2"), "#c4b4a2");
+        assert_eq!(normalize_brand_color("#b3b3b3"), "#b3b3b3");
+        assert_eq!(normalize_brand_color("#4d4d4d"), "#4d4d4d");
+        // 区间内的输入原样返回，只做「小写 + 补成 6 位」的规范化
+        assert_eq!(normalize_brand_color("#0066ff"), "#0066ff");
+        assert_eq!(normalize_brand_color("#06F"), "#0066ff");
+        assert_eq!(normalize_brand_color("  #06f  "), "#0066ff");
+        assert_eq!(normalize_brand_color("0066FF"), "#0066ff");
+        assert_eq!(normalize_brand_color("#3366CC"), "#3366cc");
+    }
+
+    /// 不动点性质 `f(f(x)) == f(x)`（以及输出形状恒为小写 6 位十六进制）在代表性颜色集上
+    /// 成立：全部 256 档灰度（夹取边界正好落在灰度带上，最容易破坏不动点）、通道极值组合、
+    /// 缺陷色本身，以及一个确定性 LCG 抽出的 15 万个随机色。
+    ///
+    /// 旧的（非幂等）实现每几千个越界随机色就有反例（fix round 1 的评审在 198,829 个随机色
+    /// 里量到 43 个），这个规模足以覆盖；LCG 无外部依赖，失败可复现。
+    #[test]
+    fn brand_color_clamp_is_a_fixed_point_over_representative_colors() {
+        fn check(raw: &str) {
+            let once = normalize_brand_color(raw);
+            let twice = normalize_brand_color(&once);
+            assert_eq!(twice, once, "夹取不是不动点：{raw} -> {once} -> {twice}");
+            assert_eq!(once.len(), 7, "输出必须是 6 位：{raw} -> {once}");
+            assert!(once.starts_with('#'), "输出必须带 #：{raw} -> {once}");
+            assert_eq!(
+                once,
+                once.to_ascii_lowercase(),
+                "输出必须小写：{raw} -> {once}"
+            );
+            assert!(
+                once[1..].bytes().all(|b| b.is_ascii_hexdigit()),
+                "输出必须是十六进制：{raw} -> {once}"
+            );
+        }
+
+        let mut cases = 0usize;
+        for v in 0u16..=255 {
+            check(&format!("#{v:02x}{v:02x}{v:02x}"));
+            cases += 1;
+        }
+        for (r, g, b) in [
+            (0, 0, 0),
+            (255, 255, 255),
+            (255, 0, 0),
+            (0, 255, 0),
+            (0, 0, 255),
+            (255, 255, 0),
+            (0, 255, 255),
+            (255, 0, 255),
+            (1, 2, 3),
+            (254, 253, 252),
+            (0xce, 0xc1, 0xb2), // 缺陷色
+            (0xc4, 0xb4, 0xa2), // 单次夹取的结果
+            (0xc4, 0xb4, 0xa1), // 修前被二次夹取出来的值
+        ] {
+            check(&format!("#{r:02x}{g:02x}{b:02x}"));
+            cases += 1;
+        }
+        // 确定性 LCG（Numerical Recipes 常数）：无外部依赖，失败可复现
+        let mut state: u64 = 0x2545_f491_4f6c_dd1d;
+        for _ in 0..150_000 {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            check(&format!(
+                "#{:02x}{:02x}{:02x}",
+                (state >> 40) as u8,
+                (state >> 24) as u8,
+                (state >> 8) as u8
+            ));
+            cases += 1;
+        }
+        assert_eq!(cases, 256 + 13 + 150_000);
+    }
+
+    /// 穷举**全部** 16,777,216 个 `#rrggbb`（16 核机上实测 75 秒），默认不跑：不动点性质
+    /// 在整个色彩空间上成立，而不只是代表性抽样。需要完整证据时单独跑：
+    /// `cargo test -- --ignored brand_color_clamp_is_idempotent_exhaustively`
+    #[test]
+    #[ignore = "穷举 16.7M 色约 75 秒；作为代表性抽样的补充证据按需运行"]
+    fn brand_color_clamp_is_idempotent_exhaustively() {
+        let mut mismatches: Vec<String> = Vec::new();
+        for v in 0u32..=0x00ff_ffff {
+            let raw = format!("#{v:06x}");
+            let once = normalize_brand_color(&raw);
+            let twice = normalize_brand_color(&once);
+            if twice != once {
+                mismatches.push(format!("{raw} -> {once} -> {twice}"));
+                if mismatches.len() >= 8 {
+                    break;
+                }
+            }
+        }
+        assert!(mismatches.is_empty(), "不动点反例：{mismatches:?}");
+    }
+
+    /// fix round 2 的验收不变式：`save()` 写盘前会 `normalize()` 一份 clone，只要
+    /// `normalize_brand_color` 是不动点，「内存 == 磁盘 == 再 load 回来」就由构造成立。
+    /// 修前 `#c4b4a2` 会在写盘这一步变成 `#c4b4a1`（磁盘与生效值分叉，重启后再 load 甚至
+    /// 会让生效值也跟着掉一个通道）。
+    #[test]
+    fn save_round_trips_brand_color_byte_identically() {
+        let dir = temp_dir("brand-roundtrip");
+        let p = dir.join("config.json");
+        let mut c = Config::default();
+        c.mods.brand_color = "#cec1b2".into(); // 手工 / 历史遗留的越界值
+        c.normalize(); // = `Config::load` 的必经之路
+        let applied = c.mods.brand_color.clone();
+        assert_eq!(applied, "#c4b4a2", "单次夹取的结果");
+
+        c.save(&p).unwrap();
+        assert_eq!(c.mods.brand_color, applied, "save() 不得改动内存里的生效值");
+
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert!(
+            text.contains("\"brandColor\": \"#c4b4a2\""),
+            "磁盘上的值必须与生效值逐字节相同：{text}"
+        );
+        assert!(!text.contains("#c4b4a1"), "二次夹取的值不得落盘：{text}");
+        assert_eq!(Config::load(&p).mods.brand_color, applied);
+
+        // 反复 save → load 不再漂移（修前第二次读回来就是 #c4b4a1）
+        for _ in 0..3 {
+            Config::load(&p).save(&p).unwrap();
+        }
+        assert_eq!(Config::load(&p).mods.brand_color, applied);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 任务书要求的手写 `config.json` 场景：`#cec1b2` 是越界值（L=75.3%），第一次 `load`
+    /// 夹成 `#c4b4a2`，此后 load → save → load 全程保持 `#c4b4a2`（修前 `save` 会写成
+    /// `#c4b4a1`）。顺带钉住「区间内的手写值原样落盘、只做小写规范化」。
+    #[test]
+    fn hand_written_brand_color_config_does_not_drift() {
+        let dir = temp_dir("brand-handwritten");
+        let p = dir.join("config.json");
+        std::fs::write(
+            &p,
+            r##"{"schemaVersion":1,"mods":{"brandColor":"#cec1b2"}}"##,
+        )
+        .unwrap();
+
+        let first = Config::load(&p);
+        assert_eq!(first.mods.brand_color, "#c4b4a2");
+        first.save(&p).unwrap();
+        let disk = std::fs::read_to_string(&p).unwrap();
+        assert!(disk.contains("\"brandColor\": \"#c4b4a2\""), "{disk}");
+        assert!(!disk.contains("#c4b4a1"), "{disk}");
+
+        let second = Config::load(&p);
+        assert_eq!(second.mods.brand_color, "#c4b4a2");
+        second.save(&p).unwrap();
+        assert_eq!(Config::load(&p).mods.brand_color, "#c4b4a2");
+
+        // 已经归一化的手写值（区间内）也必须原样落盘
+        std::fs::write(
+            &p,
+            r##"{"schemaVersion":1,"mods":{"brandColor":"#3366CC"}}"##,
+        )
+        .unwrap();
+        let upper = Config::load(&p);
+        assert_eq!(upper.mods.brand_color, "#3366cc");
+        upper.save(&p).unwrap();
+        assert!(std::fs::read_to_string(&p)
+            .unwrap()
+            .contains("\"brandColor\": \"#3366cc\""));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

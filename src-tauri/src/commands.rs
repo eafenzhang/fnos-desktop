@@ -640,8 +640,7 @@ mod tests {
         }
     }
 
-    /// finding A 的算术前提：Rust 把 `#cec1b2` 夹成什么，以及那个值是不是 JS
-    /// `clampLightness` 的不动点。
+    /// finding A 的算术前提：Rust 把 `#cec1b2` 夹成什么，以及那个值是不是不动点。
     ///
     /// 设置窗「显示值 = 生效值」的不变式就靠「Rust 已归一化、JS 不再夹一次」成立，
     /// 所以这里把 Rust 的实际输出钉住；JS 侧的对应断言（`clampLightness('#cec1b2')`
@@ -653,13 +652,16 @@ mod tests {
             "#c4b4a2",
             "JS clampLightness('#cec1b2') 也是 #c4b4a2，两侧必须同值"
         );
-        // 而且它**不是幂等的**：再夹一次就是 #c4b4a1。所以「谁对同一个值跑了两遍」在哪一侧
-        // 都是缺陷——pre-fix 的 JS `adoptConfig` 是，`Config::save` 里那次多余的
-        // `normalize()`（config.rs:689，注释写的是「幂等」）也是。
+        // fix round 2：Rust 侧改成幂等（明度在区间内时原样返回），夹取结果因此是**不动点**。
+        // 于是 `Config::save` 里那次多余的 `normalize()`（config.rs，注释写的是「幂等」）
+        // 不再改动生效值——磁盘 == 内存 == 注入载荷 == 页面生效值。
+        // 修前这里是 `"#c4b4a1"`：`#c4b4a2` 的 L = 179/255 = 0.70196 会被二次夹取。
         assert_eq!(
             crate::config::normalize_brand_color("#c4b4a2"),
-            "#c4b4a1",
-            "非幂等性本身就是 A 类缺陷的根因，锁住它"
+            "#c4b4a2",
+            "夹取必须是不动点，否则 save() 会让 config.json 与生效值差一个通道"
         );
+        // JS 侧（ui/settings/normalize.js 的 `clampLightness`）仍不是不动点，本轮不动它；
+        // 不变式改由「JS 只夹用户刚输入的值、绝不夹 Rust 归一化过的值」维持（fix round 1 的 A）。
     }
 }
