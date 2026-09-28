@@ -332,7 +332,7 @@ Tauri initialization_script（每次顶层文档导航、HTML 解析前）
 
 | 命令 | 入参 | 返回 | 说明 |
 |---|---|---|---|
-| `get_config` | — | `{mods, local, shell, meta}` | `meta` 含版本、mods commit、WebView2 版本、配置路径 |
+| `get_config` | — | `{mods, local, shell, meta}` | `meta` 含 `shellVersion` / `modsCommit` / `modsVersion` / `webviewVersion` / `configPath`。**勘误（2026-09-28，T9 实测）**：键名是 camelCase 的 **`webviewVersion`**（`commands.rs` 字段 `webview_version` + `rename_all="camelCase"`）；plan/brief 里写的 `webViewVersion` 是笔误，UI 侧已按权威键名读取 |
 | `set_config` | `{patch: Partial<Config>}` | `{config, needsReload}` | 归一化 + 落盘 + 派发 `onChanged`；`needsReload=true` 仅在 `injectEnabled` 或 `homeUrl` 变更时出现，此时调用方随后调用 `reload_main`（该命令执行**窗口重建**，见 §6.6 勘误）。勘误：原文返回体还含 `applied`，无任何消费者，已删除 |
 | `reload_main` | `{url?}` | `()` | 重载/导航主窗口 |
 | `open_config_dir` | — | `()` | 打开配置目录 |
