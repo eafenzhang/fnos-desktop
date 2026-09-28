@@ -290,10 +290,13 @@ Tauri initialization_script（每次顶层文档导航、HTML 解析前）
 ✓ 注入 mods                      → 翻转 shell.injectEnabled，即时重注入
   打开 NAS                       → 有 nasUrl 则主窗口导航过去；未配置则置灰
   显示 / 隐藏主窗口
+  重新加载主窗口                  → 以当前配置重建主窗口（错误页/卡死后的手动重试入口）
   系统设置                       → 打开设置窗
   ──────────────
   退出
 ```
+
+> **勘误（2026-09-28，T11）**：菜单在原文 5 项之外新增「重新加载主窗口」（T11 修复轮落地），运行时 HMENU 实测 **6 个可点击项 + 1 条分隔线**。新增项是错误页之外的第二条重试入口（错误页处于应用来源，capability 故意不授权它调用 IPC）。
 
 - 托盘图标：内存生成的 32×32 RGBA（探针已验证 `Image::new_owned`），正式版换成 `icons/` 里的设计图标
 - 单实例：重复启动只唤起已有窗口
@@ -418,7 +421,7 @@ Tauri initialization_script（每次顶层文档导航、HTML 解析前）
 ### 12.2 端到端验收清单（M1–M3 完成时逐条执行，需 D7 的 FN ID `ea121314`）
 
 1. 启动 → 主窗口打开 `https://fnos.net/`，**页面无任何 mods 注入痕迹**（官网被正确跳过）
-2. 托盘右键菜单 **5 个可点击项 + 1 条分隔线** 存在，勾选项渲染为 ✓（勘误 2026-09-28：原文误写「四项」，见 §7 的菜单块）
+2. 托盘右键菜单 **6 个可点击项 + 1 条分隔线** 存在，勾选项渲染为 ✓（勘误 2026-09-28：原文误写「四项」；T11 又补了「重新加载主窗口」，见 §7 的菜单块与勘误）
 3. 设置窗填 NAS WebUI 地址（或走 FN ID 登录后取当前页）→ 保存后 `enabledOrigins` 含该 origin
 4. 在 NAS WebUI 页面：`basic_mod.css` 生效（外观变化）、`mod.js` 行为生效（窗口动画/squircle）
 5. 切换 `titlebarStyle` / `launchpadStyle` / 主题色 → **不刷新页面即时生效**
@@ -431,12 +434,15 @@ Tauri initialization_script（每次顶层文档导航、HTML 解析前）
 
 | 现象 | 处理 |
 |---|---|
-| 页面未通过签名判定（上游不注入） | 设置窗顶部状态条提示「未检测到 fnOS WebUI」，并提供「把当前页加入白名单」一键操作。**阶段性方案**：M1–M2 由 Rust 侧 `on_page_load` 判定并在设置窗打开时查询；双向上报通道在 P1（完美图标/登录壁纸）一并落地 |
+| 页面未通过签名判定（上游不注入） | 设置窗顶部状态条提示「未检测到 fnOS WebUI」，并提供「把当前页加入白名单」一键操作。**已落地形态（T11）**：设置窗通过**仅它可用**的只读命令 `get_page_state` 取主窗口当前 URL 与最近一次加载结果，据此判定；判定只看「是否 fnos.net / 是否在 `enabledOrigins` 或 `nasUrl` 的 origin 内」，因此弱态文案只声明「注入脚本已注册」而不谎称已生效。双向页面上报通道仍留待 P1 |
 | 外链 CSS 被 CSP 拦截 | §5.3 兜底 B 自动接管（`adoptedStyleSheets`） |
 | `mod.js` data URL 被拦 | §5.4 兜底执行 |
-| 主窗口加载失败/离线 | `on_page_load` 失败时显示内置错误页 + 重试按钮 |
+| 主窗口加载失败/离线 | 切到内置错误页（显示失败地址、原因、重试指引与自动退避 15s→30s→60s→120s），重试入口有三处：设置窗按钮、托盘「重新加载主窗口」、错误页自动退避。**勘误（2026-09-28，T11 实测）**：原文设想的「`on_page_load` 失败时」**不可行** —— wry 0.57 丢弃了 `NavigationCompleted` 的 `IsSuccess`（`wry-0.57.0/src/webview2/mod.rs:726-737`），且 `ICoreWebView2::Source` 在失败后仍返回请求地址，Chromium 的错误页也不会以 `chrome-error` 形式出现。实际实现为三层：① URL 短路（非 http(s) 直接判失败）；② **页面自检探针** —— 初始化脚本检测 Chromium 错误页特征（`#main-frame-error` / `body.neterror`）并以可打印 ASCII 前缀 `FNOSPROBE:` 经 `document.title` 回传（复用既有的标题跟随机制，**不经 IPC，因此不违反 R2，也不给远程页任何授权**）；③ **20s 看门狗**兜底「能连上但永不完成」的情况 |
 | WebView2 运行时缺失 | 启动时检测，缺失则提示并给微软运行时下载入口（不静默失败） |
-| `config.json` 损坏 | 回退默认 + 保留 `.bak` + 设置窗提示 |
+| WebView2 版本过低（< 139） | 「关于」页提示 `corner-shape` 效果退化（版本取 `tauri::webview_version()`，不做注册表探测） |
+| `config.json` 损坏 | 回退默认 + 保留 `.bak` + 设置窗状态条回显「配置文件损坏，已回退默认并保留 config.json.bak」（`meta.recoveredFromBackup`） |
+
+> 错误页路径勘误：`frontendDist` 实际是 `../ui/settings`（应用资源根即 `ui/settings/`），因此错误页落在 **`ui/settings/error.html`** 并以 `WebviewUrl::App("error.html")` 访问；原文写的 `src-tauri/src/error_page.html` 与 `ui/error.html` 都会被 App 协议 404。切错误页复用 T7+8 的**重建主窗口**机制并传入**空初始化脚本**，确保 mods 载荷绝不在错误页上运行（不依赖上游签名判定来跳过）。
 
 ---
 
