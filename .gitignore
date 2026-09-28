@@ -2,6 +2,10 @@
 target/
 src-tauri/target/
 _spike_tauri/src-tauri/target/
+_spike_tauri/src-tauri/gen/schemas/
+
+# SDD 过程产物（非项目代码）
+.superpowers/
 
 # 依赖
 node_modules/

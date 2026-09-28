@@ -1,0 +1,2 @@
+# tauri-build 每次编译重新生成的产物，不应入库
+/gen/schemas
