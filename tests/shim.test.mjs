@@ -74,9 +74,12 @@ test('__FNOS_APPLY_CONFIG__ 派发 onChanged 增量', async () => {
   assert.equal(events[0][1].brandColor.oldValue, '#336699');
 });
 
-test('getManifest 返回对象且含 version', () => {
-  const w = loadShim(SHELL);
-  assert.equal(typeof w.chrome.runtime.getManifest().version, 'string');
+test('getManifest 返回 meta.modsVersion，缺 meta 时回落 0.0.0', () => {
+  const w = loadShim({ ...SHELL, meta: { modsVersion: '1.2.3' } });
+  assert.equal(w.chrome.runtime.getManifest().version, '1.2.3');
+  const fallback = loadShim(SHELL);
+  assert.equal(typeof fallback.chrome.runtime.getManifest().version, 'string');
+  assert.equal(fallback.chrome.runtime.getManifest().version, '0.0.0');
 });
 
 test('getURL 大小写不敏感（icon-map 值是小写，文件名是 camelCase）', () => {
@@ -103,4 +106,41 @@ test('同一资源同时出现在 assets 与 binaryAssets 时，binaryAssets 优
     binaryAssets: { 'prefect_icon/a.png': 'AAAA' }
   });
   assert.equal(w.chrome.runtime.getURL('prefect_icon/a.png'), 'data:image/png;base64,AAAA');
+});
+
+test('非字符串资源值返回空串（上游 cs:2622 的注入闸门依赖空串）', () => {
+  const w = loadShim({ mods: {}, local: {}, assets: { 'a.css': 123, 'b.css': null, 'c.css': { x: 1 } } });
+  assert.equal(w.chrome.runtime.getURL('a.css'), '');
+  assert.equal(w.chrome.runtime.getURL('b.css'), '');
+  assert.equal(w.chrome.runtime.getURL('c.css'), '');
+});
+
+test('非字符串 binaryAssets 值同样返回空串（不得落入文本分支）', () => {
+  const w = loadShim({ mods: {}, local: {}, binaryAssets: { 'd.png': 42 } });
+  assert.equal(w.chrome.runtime.getURL('d.png'), '');
+});
+
+test('pick 用 hasOwnProperty 判定成员，原型键返回空对象且真实键仍可解析', async () => {
+  const w = loadShim(SHELL);
+  const proto = await new Promise((res) => w.chrome.storage.sync.get('constructor', res));
+  assert.deepEqual(proto, {});
+  const protoFn = await new Promise((res) => w.chrome.storage.sync.get('toString', res));
+  assert.deepEqual(protoFn, {});
+  const protoObj = await new Promise((res) => w.chrome.storage.sync.get({ constructor: 1 }, res));
+  assert.equal(protoObj.constructor, 1);
+  const own = await new Promise((res) => w.chrome.storage.sync.get('brandColor', res));
+  assert.deepEqual(own, { brandColor: '#336699' });
+  const ownArray = await new Promise((res) => w.chrome.storage.sync.get(['constructor', 'brandColor'], res));
+  assert.deepEqual(ownArray, { brandColor: '#336699' });
+});
+
+test('无回调的 get 返回 Promise（上游 cs:2548/2574/2594 用 await 形态）', async () => {
+  const w = loadShim(SHELL);
+  const localDefault = await w.chrome.storage.local.get({ a: 1 });
+  assert.deepEqual(localDefault, { a: 1 });
+  const merged = await w.chrome.storage.local.get({ customCssCode: 'override', extra: 5 });
+  assert.equal(merged.customCssCode, 'body{}');
+  assert.equal(merged.extra, 5);
+  const syncArray = await w.chrome.storage.sync.get(['brandColor']);
+  assert.deepEqual(syncArray, { brandColor: '#336699' });
 });

@@ -45,17 +45,19 @@
     var out = {};
     if (keys === null || keys === undefined) return Object.assign({}, store);
     if (typeof keys === 'string') {
-      if (keys in store) out[keys] = store[keys];
+      if (Object.prototype.hasOwnProperty.call(store, keys)) out[keys] = store[keys];
       return out;
     }
     if (Array.isArray(keys)) {
-      for (var i = 0; i < keys.length; i++) if (keys[i] in store) out[keys[i]] = store[keys[i]];
+      for (var i = 0; i < keys.length; i++) {
+        if (Object.prototype.hasOwnProperty.call(store, keys[i])) out[keys[i]] = store[keys[i]];
+      }
       return out;
     }
     // 对象形式：值作为默认值
     var defaults = keys;
     for (var k in defaults) {
-      out[k] = (k in store) ? store[k] : defaults[k];
+      out[k] = Object.prototype.hasOwnProperty.call(store, k) ? store[k] : defaults[k];
     }
     return out;
   }
@@ -131,6 +133,7 @@
         return 'data:' + mimeFor(path) + ';base64,' + entry.b64;
       }
       var text = entry.text;
+      if (typeof text !== 'string') return ''; // 上游 cs:2622 的注入闸门依赖空串
       if (path.toLowerCase() === 'mod.js') {
         text = text + '\n;window.__FNOS_MOD_EXECUTED__=true;\n';
       }
