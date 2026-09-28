@@ -7,7 +7,9 @@ mod injector;
 mod paths;
 mod tray;
 
-use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
+// `Manager` 提供 `get_webview_window`（单实例回调）与 `app_handle`（关闭回调）；
+// 建窗用的 `WebviewWindowBuilder` 已集中到 `commands::build_main_window`（首启/重建共用）。
+use tauri::Manager;
 
 /// 主窗口 label（spec §7）：main.rs / tray.rs / commands.rs 共用，避免字面量散落。
 pub const MAIN_WINDOW: &str = "main";
@@ -23,43 +25,48 @@ fn main() {
         }))
         .setup(|app| {
             let cfg = commands::load_config(app.handle());
-            commands::apply_home_url(app.handle(), &cfg);
+            commands::save_and_install_state(app.handle(), &cfg);
 
-            let window = WebviewWindowBuilder::new(
-                app,
-                MAIN_WINDOW,
-                WebviewUrl::External(cfg.shell.home_url.parse().expect("home url")),
-            )
-            .title("fnOS")
-            .inner_size(cfg.shell.window.w, cfg.shell.window.h)
-            .initialization_script(injector::build_init_script(&cfg))
-            // spec §7「主窗口：标题跟随页面」。tauri/wry **不会**自动把 `document.title`
-            // 同步到窗口标题：wry 只在 `WebviewBuilder::with_document_title_changed_handler`
-            // 被注册时才转发 `DocumentTitleChanged`（wry-0.57.0/src/webview2/mod.rs:689），
-            // 而 tauri 默认不注册（`webview/mod.rs:361` 里 `document_title_changed_handler: None`）。
-            // 不注册的话标题恒为下面的 `"fnOS"`。
-            .on_document_title_changed(|window, title| {
-                let _ = window.set_title(&title);
-            })
-            .build()?;
+            // Finding 1：这里不再有 `cfg.shell.home_url.parse().expect("home url")`——
+            // 地址经 `resolve_main_url` 逐级校验回落（覆盖 → homeUrl → 默认常量），
+            // 手改出来的非法 homeUrl 再也不会变成启动即 panic（release 下 R9 隐藏控制台，
+            // panic 的表现就是「双击无反应」）。
+            let url = commands::resolve_main_url(&cfg, None);
+            // 建窗细节（几何、注入载荷、标题跟随页面、加载日志）与重建路径共用一份定义
+            commands::build_main_window(app.handle(), url, &cfg)?;
 
-            tray::apply_window_geom(&window, &cfg);
             tray::install(app.handle())?;
-            // Task 8 Step 3 的合并结果：菜单状态跟随配置。`commands::set_inject_checked` 是
-            // 「muda 自己会同步」的空实现，不能把配置推给菜单，故启动时直接调 `sync_menus`
-            // （否则勾选态恒为 true、`打开 NAS` 恒为可点，与 config.json 不一致）。
+            // Task 8 Step 3 的合并结果：菜单状态跟随配置。`sync_menus` 是唯一机制
+            //（否则勾选态恒为 true、`打开 NAS` 恒为可点，与 config.json 不一致）。
             if let Err(e) = tray::sync_menus(app.handle(), &cfg) {
                 eprintln!("[fnos] 托盘同步失败: {e}");
             }
             Ok(())
         })
         .on_window_event(|window, event| {
-            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                if window.label() == MAIN_WINDOW {
-                    api.prevent_close();
-                    commands::save_window_geom(window.app_handle());
-                    let _ = window.hide();
+            if window.label() != MAIN_WINDOW {
+                return;
+            }
+            let app = window.app_handle();
+            match event {
+                tauri::WindowEvent::CloseRequested { api, .. } => {
+                    // 重建流程必须能真的关掉旧窗口，否则同 label 的新窗口建不出来
+                    if commands::is_recreating(app) {
+                        commands::save_window_geom(app);
+                        return; // 不 prevent_close → 窗口被销毁，`Destroyed` 里再建新的
+                    }
+                    commands::save_window_geom(app);
+                    // gap (c)：`shell.closeToTray`（默认 true = D5 的关窗隐藏）。
+                    // false 时不拦这次关闭 → 主窗口真的关闭；它是最后一个窗口时
+                    // tauri 发出 `ExitRequested` 并结束进程。
+                    if commands::close_to_tray(app) {
+                        api.prevent_close();
+                        let _ = window.hide();
+                    }
                 }
+                // gap (a)：tauri 的 label 注册表在 `Destroyed` 才释放，新窗口必须在这里建
+                tauri::WindowEvent::Destroyed => commands::on_main_destroyed(app),
+                _ => {}
             }
         })
         .invoke_handler(tauri::generate_handler![

@@ -1,0 +1,17 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "remote-deny",
+  "description": "§9 纵深防御：远程页面（主窗口加载的任何外部站点）显式拒绝 5 个命令；只列 deny-*、不含任何授权。不覆盖本地设置窗（local:false → 只产出 Remote 执行上下文；tauri-2.12.0/src/ipc/authority.rs:48 的 Origin::matches 只让 Remote×Remote 命中）。注 1：spec §9 原文写 remote.urls=[\"*\"]，但 tauri 2.12 用 urlpattern 解析（tauri-utils-2.10.0/src/acl/mod.rs:284），裸 \"*\" 直接 panic（invalid URL pattern for remote URL *: a relative input without a base URL is not valid），故写成 *://*:*（任意 scheme/host/端口，语义上最接近 \"*\"）。注 2：`http://*` 这类不带端口通配的写法**匹配不上非默认端口**（实测 http://127.0.0.1:8791 不命中 → deny 失效），必须带 `:*`。",
+  "local": false,
+  "windows": ["main"],
+  "remote": {
+    "urls": ["*://*:*"]
+  },
+  "permissions": [
+    "deny-get-config",
+    "deny-set-config",
+    "deny-reload-main",
+    "deny-open-config-dir",
+    "deny-reset-config"
+  ]
+}

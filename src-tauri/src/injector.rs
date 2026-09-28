@@ -69,6 +69,52 @@ fn assets() -> Assets {
     }
 }
 
+/// 把上游 `content-script.js` 包进「等到有 `documentElement` 再执行」的壳（**源码一个字节不改**）。
+///
+/// 为什么必须有这层壳（本轮探针实测）：tauri 的 `initialization_script` 走 WebView2 的
+/// `AddScriptToExecuteOnDocumentCreated`，执行时刻比 Chrome 扩展的 document_start 还早 ——
+/// 此刻 `document.head` 与 `document.documentElement` **都还是 null**。上游第一件事就是
+/// `(document.head || document.documentElement).appendChild(link)`（cs:2618 / 2658 / 2675），
+/// 于是 `startInject()` 一进门就抛 `TypeError: Cannot read properties of null (reading 'appendChild')`
+/// （异步回调里抛出 ⇒ unhandled rejection），**整条注入链再也不跑**：实测
+/// `#fnos-ui-mods-basic-style` / `#fnos-ui-mods-script` 在启用注入时也永远不出现，
+/// 只有 `chrome.storage.onChanged` 那条支路（`updateBrandColor` → `getThemeStyleElement`）
+/// 因为发生在配置推送时（此时 DOM 已就绪）才会建出 `#fnos-ui-mods-theme-style`。
+///
+/// 壳的语义：
+/// - `documentElement` 已存在 → 立即执行（与旧行为一致）；
+/// - 否则用 `MutationObserver` 观察 **`document` 本身**，解析器创建 `<html>` 时立刻触发
+///   （微任务，仍早于页面自己的脚本）；
+/// - MutationObserver 不可用 / 已经过了 loading 阶段 → `DOMContentLoaded` 兜底；
+/// - 上游抛错时记一笔 `window.__FNOS_UPSTREAM_ERROR__` 便于现场排查。
+fn wrap_upstream(content: &str) -> String {
+    format!(
+        "(function () {{\n\
+         var run = function () {{\n{content}\n}};\n\
+         var started = false;\n\
+         function start() {{\n\
+           if (started) return;\n\
+           started = true;\n\
+           try {{ run(); }} catch (e) {{ window.__FNOS_UPSTREAM_ERROR__ = String((e && e.message) || e); }}\n\
+         }}\n\
+         if (document.documentElement) {{ start(); return; }}\n\
+         var mo = null;\n\
+         if (typeof MutationObserver === 'function') {{\n\
+           try {{\n\
+             mo = new MutationObserver(function () {{\n\
+               if (!document.documentElement) return;\n\
+               mo.disconnect();\n\
+               start();\n\
+             }});\n\
+             mo.observe(document, {{ childList: true, subtree: true }});\n\
+           }} catch (e) {{ mo = null; }}\n\
+         }}\n\
+         document.addEventListener('DOMContentLoaded', start);\n\
+         if (document.readyState !== 'loading') start();\n\
+         }})();\n"
+    )
+}
+
 pub fn build_init_script(cfg: &Config) -> String {
     if !cfg.shell.inject_enabled {
         return String::new();
@@ -105,7 +151,7 @@ pub fn build_init_script(cfg: &Config) -> String {
             .expect("payload is a serde Value and always serializes"),
         shim = SHIM_JS,
         boot = BOOTSTRAP_JS,
-        content = CONTENT_SCRIPT_JS,
+        content = wrap_upstream(CONTENT_SCRIPT_JS),
     )
 }
 
@@ -187,6 +233,39 @@ mod tests {
             v.get("binaryAssets").is_none(),
             "本阶段刻意不输出 binaryAssets（Task 13 才按配置承载 .png）"
         );
+    }
+
+    #[test]
+    fn upstream_is_wrapped_until_document_element_exists() {
+        let s = build_init_script(&Config::default());
+        // 上游源码必须**逐字**保留（只包裹、不修改 vendored 代码）
+        assert!(
+            s.contains(CONTENT_SCRIPT_JS),
+            "上游 content-script 必须逐字出现在载荷里"
+        );
+        // 且必须在「等到 documentElement」的壳内：否则 WebView2 的
+        // AddScriptToExecuteOnDocumentCreated 会在 documentElement/head 还是 null 时执行，
+        // 上游第一句 appendChild 就抛 TypeError，整条注入链静默失效。
+        assert!(
+            s.contains("function start() {"),
+            "缺少等到 documentElement 的启动壳"
+        );
+        assert!(
+            s.contains("mo.observe(document, { childList: true, subtree: true })"),
+            "壳必须观察 document 本身（documentElement 还不存在时观察的是 document）"
+        );
+        assert!(
+            s.contains("document.addEventListener('DOMContentLoaded', start)"),
+            "MutationObserver 不可用时要有 DOMContentLoaded 兜底"
+        );
+        assert!(
+            s.contains("window.__FNOS_UPSTREAM_ERROR__"),
+            "上游抛错要留可观测痕迹"
+        );
+        // 壳必须在 shim/bootstrap 之后（shim 提供 chrome.*，bootstrap 先登记兜底）
+        let i_boot = s.find("__FNOS_BOOTSTRAP__").expect("bootstrap section");
+        let i_wrap = s.find("function start() {").expect("wrapper");
+        assert!(i_boot < i_wrap, "启动壳必须排在 bootstrap 之后");
     }
 
     #[test]

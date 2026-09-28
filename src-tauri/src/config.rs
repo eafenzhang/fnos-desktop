@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::path::{Path, PathBuf};
+use url::Url;
 
 pub const SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_HOME_URL: &str = "https://fnos.net/";
@@ -121,6 +122,58 @@ impl Default for ShellConfig {
     }
 }
 
+/// 是否为**可直接交给 WebView 的绝对 http(s) URL**（判定前先 trim）。
+///
+/// Finding 1：`homeUrl` / `nasUrl` 是用户可控文本（`open_config_dir` 明示了配置文件路径，
+/// 手改是预期用法），而 round 0 只检查「非空」，于是 `"not a url"` 能一路走到
+/// `main.rs` 的 `cfg.shell.home_url.parse().expect("home url")` —— 建窗即 panic；
+/// release 下 R9 隐藏了控制台，表现就是「双击无反应」。这里集中做真正的校验：
+///
+/// - `javascript:alert(1)` / `file:///…` / `data:…` → scheme 不是 http(s) → `None`
+/// - `"not a url"` / `"http://"` / `"http:"` → 解析失败或没有 host → `None`
+///
+/// 返回的 `Url` 与 `tauri::Url` 是同一个类型（tauri 直接 re-export `url::Url`）。
+pub fn parse_web_url(raw: &str) -> Option<Url> {
+    let url = Url::parse(raw.trim()).ok()?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return None;
+    }
+    if url.host_str().map_or(true, str::is_empty) {
+        return None;
+    }
+    Some(url)
+}
+
+impl ShellConfig {
+    /// 主页面地址：`normalize` 后必定合法；这里仍然再校验一次并回落 `DEFAULT_HOME_URL`，
+    /// 因此**任何消费方都可以无 panic 地取用**（Finding 1：不许再对用户文本 `expect`）。
+    pub fn home_url_or_default(&self) -> &str {
+        let trimmed = self.home_url.trim();
+        if parse_web_url(trimmed).is_some() {
+            trimmed
+        } else {
+            DEFAULT_HOME_URL
+        }
+    }
+
+    /// NAS WebUI 地址的解析结果：`None` = 未配置**或填错了**。
+    pub fn nas_url_parsed(&self) -> Option<Url> {
+        parse_web_url(&self.nas_url)
+    }
+
+    /// NAS WebUI 地址（trim 后的原文）：`None` = 未配置**或填错**。
+    ///
+    /// Finding 1 选定的语义是「**保留原文但一律禁用**」：`normalize` 不删用户写错的值
+    /// （用户能在配置文件里看到自己的错字并改回来），但凡是要*使用*它的地方——托盘的
+    /// 「打开 NAS」置灰（`tray::sync_menus`）、`commands::open_nas` 的跳转——都只看这个
+    /// 取值器。于是「非法 nasUrl」在所有入口都一致地表现为「没有可用地址」，
+    /// 不会再出现 round 0 那种「菜单可点、点了静默什么都不做」。
+    pub fn nas_target(&self) -> Option<&str> {
+        self.nas_url_parsed()?;
+        Some(self.nas_url.trim())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct Config {
@@ -200,31 +253,14 @@ pub fn normalize_brand_color(input: &str) -> String {
     format!("#{:02x}{:02x}{:02x}", to(r1), to(g1), to(b1))
 }
 
-/// 从 URL 的 scheme://host[:port] 得到 origin（全部小写）。无 scheme 或空 host 返回 None。
+/// 从 URL 得到 origin（`scheme://host[:port]`，scheme/host 小写、省略默认端口）。
+///
+/// 与浏览器的 `location.origin` 对齐（Finding 1 顺带修正）：`Origin::ascii_serialization`
+/// 会剥掉 userinfo、丢掉 `:80` / `:443` 这类默认端口——旧的手写实现会把
+/// `http://user:pass@host:80/` 变成 `http://user:pass@host:80` 这种永远匹配不上
+/// `location.origin` 的条目。非法或非 http(s) URL → `None`。
 pub fn origin_of(url: &str) -> Option<String> {
-    let s = url.trim();
-    let (scheme, rest) = s.split_once("://")?;
-    if scheme.is_empty() {
-        return None;
-    }
-    let authority = rest.split(['/', '?', '#']).next()?;
-    if authority.is_empty() {
-        return None;
-    }
-    // 剥掉 userinfo（`user:pass@`）：取最后一个 '@' 之后的段落（密码本身可能含 '@'）。
-    // 否则白名单里会留下 `http://user:pass@host` 这种永远匹配不上 `location.origin` 的条目。
-    let host_port = match authority.rsplit_once('@') {
-        Some((_, host)) => host,
-        None => authority,
-    };
-    if host_port.is_empty() {
-        return None;
-    }
-    Some(format!(
-        "{}://{}",
-        scheme.to_ascii_lowercase(),
-        host_port.to_ascii_lowercase()
-    ))
+    Some(parse_web_url(url)?.origin().ascii_serialization())
 }
 
 /// 上游 `launchpadIconRedrawMap` 的取值约束：`^prefect_icon/[a-z0-9-]+\.png$`
@@ -487,7 +523,7 @@ impl Config {
     pub fn normalize(&mut self) {
         self.schema_version = SCHEMA_VERSION;
         // §6.4：先算出 origin（借用在此结束），最后再并入白名单
-        let nas_origin = origin_of(&self.shell.nas_url);
+        let nas_origin = self.shell.nas_target().and_then(origin_of);
         let m = &mut self.mods;
         m.brand_color = normalize_brand_color(&m.brand_color);
         if m.titlebar_style != "mac" {
@@ -521,10 +557,17 @@ impl Config {
             .collect();
         m.launchpad_icon_redraw_map
             .retain(|_, v| is_valid_prefect_icon_path(v));
-        if self.shell.home_url.trim().is_empty() {
-            self.shell.home_url = DEFAULT_HOME_URL.into();
+        // Finding 1：`homeUrl` 必须是可导航的绝对 http(s) URL，否则回落默认常量。
+        // round 0 只判空，于是 `"not a url"` / `"javascript:alert(1)"` 会一路走到
+        // `main.rs` 的 `.parse().expect("home url")` → release 下静默启动失败。
+        // （本段在 `m` 的可变借用结束之后，故可安全改 `self.shell`。）
+        match parse_web_url(&self.shell.home_url) {
+            Some(_) => self.shell.home_url = self.shell.home_url.trim().to_string(),
+            None => self.shell.home_url = DEFAULT_HOME_URL.into(),
         }
-        // 保存 NAS WebUI 地址时自动把其 origin 并入注入白名单（跳过 1.5s 探测），幂等
+        // 保存 NAS WebUI 地址时自动把其 origin 并入注入白名单（跳过 1.5s 探测），幂等。
+        // `nas_target()` 先做完整校验：非法的 `nasUrl`（如 `javascript:…`）不得混进白名单，
+        // 否则会往非飞牛页面注入。
         if let Some(origin) = nas_origin {
             if !self
                 .mods
@@ -594,12 +637,19 @@ impl Config {
         }
     }
 
+    /// 写盘（先写 `.tmp` 再 rename，避免半截文件）。
+    ///
+    /// Finding 1「归一化/落盘处校验」：写之前再 `normalize()` 一次（幂等，clone 一份改，
+    /// 不动调用方）。所有写路径的必经之处就是这里，因此**磁盘上的 URL 永远是合法的**——
+    /// 内存里被谁塞了非法值也不可能落盘成「下次启动即 panic」的配置。
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        let mut cfg = self.clone();
+        cfg.normalize();
         let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, serde_json::to_string_pretty(self).unwrap())?;
+        std::fs::write(&tmp, serde_json::to_string_pretty(&cfg).unwrap())?;
         std::fs::rename(&tmp, path)
     }
 }
@@ -801,6 +851,16 @@ mod tests {
             Some("https://abc.fnos.net".into())
         );
         assert_eq!(origin_of("not a url"), None);
+        // Finding 1：非 http(s) 的 scheme 不再当成 origin（`javascript:` 永远不该进白名单）
+        assert_eq!(origin_of("javascript:alert(1)"), None);
+        assert_eq!(origin_of("file:///C:/x"), None);
+        // 与 `location.origin` 对齐：默认端口要省略（旧实现会留下 `:80`，永远匹配不上）
+        assert_eq!(origin_of("http://host:80/x"), Some("http://host".into()));
+        assert_eq!(origin_of("https://host:443/x"), Some("https://host".into()));
+        assert_eq!(
+            origin_of("http://host:8080/x"),
+            Some("http://host:8080".into())
+        );
 
         let mut c = Config::default();
         c.shell.nas_url = "HTTP://Nas.Local:8000/".into();
@@ -821,6 +881,135 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    /// 非法 URL 合集：scheme 不对（`javascript:` / `file:` / `data:`）、解析不了
+    /// （`"not a url"`）、没有 host（`"http://"`）、空白。Finding 1 的判定基准。
+    const MALFORMED_URLS: [&str; 8] = [
+        "not a url",
+        "javascript:alert(1)",
+        "file:///C:/Windows/System32/calc.exe",
+        "data:text/html,<script>alert(1)</script>",
+        "http://",
+        "http:",
+        "   ",
+        "",
+    ];
+
+    /// Finding 1（Important）：手改的 `homeUrl` 不得让应用启动即 panic —— 非法值一律回落
+    /// 默认常量，且 `main.rs` 用的取值器本身也永不出错。
+    #[test]
+    fn malformed_home_url_falls_back_to_default() {
+        for raw in MALFORMED_URLS {
+            let mut c = Config::default();
+            c.shell.home_url = raw.into();
+            c.normalize();
+            assert_eq!(c.shell.home_url, DEFAULT_HOME_URL, "raw={raw:?}");
+            assert_eq!(
+                c.shell.home_url_or_default(),
+                DEFAULT_HOME_URL,
+                "raw={raw:?}"
+            );
+            // 建窗路径（`commands::resolve_main_url`）依赖这条：取出来的串一定可解析
+            assert!(parse_web_url(c.shell.home_url_or_default()).is_some());
+        }
+
+        // 合法值（含首尾空白）必须原样通过 → 证明上面的回落不是「一律重置」
+        for raw in [
+            " https://fnos.net/ ",
+            "http://192.168.1.10:5666/webui/",
+            "https://abc.fnos.net/app",
+        ] {
+            let mut c = Config::default();
+            c.shell.home_url = raw.into();
+            c.normalize();
+            assert_eq!(c.shell.home_url, raw.trim(), "raw={raw:?}");
+            assert_eq!(c.shell.home_url_or_default(), raw.trim(), "raw={raw:?}");
+        }
+    }
+
+    /// 非法 `homeUrl` 从文件读到内存的整条链路都要回落（`load` 里是 sanitize → normalize）。
+    #[test]
+    fn malformed_home_url_in_file_falls_back_on_load() {
+        let dir = temp_dir("badhome");
+        let p = dir.join("config.json");
+        std::fs::write(
+            &p,
+            br##"{"shell":{"homeUrl":"javascript:alert(1)","injectEnabled":true}}"##,
+        )
+        .unwrap();
+        let c = Config::load(&p);
+        assert_eq!(c.shell.home_url, DEFAULT_HOME_URL);
+        // 同文件里的其它键不受牵连
+        assert!(c.shell.inject_enabled);
+
+        // 非字符串类型（对象/数组）走 `sanitize_string_field` 删除 → 默认值，同样不是 panic
+        std::fs::write(&p, br#"{"shell":{"homeUrl":{"a":1}}}"#).unwrap();
+        assert_eq!(Config::load(&p).shell.home_url, DEFAULT_HOME_URL);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Finding 1：非法 `nasUrl` 一律视为「未配置」——托盘的「打开 NAS」据此置灰
+    /// （`tray::sync_menus` 的唯一判据就是这个 `nas_target()`），`commands::open_nas`
+    /// 也走同一取值器，因此不会再出现「菜单可点、点了静默无事发生」。
+    #[test]
+    fn malformed_nas_url_disables_tray_item() {
+        for raw in MALFORMED_URLS {
+            let mut c = Config::default();
+            c.shell.nas_url = raw.into();
+            c.normalize();
+            // 这就是托盘「打开 NAS」置灰的判据本身：`tray::sync_menus` 里写的是
+            // `item.set_enabled(cfg.shell.nas_target().is_some())`
+            assert_eq!(c.shell.nas_target(), None, "raw={raw:?}");
+            // 「保留原文但禁用」：用户输入不被静默删除（与 `homeUrl` 的回落策略不同，
+            // 原因见 `ShellConfig::nas_target` 的文档）
+            assert_eq!(c.shell.nas_url, raw, "raw={raw:?}");
+            // 非法 nasUrl 不得混进注入白名单
+            assert!(c.mods.enabled_origins.is_empty(), "raw={raw:?}");
+        }
+
+        // 合法值：托盘可点 + origin 并入白名单
+        let mut c = Config::default();
+        c.shell.nas_url = " http://192.168.1.10:5666/webui/ ".into();
+        c.normalize();
+        assert_eq!(
+            c.shell.nas_target(),
+            Some("http://192.168.1.10:5666/webui/")
+        );
+        assert!(c.shell.nas_url_parsed().is_some());
+        assert_eq!(c.mods.enabled_origins, vec!["http://192.168.1.10:5666"]);
+    }
+
+    /// `commands::resolve_main_url` 的兜底分支断言 `DEFAULT_HOME_URL` 一定可解析
+    /// （写到 `unreachable!`），这条单测把该假设钉住。
+    #[test]
+    fn default_home_url_is_a_valid_web_url() {
+        assert!(parse_web_url(DEFAULT_HOME_URL).is_some());
+        assert_eq!(
+            parse_web_url(DEFAULT_HOME_URL).map(|u| u.to_string()),
+            Some("https://fnos.net/".into())
+        );
+    }
+
+    /// Finding 1「落盘即合法」：即便内存里被塞了非法 URL，`save` 写出的文件也必须合法
+    /// （下次启动读到它不会 panic）。`nasUrl` 的「保留原文」语义同样保持不变。
+    #[test]
+    fn save_normalizes_urls_before_writing() {
+        let dir = temp_dir("saveurl");
+        let p = dir.join("config.json");
+        let mut c = Config::default();
+        c.shell.home_url = "javascript:alert(1)".into();
+        c.shell.nas_url = "not a url".into();
+        c.save(&p).unwrap();
+
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert!(!text.contains("javascript:alert(1)"), "非法 homeUrl 落盘了");
+        let back = Config::load(&p);
+        assert_eq!(back.shell.home_url, DEFAULT_HOME_URL);
+        assert_eq!(back.shell.nas_target(), None);
+        // 「保留原文但禁用」：非法 nasUrl 仍在文件里（用户可见可改），只是不被采用
+        assert_eq!(back.shell.nas_url, "not a url");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// §6.5 要求**逐字段**回退：单个键类型不对不得丢掉整份配置。
@@ -900,26 +1089,32 @@ mod tests {
 
         // 数字分支的 variant：证明浮点/数字字符串真的被转换，而不是删除后回落默认 8。
         // 8.5 → 9（f64::round 半值远离零）；「非数字 → 8」按 §6.5 由 null 一例覆盖。
+        // （`homeUrl` 这里不能再用 `"keep"` 当哨兵：Finding 1 之后「非 URL 文本」会被
+        // 归一化成默认值，见 `malformed_home_url_falls_back_to_default`。）
         for (raw, want) in [("8.5", 9u32), ("\"12\"", 12), ("null", 8)] {
             std::fs::write(
                 &p,
                 format!(
-                    r#"{{"mods":{{"desktopIconPerColumn":{raw}}},"shell":{{"homeUrl":"keep"}}}}"#
+                    r#"{{"mods":{{"desktopIconPerColumn":{raw}}},"shell":{{"homeUrl":"http://keep.local/"}}}}"#
                 ),
             )
             .unwrap();
             let c = Config::load(&p);
             assert_eq!(c.mods.desktop_icon_per_column, want, "raw={raw}");
             // 单个坏类型键不得丢掉同文件里的其它键
-            assert_eq!(c.shell.home_url, "keep", "raw={raw}");
+            assert_eq!(c.shell.home_url, "http://keep.local/", "raw={raw}");
         }
 
         // 段本身不是对象（如 `"mods": 5`）：该段全部走默认值，其它段照旧读入
-        std::fs::write(&p, br#"{"mods":5,"shell":{"homeUrl":"keep"}}"#).unwrap();
+        std::fs::write(
+            &p,
+            br#"{"mods":5,"shell":{"homeUrl":"http://keep.local/"}}"#,
+        )
+        .unwrap();
         let c = Config::load(&p);
         assert_eq!(c.mods.desktop_icon_per_column, 8);
         assert_eq!(c.mods.font_face_name, "FnOSCustomFont");
-        assert_eq!(c.shell.home_url, "keep");
+        assert_eq!(c.shell.home_url, "http://keep.local/");
         std::fs::remove_dir_all(&dir).ok();
     }
 

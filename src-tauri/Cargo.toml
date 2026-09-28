@@ -12,6 +12,10 @@ tauri = { version = "2", features = ["tray-icon", "image-png"] }
 tauri-plugin-single-instance = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Finding 1：`config.rs` 要真正校验 `homeUrl` / `nasUrl`。`tauri::Url` 就是 `url::Url`
+# （`tauri-2.12.0/src/lib.rs:92` 的 `pub use url::Url`），版本由 tauri 统一到同一个 2.x，
+# 因此两个类型可直接互用、无需转换。
+url = "2"
 
 [profile.release]
 lto = true

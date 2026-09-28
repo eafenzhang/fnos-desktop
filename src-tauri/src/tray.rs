@@ -74,13 +74,23 @@ pub fn sync_menus<R: Runtime>(app: &AppHandle<R>, cfg: &Config) -> tauri::Result
         let _ = item.set_checked(cfg.shell.inject_enabled);
     }
     if let Some(MenuItemKind::MenuItem(item)) = menu.get("open_nas") {
-        let _ = item.set_enabled(!cfg.shell.nas_url.trim().is_empty());
+        // Finding 1：合法 URL 才可点（`nas_target()` 已做完整校验，与 `commands::open_nas`
+        // 同源），因此不会再有「菜单可点、点了静默无事发生」。
+        let _ = item.set_enabled(cfg.shell.nas_target().is_some());
     }
     Ok(())
 }
 
 pub fn toggle_main<R: Runtime>(app: &AppHandle<R>) {
     if let Some(w) = app.get_webview_window(MAIN_WINDOW) {
+        // 最小化的窗口 `is_visible()` 仍是 true：必须先看 `is_minimized()`，
+        // 否则「显示 / 隐藏」会把最小化的窗口直接藏起来，用户只能去托盘再点一次。
+        if w.is_minimized().unwrap_or(false) {
+            let _ = w.unminimize();
+            let _ = w.show();
+            let _ = w.set_focus();
+            return;
+        }
         match w.is_visible() {
             Ok(true) => {
                 let _ = w.hide();
@@ -96,8 +106,15 @@ pub fn toggle_main<R: Runtime>(app: &AppHandle<R>) {
 
 pub fn apply_window_geom<R: Runtime>(w: &WebviewWindow<R>, cfg: &Config) {
     let g = &cfg.shell.window;
-    let _ = w.set_size(tauri::LogicalSize::new(g.w, g.h));
+    // 防御：历史配置里可能已经留下 `w/h = 0`（最小化时保存几何的旧缺陷，已在
+    // `commands::save_window_geom` 修掉）。0 尺寸的 set_size 会让窗口不可见。
+    if g.w > 0.0 && g.h > 0.0 {
+        let _ = w.set_size(tauri::LogicalSize::new(g.w, g.h));
+    }
     if let (Some(x), Some(y)) = (g.x, g.y) {
-        let _ = w.set_position(tauri::LogicalPosition::new(x, y));
+        // 最小化窗口的位置是 -32000（Windows 的哨兵值），不能当成合法坐标用
+        if x > -10000.0 && y > -10000.0 {
+            let _ = w.set_position(tauri::LogicalPosition::new(x, y));
+        }
     }
 }
