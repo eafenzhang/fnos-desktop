@@ -1,4 +1,5 @@
 mod config;
+mod injector;
 mod paths;
 
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
