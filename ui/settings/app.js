@@ -26,10 +26,11 @@ const SECTIONS = ['mods', 'local', 'shell'];
  * 界面状态。导出供单测与状态条读取。
  *
  * `page` 是 Rust 侧 `get_page_state` 的**最近一次**回包（主窗口 URL / 是否命中白名单 /
- * 上次加载是否失败）。它与 `config` 相互独立：主窗口可以只导航不改配置，所以
- * `refresh()` 必须两条都取（见那里的注释）。
+ * 上次加载是否失败）；`report` 是 `get_page_report` 的最近一次回包（Task 13a：页面自己
+ * 经标题通道回报的上游注入链信号）。三者相互独立：主窗口可以只导航不改配置，而页面上报
+ * 又只在页面自己跑完注入链后才出现，所以 `refresh()` 三条都要取（见那里的注释）。
  */
-export const state = { config: null, active: null, error: null, page: null };
+export const state = { config: null, active: null, error: null, page: null, report: null };
 
 // ---------- DOM 小工具 ----------
 
@@ -136,7 +137,7 @@ async function commit(key, value, node) {
     if (res.needsReload) {
       await api.reloadMain(null);
       // 重建会换掉主窗口那一整次加载：状态条必须跟着换，否则会一直显示旧页面的判定
-      state.page = await fetchPageState();
+      await fetchPageSnapshot();
     }
     state.error = null;
     render();
@@ -320,6 +321,36 @@ async function fetchPageState() {
   }
 }
 
+/**
+ * 取一次页面上报（Task 13a）。
+ *
+ * 与 `fetchPageState` 同一套失败语义：取不到就 `null` → 状态条退回「注入脚本已注册」
+ * 这一弱文案。**不许**把「IPC 失败」当成「已上报」或「未上报」之外的任何结论——
+ * 这里没有第三个状态可说。
+ */
+async function fetchPageReport() {
+  try {
+    const report = await api.getPageReport();
+    return report && typeof report === 'object' ? report : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+/**
+ * 一次性刷新「主窗口观测 + 页面上报」两份快照。
+ *
+ * 两者都属于**同一时刻的主窗口**：上报是页面文档的属性，主窗口导航/重建后旧上报会被
+ * Rust 侧作废（`commands.rs::get_page_report` 按 origin 判定），所以任何取 `page` 的地方
+ * 都必须**同时**重取 `report`，否则会出现「page 说是新页面、report 还是上一页的注入信号」
+ * 这种自相矛盾的状态条。
+ */
+async function fetchPageSnapshot() {
+  const [page, report] = await Promise.all([fetchPageState(), fetchPageReport()]);
+  state.page = page;
+  state.report = report;
+}
+
 /** 判据是否还停在「加载失败」这一态（重试后的轮询用于决定何时停）。 */
 function stillFailed(page) {
   return !!page && (page.loadFailed === true || page.loading === true);
@@ -340,7 +371,7 @@ async function retryMain() {
     await api.reloadMain(null);
   } catch (e) {
     state.error = `重试失败：${message(e)}`;
-    state.page = await fetchPageState();
+    await fetchPageSnapshot();
     render();
     renderStatus();
     return;
@@ -348,7 +379,7 @@ async function retryMain() {
   const deadline = Date.now() + 8000;
   do {
     await new Promise((r) => setTimeout(r, 600));
-    state.page = await fetchPageState();
+    await fetchPageSnapshot();
     renderStatus(true);
   } while (Date.now() < deadline && stillFailed(state.page));
   render();
@@ -379,7 +410,7 @@ async function whitelistCurrentOrigin() {
   } catch (e) {
     state.error = `加入白名单失败：${message(e)}`;
   }
-  state.page = await fetchPageState();
+  await fetchPageSnapshot();
   render();
   renderStatus();
 }
@@ -390,7 +421,7 @@ async function whitelistCurrentOrigin() {
  * `busy` 只影响按钮可用性：重试期间的按钮置灰，避免连点堆出多次重建。
  */
 function renderStatus(busy) {
-  const model = statusFor(state.config, state.page);
+  const model = statusFor(state.config, state.page, state.report);
   const el = statusBar(model.text, model.kind);
   if (!el) return;
   for (const action of model.actions) {
@@ -600,6 +631,10 @@ function sameConfig(a, b) {
  * 配置没变时依旧**不重渲染 #pane**（否则每次 alt-tab 回来都会重建 DOM、丢掉用户正在
  * 输入却尚未提交的文本）。
  *
+ * Task 13a 再加一份：`get_page_report`（页面经标题通道回报的注入链信号）与 `get_page_state`
+ * 是**同一时刻主窗口**的两个视图，必须在同一个快照里取（见 `fetchPageSnapshot`）。焦点刷新
+ * 正好是「页面刚跑完注入链、用户切回设置窗」的时刻——状态条据实化主要靠这个钩子。
+ *
  * `render()` 会保留 `state.active`（当前分组）与 `pane.scrollTop`（滚动位置），
  * 所以刷新不会把用户弹回第一组。
  */
@@ -613,9 +648,8 @@ export async function refresh() {
   } catch (e) {
     failure = e;
   }
-  const page = await fetchPageState();
+  await fetchPageSnapshot();
   refreshing = false;
-  state.page = page;
   if (failure) {
     state.error = `刷新配置失败：${message(failure)}`;
     renderStatus();
@@ -638,7 +672,7 @@ export async function boot() {
   } catch (e) {
     state.error = `读取配置失败：${message(e)}`;
   }
-  state.page = await fetchPageState();
+  await fetchPageSnapshot();
   render();
   renderStatus();
   window.addEventListener('focus', () => { refresh(); });

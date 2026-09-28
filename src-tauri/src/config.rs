@@ -342,18 +342,52 @@ pub fn origin_of(url: &str) -> Option<String> {
     Some(parse_web_url(url)?.origin().ascii_serialization())
 }
 
-/// 上游 `launchpadIconRedrawMap` 的取值约束：`^prefect_icon/[a-z0-9-]+\.png$`
+/// 上游 `launchpadIconRedrawMap` 的取值约束：`^prefect_icon/[a-z0-9-]+\.png$`，
+/// 但**按大小写不敏感**判定（R30：Windows 路径）。
+///
+/// 为什么放宽（R30）：图标资源在磁盘上是 camelCase（`src-tauri/assets/fnos-mods/prefect_icon/`
+/// 下就是 `panIndex.png` 这类名字），而 shim 的 `getURL` 建索引时把小写化后的键当唯一键
+/// （shim.js 的 `assetIndex[String(k).toLowerCase()]`，`tests/shim.test.mjs` 有一条用例锁着
+/// 「大小写不敏感」）——也就是说 `emby.PNG` / `Prefect_Icon/Emby.png` 在运行期**都能解析到同一份
+/// 资源**，而旧实现只认全小写，会把它们当非法值在 `normalize` 里 `retain` 掉。用户看到的现象是
+/// 「设置了完美图标，页面却没变化」，且没有任何提示——**静默丢配置**比拒绝更难排障。
+///
+/// 放宽的**只有大小写这一维**：
+/// - 仍然拒绝穿越（`..`）、子目录（`sub/dir.png`）、反斜杠（`prefect_icon\emby.png`：
+///   shim 的查表键用 `/`，反斜杠永远解析不到资源，放行只会造出一个查不到的值）、
+///   双扩展名（`a.png.png`）、空名，以及 ASCII 字母数字连字符之外的字符。
+/// - 判定顺序不变（先去前缀、再去后缀、再验主体字符集），所以 `prefect_icon/a.png.png`
+///   仍然是「主体含 `.`」而被拒。
 pub fn is_valid_prefect_icon_path(v: &str) -> bool {
-    let Some(rest) = v.strip_prefix("prefect_icon/") else {
+    let Some(rest) = strip_prefix_ascii_ci(v, "prefect_icon/") else {
         return false;
     };
-    let Some(name) = rest.strip_suffix(".png") else {
+    let Some(name) = strip_suffix_ascii_ci(rest, ".png") else {
         return false;
     };
-    !name.is_empty()
-        && name
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
+/// 去掉 `prefix`（**只折 ASCII 大小写**），前缀不匹配时 `None`。
+///
+/// 用 `str::get(..n)` 而不是切片索引：非 ASCII 字节边界上取 `None` 而不是 panic
+///（长度前缀永远按字节算，而 `&str` 不能切在字符中间）。
+fn strip_prefix_ascii_ci<'a>(v: &'a str, prefix: &str) -> Option<&'a str> {
+    let head = v.get(..prefix.len())?;
+    if !head.eq_ignore_ascii_case(prefix) {
+        return None;
+    }
+    v.get(prefix.len()..)
+}
+
+/// 去掉 `suffix`（**只折 ASCII 大小写**），后缀不匹配（或比整个串还长）时 `None`。
+fn strip_suffix_ascii_ci<'a>(v: &'a str, suffix: &str) -> Option<&'a str> {
+    let start = v.len().checked_sub(suffix.len())?;
+    let tail = v.get(start..)?;
+    if !tail.eq_ignore_ascii_case(suffix) {
+        return None;
+    }
+    v.get(..start)
 }
 
 /// `<path>.bak`（追加式命名：对 `config.json` 得 `config.json.bak`）。
@@ -1616,43 +1650,82 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// 上游 `^prefect_icon/[a-z0-9-]+\.png$`（cs:361/515）：穿越、双扩展名、大写都必须被剔除。
+    /// R30：`launchpadIconRedrawMap` 的值**按大小写不敏感**判定（Windows 路径），
+    /// 但**只放宽大小写这一维**——穿越/子目录/反斜杠/双扩展名/空名一律仍然剔除。
     #[test]
-    fn redraw_map_regex_is_enforced() {
+    fn redraw_map_regex_is_case_insensitive_only() {
+        // 仍然合法：全小写、数字、连字符
         assert!(is_valid_prefect_icon_path("prefect_icon/emby.png"));
         assert!(is_valid_prefect_icon_path(
             "prefect_icon/home-assistant.png"
         ));
+        assert!(is_valid_prefect_icon_path("prefect_icon/a1-b2.png"));
+
+        // R30 放宽的三处大小写（每一处都单独钉住，免得将来只放宽其中之一还全绿）
+        assert!(
+            is_valid_prefect_icon_path("prefect_icon/Emby.png"),
+            "资源名本身是 camelCase（磁盘上就是 panIndex.png 这类名字）"
+        );
+        assert!(
+            is_valid_prefect_icon_path("prefect_icon/emby.PNG"),
+            "混合大小写扩展名"
+        );
+        assert!(
+            is_valid_prefect_icon_path("PREFECT_ICON/emby.PnG"),
+            "目录段 + 扩展名同时混合大小写（分隔符两侧都算）"
+        );
+        assert!(is_valid_prefect_icon_path(
+            "Prefect_Icon/Home-Assistant.PNG"
+        ));
+
+        // 只放宽大小写：其余约束一个字都没松
         assert!(!is_valid_prefect_icon_path("../x"));
         assert!(!is_valid_prefect_icon_path("prefect_icon/a.png.png"));
-        assert!(!is_valid_prefect_icon_path("prefect_icon/Emby.png"));
-        assert!(!is_valid_prefect_icon_path("prefect_icon/emby.PNG"));
         assert!(!is_valid_prefect_icon_path("prefect_icon/"));
         assert!(!is_valid_prefect_icon_path("prefect_icon/sub/dir.png"));
         assert!(!is_valid_prefect_icon_path("other/emby.png"));
+        assert!(
+            !is_valid_prefect_icon_path("prefect_icon\\emby.png"),
+            "反斜杠：shim 的查表键用 `/`（assetIndex 全小写、按原分隔符），放行只会造出查不到的值"
+        );
+        assert!(!is_valid_prefect_icon_path("prefect_icon/em by.png"));
+        assert!(!is_valid_prefect_icon_path("prefect_icon/.png"));
+        assert!(!is_valid_prefect_icon_path("prefect_icon/emby.png "));
+        assert!(!is_valid_prefect_icon_path(" prefect_icon/emby.png"));
+        assert!(!is_valid_prefect_icon_path("prefect_icon/图标.png"));
+        // 非 ASCII 不得 panic（前缀长度按字节切，可能落在字符中间）
+        assert!(!is_valid_prefect_icon_path("图标"));
+        assert!(!is_valid_prefect_icon_path("prefect_icon/图的.png"));
 
+        // normalize 的 retain 必须与上面的判定同源：混合大小写的值要被**保留**下来
         let mut c = Config::default();
         for (k, v) in [
             ("ok", "prefect_icon/emby.png"),
-            ("up", "prefect_icon/Emby.png"),
+            ("upper", "prefect_icon/Emby.png"),
+            ("ext", "prefect_icon/emby.PNG"),
+            ("dir", "PREFECT_ICON/emby.png"),
             ("dots", "prefect_icon/a.png.png"),
             ("esc", "../x"),
             ("sub", "prefect_icon/sub/dir.png"),
+            ("bslash", "prefect_icon\\emby.png"),
         ] {
             c.mods.launchpad_icon_redraw_map.insert(k.into(), v.into());
         }
         c.normalize();
-        let keys: Vec<&str> = c
-            .mods
-            .launchpad_icon_redraw_map
-            .keys()
-            .map(String::as_str)
-            .collect();
-        assert_eq!(keys, vec!["ok"]);
+        let keys: Vec<String> = c.mods.launchpad_icon_redraw_map.keys().cloned().collect();
         assert_eq!(
-            c.mods.launchpad_icon_redraw_map["ok"],
-            "prefect_icon/emby.png"
+            keys,
+            vec!["dir", "ext", "ok", "upper"],
+            "混合大小写的合法值必须原样保留（retain 与判定同源）"
         );
+        assert_eq!(
+            c.mods.launchpad_icon_redraw_map["upper"], "prefect_icon/Emby.png",
+            "保留的是用户写的原文，不做改写"
+        );
+        // 幂等：再归一化一次不改变任何东西（否则每次 save/load 都会漂移）
+        c.normalize();
+        let again: Vec<String> = c.mods.launchpad_icon_redraw_map.keys().cloned().collect();
+        assert_eq!(again, keys);
     }
 
     /// 同一路径写两次：后写胜出、文件仍是合法 JSON、不留 `.tmp`。

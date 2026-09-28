@@ -1,6 +1,6 @@
 //! IPC 契约（spec §8.3）与 Rust 侧内部操作。
 
-use crate::{config, config::Config, injector, paths, tray, MAIN_WINDOW};
+use crate::{config, config::Config, injector, paths, report, tray, MAIN_WINDOW};
 use serde::Serialize;
 use serde_json::Value;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -94,6 +94,13 @@ pub struct AppState {
     /// 是**会话级**状态，不随 `set_config` / `reset_config` 复位——用户要的是「这次启动发生过
     /// 配置损坏」这个事实，而不是「当前这份配置是否完好」。
     pub recovered_from_backup: AtomicBool,
+    /// 最近一次**通过校验**的页面上报（Task 13a；见 [`crate::report`]）。
+    ///
+    /// **只在内存里**：不落盘、不进 `Config`、不给页面回执。它是「页面声称注入链已触发」的
+    /// 证据，不是任何权限的来源。每次新建/重建主窗口、切错误页、以及新文档与上报不同源时
+    /// 都会清空（见 [`begin_load`] / [`set_error_state`] / [`on_page_event`]）——旧页面的
+    /// 上报绝不能拿来描述新页面。
+    pub page_report: Mutex<Option<report::ReportEntry>>,
 }
 
 /// 主窗口一次加载所处的阶段（Task 11）。
@@ -621,45 +628,147 @@ fn build_error_window<R: Runtime>(
 /// 于是退避按 15s → 30s → 60s → 120s 递进、第 5 次停下来；上一轮正常（`Loaded`）时清零。
 fn begin_load<R: Runtime>(app: &AppHandle<R>, url: &str) -> u64 {
     let state = app.state::<AppState>();
-    let mut load = state.load.lock().unwrap();
-    let keep_failures = load.phase == LoadPhase::Failed;
-    load.generation = load.generation.wrapping_add(1);
-    load.url = url.to_string();
-    load.phase = LoadPhase::Loading;
-    load.error_page = false;
-    load.last_error = None;
-    load.probe_generation = None;
-    load.next_retry_seconds = None;
-    if !keep_failures {
-        load.failures = 0;
-    }
-    load.generation
+    let generation = {
+        let mut load = state.load.lock().unwrap();
+        let keep_failures = load.phase == LoadPhase::Failed;
+        load.generation = load.generation.wrapping_add(1);
+        load.url = url.to_string();
+        load.phase = LoadPhase::Loading;
+        load.error_page = false;
+        load.last_error = None;
+        load.probe_generation = None;
+        load.next_retry_seconds = None;
+        if !keep_failures {
+            load.failures = 0;
+        }
+        load.generation
+    };
+    // Task 13a：新的一次加载 = 换了一张窗口/文档，旧上报不再属于当前页面（绝不沿用）。
+    *state.page_report.lock().unwrap() = None;
+    generation
 }
 
 /// 把观测状态改写成「正在显示错误页」（错误页窗口建好之前调用）。
 fn set_error_state<R: Runtime>(app: &AppHandle<R>, info: &ErrorInfo) -> u64 {
     let state = app.state::<AppState>();
-    let mut load = state.load.lock().unwrap();
-    load.generation = load.generation.wrapping_add(1);
-    load.url = info.url.clone();
-    load.phase = LoadPhase::Failed;
-    load.error_page = true;
-    load.probe_generation = None;
-    load.last_error = Some(info.reason.clone());
-    load.next_retry_seconds = info.next_retry_seconds;
-    load.generation
+    let generation = {
+        let mut load = state.load.lock().unwrap();
+        load.generation = load.generation.wrapping_add(1);
+        load.url = info.url.clone();
+        load.phase = LoadPhase::Failed;
+        load.error_page = true;
+        load.probe_generation = None;
+        load.last_error = Some(info.reason.clone());
+        load.next_retry_seconds = info.next_retry_seconds;
+        load.generation
+    };
+    // 错误页上永远不注册 mods 载荷，因此也不该留着任何页面上报（Task 13a）。
+    *state.page_report.lock().unwrap() = None;
+    generation
 }
 
-/// 主窗口 `document.title` 变化：探针回话走这条路，其余照旧镜像到窗口标题。
+/// 主窗口 `document.title` 变化：两条控制前缀走这里，其余照旧镜像到窗口标题。
+///
+/// 两个前缀的**副作用必须一致**：控制标题是「页面 → 宿主」的回传通道，不是给用户看的标题
+/// ——既不镜像到窗口标题（`set_title`），也不进 UI，只在控制台留一行**固定短语 + 类型**
+/// （绝不回显页面可控正文）。Task 11 的探针分支就是这样做的，Task 13a 的上报分支照抄。
 pub fn handle_title<R: Runtime>(window: &WebviewWindow<R>, title: &str) {
     if let Some(payload) = title.strip_prefix(PROBE_TITLE_PREFIX) {
         // 探针标题是「页面 → 宿主」的回传通道，不是给用户看的标题：不镜像、只处理。
         on_load_probe(window.app_handle(), payload);
         return;
     }
+    if let Some(payload) = title.strip_prefix(report::REPORT_TITLE_PREFIX) {
+        on_page_report(window, payload);
+        return;
+    }
     // 现场排障 + 运行期证据（错误页会把自检结论写进标题，见 ui/settings/error.html）。
     eprintln!("[fnos] 主窗口标题: {title}");
     let _ = window.set_title(title);
+}
+
+/// 收到一条页面上报（`document.title` 的 `FNOSREPORT:` 通道；Task 13a）。
+///
+/// 四道闸门全在 [`report::validate`] 里（字节上限 → 合法 JSON → 必须是对象 → `type` 白名单），
+/// 未通过就丢掉并留一行固定短语，**绝不 panic、绝不把页面可控正文写进日志或 UI**。
+/// 通过后连同**上报文档的 origin** 一起存进 `AppState`（内存）：origin 用于「换了页面就不认
+/// 旧上报」的诚实性判定（见 [`get_page_report`]）。
+fn on_page_report<R: Runtime>(window: &WebviewWindow<R>, payload: &str) {
+    let value = match report::validate(payload) {
+        Ok(v) => v,
+        Err(reason) => {
+            eprintln!(
+                "[fnos] 页面上报被拒（{}；{} 字节）",
+                reason.as_str(),
+                payload.len()
+            );
+            // 截断假象：标题通道的实测上限是 4096 字节（见 report::TITLE_CHANNEL_MAX_BYTES），
+            // 超过它的上报到达宿主时已经被截断，只能表现为「不是合法 JSON」。把这一情形标出来，
+            // 否则后来的人会去追一个并不存在的语法 bug（T13b 的大载荷上报正是高风险场景）。
+            if reason == report::Reject::NotJson && report::truncation_suspected(payload.len()) {
+                eprintln!(
+                    "[fnos]   ↑ 长度已够到 document.title 的 {} 字节上限，疑似被通道截断（而不是 JSON 语法错）",
+                    report::TITLE_CHANNEL_MAX_BYTES
+                );
+            }
+            return;
+        }
+    };
+    // 类型只用于日志，且一定来自允许表（validate 已保证），不可能是页面随手写的长文本。
+    let ty = value.get("type").and_then(Value::as_str).unwrap_or("?");
+    let dir = value.get("dir").and_then(Value::as_str).unwrap_or("?");
+    let origin = window
+        .url()
+        .ok()
+        .and_then(|u| config::origin_of(u.as_str()));
+    // 日志先打（`origin` 随后就随 entry 一起进内存了：不 clone、不留第二份）
+    eprintln!(
+        "[fnos] 页面上报已接受：type={ty} dir={dir} origin={} 字节={}",
+        origin.as_deref().unwrap_or("<未知>"),
+        payload.len()
+    );
+    let state = window.state::<AppState>();
+    *state.page_report.lock().unwrap() = Some(report::ReportEntry { value, origin });
+}
+
+/// 新文档与最近一次上报不同源 → 丢掉旧上报。
+///
+/// 主窗口可以在不改任何配置的情况下换页面（页内链接、托盘「打开 NAS」、重定向）。旧页面上报的
+/// 「已注入」不能拿来描述新页面——`get_page_report` 也会再判一次，这里是「新文档到达时顺手清掉」，
+/// 免得一条过期证据一直躺在内存里。
+fn drop_report_if_origin_changed<R: Runtime>(app: &AppHandle<R>, url: &str) {
+    let current = config::origin_of(url);
+    let state = app.state::<AppState>();
+    let mut slot = state.page_report.lock().unwrap();
+    let stale = match slot.as_ref() {
+        Some(entry) => !report::same_origin(entry.origin.as_deref(), current.as_deref()),
+        None => false,
+    };
+    if stale {
+        *slot = None;
+    }
+}
+
+/// 读最近一次页面上报（`get_page_report` 的返回体；`None` = 没有可用的上报）。
+///
+/// **只授予设置窗**（`capabilities/default.json`），与 `get_page_state` 同一档：主窗口
+/// （含内置错误页）拿不到任何命令授权，所以页面永远无法自己读取或改写这条证据。
+///
+/// 只有「上报来源 origin == 主窗口当前 origin」时才返回内容：取不到当前 origin（窗口已销毁 /
+/// URL 解析不出来）一律 `None`，设置窗于是退回 Task 11 的弱文案——宁可不说，也不谎称已注入。
+#[tauri::command]
+pub fn get_page_report<R: Runtime>(app: AppHandle<R>) -> Option<Value> {
+    let current = app
+        .get_webview_window(MAIN_WINDOW)
+        .and_then(|w| w.url().ok())
+        .and_then(|u| config::origin_of(u.as_str()));
+    let state = app.state::<AppState>();
+    let slot = state.page_report.lock().unwrap();
+    let entry = slot.as_ref()?;
+    if !report::same_origin(entry.origin.as_deref(), current.as_deref()) {
+        return None;
+    }
+    Some(entry.value.clone())
 }
 
 /// 主窗口页面加载事件。
@@ -685,6 +794,11 @@ pub fn on_page_event<R: Runtime>(
         return;
     }
     eprintln!("[fnos] 主窗口页面已加载: {url}");
+    // Task 13a：页内导航（托盘「打开 NAS」的 `navigate`、页面里的链接、重定向）**不走**
+    // `begin_load`，所以上面那段带世代闸门的代码会直接 return——清理必须放在闸门**之前**，
+    // 否则新文档与旧上报不同源时那条证据会一直留着。`get_page_report` 读取时还会再判一次
+    // （那时的 URL 已经是新文档），两层都必要：这里负责「及时丢掉」，那里负责「绝不误报」。
+    drop_report_if_origin_changed(app, url);
     {
         let state = app.state::<AppState>();
         let mut load = state.load.lock().unwrap();
@@ -1229,6 +1343,7 @@ pub fn save_and_install_state<R: Runtime>(
         load: Mutex::new(LoadState::default()),
         recreate_error: Mutex::new(None),
         recovered_from_backup: AtomicBool::new(recovered_from_backup),
+        page_report: Mutex::new(None),
     });
 }
 
@@ -1484,5 +1599,42 @@ mod tests {
         );
         assert!(LOAD_PROBE_JS.contains("main-frame-error"));
         assert!(!LOAD_PROBE_JS.contains("__FNOS_SHELL__"));
+    }
+
+    /// 上报前缀必须与 `shim.js` 里的字面量**同源**（Task 13a）。
+    ///
+    /// 两处不一致的表现是**静默丢数据**：页面写了 `FNOSREPORT:` 而宿主只认别的串，标题
+    /// 就被当成普通标题镜像到窗口上（用户看到窗口标题变成一坨 JSON），上报却永远收不到。
+    /// 与 `probe_prefix_and_script_agree` 同一手法：从常量逐字转义出 JS 字面量再在源码里找。
+    #[test]
+    fn report_prefix_and_shim_agree() {
+        let shim = include_str!("../inject/shim.js");
+        let escaped: String = report::REPORT_TITLE_PREFIX
+            .chars()
+            .map(|c| {
+                if c.is_ascii_graphic() {
+                    c.to_string()
+                } else {
+                    format!("\\u{:04x}", c as u32)
+                }
+            })
+            .collect();
+        assert!(
+            shim.contains(&format!("'{escaped}'")),
+            "shim.js 里的上报前缀必须由 report::REPORT_TITLE_PREFIX 逐字转义而来：{escaped}"
+        );
+        // 上报通道**不得**退化成 IPC：页面侧只允许写标题，不许出现任何 invoke 调用。
+        assert!(
+            !shim.contains("invoke("),
+            "上报通道不得改用 IPC（那会给远程页面开命令授权，见 R70）"
+        );
+        // 允许表里的 type 必须逐字出现在 vendored 的上游源码里（不是凭空发明的字符串）。
+        let upstream = include_str!("../assets/fnos-mods/content-script.js");
+        for ty in report::REPORT_TYPES {
+            assert!(
+                upstream.contains(&format!("'{ty}'")),
+                "允许表里的 {ty} 必须在 vendored 的 content-script.js 里真实存在"
+            );
+        }
     }
 }

@@ -9,6 +9,7 @@ import {
   addCurrentOriginToWhitelist,
   cornerShapeHint,
   originOfHttpUrl,
+  reportVerdict,
   statusFor,
   webviewMajor,
 } from '../ui/settings/status.js';
@@ -210,4 +211,108 @@ test('statusFor: meta.recoveredFromBackup → 状态条必须回显配置损坏�
 test('statusFor: 没有回退过备份时不出现 .bak 文案（不虚报）', () => {
   const m = statusFor(cfg(), page({ recognized: true }));
   assert.ok(!m.text.includes('.bak'), m.text);
+});
+
+// ------------------------------------------------ Task 13a：页面上报（据实化）
+
+/**
+ * 一条**真实的**上报：宿主把上游 `content-script.js:2681-2687` 的
+ * `chrome.runtime.sendMessage({type:'FNOS_INJECTION_TRIGGERED', triggerReason, origin, href, timestamp})`
+ * 放进信封的 `payload`（原文，一个字段不改），`dir:'out'` = 上游自己发出去的。
+ */
+function report(over = {}, payloadOver = {}) {
+  return {
+    type: 'FNOS_INJECTION_TRIGGERED',
+    dir: 'out',
+    payload: {
+      type: 'FNOS_INJECTION_TRIGGERED',
+      triggerReason: 'auto_whitelist',
+      origin: 'http://127.0.0.1:8793',
+      href: 'http://127.0.0.1:8793/index.html',
+      timestamp: 1759000000000,
+      ...payloadOver,
+    },
+    ...over,
+  };
+}
+
+test('reportVerdict: 只有「上游自己发出的注入链信号」才算注入已触发', () => {
+  assert.deepEqual(reportVerdict(report()), { injected: true, reason: 'auto_whitelist' });
+  // payload 缺 triggerReason：仍然是「已触发」，只是没有原因可报（不许因此降级）
+  assert.deepEqual(reportVerdict(report({}, { triggerReason: undefined })), { injected: true, reason: null });
+});
+
+test('reportVerdict: 其余一切形状都不升级（宁可退回弱文案）', () => {
+  for (const bad of [
+    null,
+    undefined,
+    'FNOS_INJECTION_TRIGGERED',
+    42,
+    {},
+    // type 不在上报协议里（brief 里那个凭空的 FNOS_PAGE_STATUS 就属于这一档）
+    { type: 'FNOS_PAGE_STATUS', dir: 'out', payload: { injected: true } },
+    // 应答方向：别人问它、它作答，不代表这次加载触发过注入
+    report({ dir: 'response' }),
+    // dir 缺失 / 类型错误
+    report({ dir: undefined }),
+    report({ dir: true }),
+    // 应用项列表那种应答（type 是请求类型）也不得升级
+    { type: 'FNOS_GET_LAUNCHPAD_APP_ITEMS', dir: 'out', payload: { items: [] } },
+  ]) {
+    assert.deepEqual(reportVerdict(bad), { injected: false, reason: null }, `不该升级：${JSON.stringify(bad)}`);
+  }
+});
+
+test('statusFor: 有真实上报 → 才敢说「注入链已触发」（不再只说「脚本已注册」）', () => {
+  const m = statusFor(cfg(), page({
+    url: 'http://127.0.0.1:8793/index.html',
+    origin: 'http://127.0.0.1:8793',
+    recognized: true,
+  }), report());
+  assert.equal(m.kind, 'ok');
+  assert.ok(m.text.includes('已回报上游注入链触发'), m.text);
+  assert.ok(m.text.includes('auto_whitelist'), `必须带上上游给的 triggerReason：${m.text}`);
+  assert.ok(m.text.includes('http://127.0.0.1:8793'), m.text);
+  assert.ok(!m.text.includes('注入脚本已注册'), '有上报时不该再用弱文案');
+});
+
+test('statusFor: 没有上报 → 保持 Task 11 的弱文案（不谎称已注入）', () => {
+  const p = page({ url: 'http://127.0.0.1:8793/index.html', origin: 'http://127.0.0.1:8793', recognized: true });
+  for (const r of [null, undefined, report({ dir: 'response' }), { type: 'FNOS_CHECK', dir: 'out', payload: {} }]) {
+    const m = statusFor(cfg(), p, r);
+    assert.equal(m.kind, 'ok');
+    assert.ok(m.text.includes('注入脚本已注册'), m.text);
+    assert.ok(!m.text.includes('已回报'), `不得声称有上报：${m.text}`);
+  }
+});
+
+test('statusFor: 上报不得盖过加载失败 / 正在加载（宿主自己的错误证据优先）', () => {
+  const failed = statusFor(cfg(), page({ loadFailed: true, url: 'http://127.0.0.1:1/', lastError: '连接被拒绝' }), report());
+  assert.equal(failed.kind, 'error');
+  assert.ok(failed.text.includes('加载失败'), failed.text);
+  assert.ok(!failed.text.includes('已回报'), failed.text);
+  assert.deepEqual(failed.actions, ['retry']);
+
+  const loading = statusFor(cfg(), page({ loading: true }), report());
+  assert.equal(loading.kind, 'warn');
+  assert.ok(loading.text.includes('正在加载'), loading.text);
+  assert.ok(!loading.text.includes('已回报'), loading.text);
+});
+
+test('statusFor: 页面上报了注入链、但宿主没认出这个地址 → 两件事都要说', () => {
+  // 上游还有 DOM 签名 / fnos-token / appcgi 资源三条签名路径（cs:2746-2779），
+  // 因此「宿主未识别」与「页面已注入」可以同时为真，不能只说一半。
+  const m = statusFor(cfg(), page({ recognized: false }), report({}, { triggerReason: 'auto_suspected' }));
+  assert.equal(m.kind, 'ok');
+  assert.ok(m.text.includes('已回报上游注入链触发'), m.text);
+  assert.ok(m.text.includes('auto_suspected'), m.text);
+  assert.ok(m.text.includes('宿主未将该地址识别为 fnOS WebUI'), m.text);
+  assert.ok(!m.text.includes('未检测到 fnOS WebUI'), '已经确知注入了，不能再说「未检测到」');
+});
+
+test('statusFor: 上报里带的应用项应答不得被当成注入证据（Task 13b 的前置契约）', () => {
+  const items = { type: 'FNOS_GET_LAUNCHPAD_APP_ITEMS', dir: 'response', payload: { items: [{ key: 'a' }], titles: ['a'] } };
+  const m = statusFor(cfg(), page({ recognized: true }), items);
+  assert.ok(m.text.includes('注入脚本已注册'), m.text);
+  assert.ok(!m.text.includes('已回报'), m.text);
 });

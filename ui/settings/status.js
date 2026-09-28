@@ -1,16 +1,21 @@
 // 设置窗顶部状态条（spec §12.3「失败模式与恢复」）。
 //
-// 三条硬约束：
+// 四条硬约束：
 //
-// 1. **只由真实数据得出**。判据全部来自两个 IPC 回包：`get_config`（配置 + `meta`）与
-//    `get_page_state`（Rust 侧观测到的主窗口 URL、是否命中白名单、上一次加载的结果）。
+// 1. **只由真实数据得出**。判据全部来自三个 IPC 回包：`get_config`（配置 + `meta`）、
+//    `get_page_state`（Rust 侧观测到的主窗口 URL、是否命中白名单、上一次加载的结果）与
+//    `get_page_report`（Task 13a：最近一次**页面自己**上报的上游注入链信号）。
 //    这里不猜、不缓存「上次大概是什么状态」，也不去 ping 任何地址。
 // 2. **弱态必须如实**。宿主能证明的只有「这个 origin 在白名单里 / 是 *.fnos.net →
 //    已为当前主窗口注册了 mods 初始化脚本」。页面最终是否真的注入，取决于上游
-//    `content-script.js::hasFnOSSignature()` 的判定（宿主看不到），所以文案是
-//    「注入脚本已注册」，**不是**「已注入 / 已生效」；fnOS 官网根域更是按设计不注入，
-//    必须单独说清楚。
-// 3. 纯函数集中在本文件（Node 可单测）；只有 `statusBar()` 碰 DOM，且取不到 `#status`
+//    `content-script.js::hasFnOSSignature()` 的判定（宿主看不到），所以**没有上报时**
+//    文案只能是「注入脚本已注册」，**不是**「已注入 / 已生效」；fnOS 官网根域更是按设计
+//    不注入，必须单独说清楚。
+// 3. **强态必须有据**（Task 13a）。只有页面把上游 `FNOS_INJECTION_TRIGGERED`（上游在
+//    `startInject()` 末尾自己发出的那条消息）经标题通道回传、且方向是「它自己发的」
+//    （`dir === 'out'`）时，才升级成「已回报注入链触发」。别的形状一律不升级
+//    （见 `reportVerdict`）。
+// 4. 纯函数集中在本文件（Node 可单测）；只有 `statusBar()` 碰 DOM，且取不到 `#status`
 //    时安静返回——`tests/settings.test.mjs` 会在无 DOM 的 Node 里 `import` app.js。
 //
 // 归一化语义与 Rust 对齐：白名单条目 trim + **只折 ASCII 大写** + 去重（R23 / config.rs）。
@@ -86,14 +91,39 @@ export function addCurrentOriginToWhitelist(origin, enabledOrigins) {
 }
 
 /**
+ * 最近一次页面上报（`get_page_report` 回包）的判读结果：`{ injected, reason }`。
+ *
+ * **唯一能升级状态条的证据**：上游 `content-script.js:2678-2692` 的 `notifyInjectionTriggered()`
+ * 在 `startInject()` 末尾（`:2743`）`chrome.runtime.sendMessage({type:'FNOS_INJECTION_TRIGGERED',
+ * triggerReason, origin, href, timestamp})`；本壳的 shim（`inject/shim.js` 的 `sendMessage`）
+ * 把这条消息**原文**放进信封的 `payload`，宿主校验 type 白名单后存内存。
+ * 它比「脚本已注册」强一档：说明**上游自己的注入链确实跑到了最后一步**。
+ *
+ * 不升级的形状（全部按「没有上报」处理，宁可退回弱文案）：
+ * - 不是对象 / `null`（没上报、被拒、换页面后作废）；
+ * - `type` 不是 `FNOS_INJECTION_TRIGGERED`（例如应用项列表应答）；
+ * - `dir !== 'out'`：`'response'` 是**别人问它、它作答**，不代表这次加载触发过注入；
+ * - `payload` 缺失 → 仍然算注入已触发（triggerReason 只是附加信息，缺了不影响结论）。
+ */
+export function reportVerdict(report) {
+  if (!report || typeof report !== 'object') return { injected: false, reason: null };
+  if (report.type !== 'FNOS_INJECTION_TRIGGERED') return { injected: false, reason: null };
+  if (report.dir !== 'out') return { injected: false, reason: null };
+  const payload = report.payload && typeof report.payload === 'object' ? report.payload : null;
+  const raw = payload && typeof payload.triggerReason === 'string' ? payload.triggerReason.trim() : '';
+  return { injected: true, reason: raw || null };
+}
+
+/**
  * 状态条模型：`{ kind, text, actions, origin }`。
  *
  * `actions` 是渲染层要挂的按钮（`'retry'` / `'whitelist'`）：只给出「有真实依据」的动作
  * —— 解析不出 origin 就不给「加入白名单」，没在错误页/加载失败就不给「重试」。
  *
- * `cfg` = `get_config` 回包，`page` = `get_page_state` 回包（可以为 `null` = 还没取到）。
+ * `cfg` = `get_config` 回包，`page` = `get_page_state` 回包（可以为 `null` = 还没取到），
+ * `report` = `get_page_report` 回包（同样可以为 `null` = 没有可用上报）。
  */
-export function statusFor(cfg, page) {
+export function statusFor(cfg, page, report) {
   if (!cfg || typeof cfg !== 'object') {
     return { kind: 'pending', text: '正在读取配置…', actions: [], origin: null };
   }
@@ -102,6 +132,7 @@ export function statusFor(cfg, page) {
   const inject = shell.injectEnabled !== false;
   const origin = page && page.origin ? normalizeOrigin(page.origin) : null;
   const where = origin || (page && page.url) || '未知地址';
+  const verdict = reportVerdict(report);
 
   const parts = [`配置已加载，注入开关：${inject ? '开启' : '关闭'}`];
   const actions = [];
@@ -118,6 +149,14 @@ export function statusFor(cfg, page) {
   } else if (page.loading) {
     parts.push(`主窗口正在加载：${page.url || '未知地址'}`);
     kind = 'warn';
+  } else if (verdict.injected) {
+    // 页面自己的回报：上游注入链在这一页跑到了 `notifyInjectionTriggered`（最强的一条判据）。
+    parts.push(`页面已回报上游注入链触发${verdict.reason ? `（triggerReason=${verdict.reason}）` : ''}：${where}`);
+    if (!page.recognized) {
+      // 宿主没在白名单/飞牛域名里认出这个地址，但页面自己报了注入链已触发
+      //（上游还有 DOM 签名 / token / appcgi 资源三条签名路径）。两句话都必须说出来。
+      parts.push('宿主未将该地址识别为 fnOS WebUI（上游按自身签名判定并注入）');
+    }
   } else if (!page.recognized) {
     parts.push(`未检测到 fnOS WebUI：${where}`);
     kind = 'warn';

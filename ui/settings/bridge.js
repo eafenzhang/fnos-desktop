@@ -5,7 +5,7 @@
 // （`tauri-2.12.0/scripts/core.js:81` 用 `Object.defineProperty` 定义 `invoke`，
 // 与 `withGlobalTauri` 无关）。两条路径都试，取先可用的那条。
 //
-// 命令授权不在这里：`capabilities/default.json` 只把 6 个 `allow-*` 授予
+// 命令授权不在这里：`capabilities/default.json` 只把 8 个 `allow-*` 授予
 // label 为 `settings` 的窗口，其它窗口（含远程页面）调同一命令会被 ACL 拒绝。
 
 /** 当前可用的 invoke 实现；都不可用时抛错（由调用方 catch 并显示到界面上）。 */
@@ -50,3 +50,12 @@ export function openUrl(url) { return invoke('open_url', { url }); }
  * 所以页面永远无法自己声称「已注入」或改写这个判定。
  */
 export function getPageState() { return invoke('get_page_state'); }
+/**
+ * 最近一次页面上报（Task 13a）：`get_page_report` 同样是**只读**、同样只授设置窗。
+ *
+ * 上报本身**不走 IPC**：shim 写 `document.title`（`FNOSREPORT:` 前缀），Rust 的
+ * `on_document_title_changed` 校验后存内存。所以本命令是「读取口」，不是「上报口」——
+ * 页面上没有任何命令可调，capability 集合里也没有任何 `remote` 块。
+ * 返回 `null` 表示没有可用上报（还没上报 / 上报被拒 / 换页面后旧上报已作废）。
+ */
+export function getPageReport() { return invoke('get_page_report'); }

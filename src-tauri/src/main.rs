@@ -5,6 +5,7 @@ mod commands;
 mod config;
 mod injector;
 mod paths;
+mod report;
 mod tray;
 
 // `Manager` 提供 `get_webview_window`（单实例回调）与 `app_handle`（关闭回调）；
@@ -83,6 +84,9 @@ fn main() {
             // Task 11 的状态条数据源（R2：设置窗**查询**，不做页面→宿主上报）。
             // 同样只授予 settings 窗——主窗口（含内置错误页）拿不到任何命令。
             commands::get_page_state,
+            // Task 13a：页面上报的读取口。上报本身走 `document.title`（不经 IPC、不需要任何
+            // capability，见 src/report.rs），页面**没有任何**命令可调用；这个读命令只授设置窗。
+            commands::get_page_report,
         ])
         .run(tauri::generate_context!())
         .expect("fnOS 启动失败");
