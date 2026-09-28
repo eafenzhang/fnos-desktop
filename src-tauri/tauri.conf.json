@@ -14,6 +14,10 @@
     "active": true,
     "targets": ["nsis"],
     "icon": ["icons/icon.ico", "icons/icon.png"],
+    "resources": {
+      "assets/fnos-mods/LICENSE": "fnos-mods/LICENSE",
+      "assets/fnos-mods/NOTICE": "fnos-mods/NOTICE"
+    },
     "windows": {
       "nsis": {
         "installMode": "currentUser",

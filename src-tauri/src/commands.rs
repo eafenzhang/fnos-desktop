@@ -310,9 +310,36 @@ pub struct Meta {
     pub mods_version: String,
     pub config_path: String,
     pub webview_version: Option<String>,
+    /// 随包许可全文的**实际**位置（spec §10 / Ruling R54）。安装后落在资源目录
+    /// （Windows 上即主程序所在目录）的 `fnos-mods/LICENSE`。
+    pub license_path: String,
+    /// 随包 NOTICE（来源仓库 + commit + SHA-256 + 包装性改动清单）的实际位置。
+    pub notice_path: String,
     /// 本次会话是否从 `config.json.bak` 恢复过（Task 11 / spec §12.3 的「配置损坏」一行）。
     /// 设置窗状态条据此**回显**，而不是让一次静默回退只留在磁盘上的 `.bak` 里。
     pub recovered_from_backup: bool,
+}
+
+/// 随包合规件在**本次运行**下的真实路径（spec §10：分发必须保留许可全文）。
+///
+/// 为什么单独一个类型：`config_view` 刻意不接 `AppHandle`（见它的注释），而解析资源目录
+/// 需要 `app.path()`。于是由持有句柄的调用方先解析好再传进去——比给 `config_view` 塞一个
+/// `&AppHandle` 更贴合它「纯组装」的定位。
+#[derive(Debug, Clone)]
+pub struct CompliancePaths {
+    pub license: String,
+    pub notice: String,
+}
+
+impl CompliancePaths {
+    pub fn resolve<R: Runtime>(app: &AppHandle<R>) -> Self {
+        // 取不到资源目录时 `compliance_path` 自己回落到源码树路径，这里 `ok()` 即可
+        let dir = app.path().resource_dir().ok();
+        Self {
+            license: paths::compliance_path(dir.as_deref(), paths::LICENSE_RESOURCE),
+            notice: paths::compliance_path(dir.as_deref(), paths::NOTICE_RESOURCE),
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -363,9 +390,13 @@ fn recovered_from_backup<R: Runtime>(app: &AppHandle<R>) -> bool {
 ///
 /// 刻意**不**接收 `AppHandle`：`config_view` 用不到 app 句柄（`tauri::webview_version()`
 /// 是不需要 app 的自由函数），带上它只会产生 `unused variable: app` 警告（R18 要求 0 警告）。
-/// 唯一的例外是 `recovered_from_backup`——它不是配置字段，由唯一持有 `AppHandle` 的调用方
-/// 读出来后传进来。
-fn config_view(cfg: &Config, recovered_from_backup: bool) -> ConfigView {
+/// 两个例外都由唯一持有 `AppHandle` 的调用方读出来后传进来：`recovered_from_backup`
+/// （不是配置字段）与 `compliance`（资源目录要 `app.path()`）。
+fn config_view(
+    cfg: &Config,
+    recovered_from_backup: bool,
+    compliance: &CompliancePaths,
+) -> ConfigView {
     ConfigView {
         schema_version: cfg.schema_version,
         mods: cfg.mods.clone(),
@@ -383,6 +414,9 @@ fn config_view(cfg: &Config, recovered_from_backup: bool) -> ConfigView {
             // `pub fn webview_version() -> Result<String>`），取不到时为 `None`
             //（例如 WebView2 运行时缺失），不 panic。
             webview_version: tauri::webview_version().ok(),
+            // spec §10 / R54：关于页必须能指出**随包**许可全文与 NOTICE 的真实位置
+            license_path: compliance.license.clone(),
+            notice_path: compliance.notice.clone(),
             recovered_from_backup,
         },
     }
@@ -392,7 +426,7 @@ fn config_view(cfg: &Config, recovered_from_backup: bool) -> ConfigView {
 pub fn get_config<R: Runtime>(app: AppHandle<R>) -> ConfigView {
     let cfg = current(&app);
     let recovered = recovered_from_backup(&app);
-    config_view(&cfg, recovered)
+    config_view(&cfg, recovered, &CompliancePaths::resolve(&app))
 }
 
 #[tauri::command]
@@ -426,7 +460,11 @@ pub fn set_config<R: Runtime>(
         eprintln!("[fnos] 托盘同步失败: {e}");
     }
     Ok(SetResult {
-        config: config_view(&cfg, recovered_from_backup(&app)),
+        config: config_view(
+            &cfg,
+            recovered_from_backup(&app),
+            &CompliancePaths::resolve(&app),
+        ),
         needs_reload,
     })
 }
@@ -1104,7 +1142,11 @@ pub fn reset_config<R: Runtime>(app: AppHandle<R>, scope: String) -> Result<Conf
             eprintln!("[fnos] 重置后重建主窗口失败: {e}");
         }
     }
-    Ok(config_view(&cfg, recovered_from_backup(&app)))
+    Ok(config_view(
+        &cfg,
+        recovered_from_backup(&app),
+        &CompliancePaths::resolve(&app),
+    ))
 }
 
 // ---------- Rust 内部（非 IPC） ----------
@@ -1293,6 +1335,31 @@ mod tests {
         );
         // JS 侧（ui/settings/normalize.js 的 `clampLightness`）仍不是不动点，本轮不动它；
         // 不变式改由「JS 只夹用户刚输入的值、绝不夹 Rust 归一化过的值」维持（fix round 1 的 A）。
+    }
+
+    // ---------- Task 12：合规件路径的 IPC 契约 ----------
+
+    /// 关于页按 `meta.licensePath` / `meta.noticePath` 读；键名必须是 camelCase
+    /// （`#[serde(rename_all = "camelCase")]` 是唯一来源，写错就会静默回落成源码路径）。
+    #[test]
+    fn meta_json_keys_are_camel_case() {
+        let meta = Meta {
+            shell_version: "0.1.0".into(),
+            mods_commit: "483c3e2".into(),
+            mods_version: "1.0.2".into(),
+            config_path: r"C:\cfg\config.json".into(),
+            webview_version: Some("139.0.0.0".into()),
+            license_path: r"C:\app\fnos-mods\LICENSE".into(),
+            notice_path: r"C:\app\fnos-mods\NOTICE".into(),
+            recovered_from_backup: false,
+        };
+        let json = serde_json::to_value(&meta).expect("Meta 必须可序列化");
+        assert_eq!(json["licensePath"], r"C:\app\fnos-mods\LICENSE");
+        assert_eq!(json["noticePath"], r"C:\app\fnos-mods\NOTICE");
+        // 既有字段不变（设置窗的「关于」页读的就是这些键）
+        assert_eq!(json["webviewVersion"], "139.0.0.0");
+        assert_eq!(json["configPath"], r"C:\cfg\config.json");
+        assert!(json.get("license_path").is_none(), "键名必须是 camelCase");
     }
 
     // ---------- Task 11：状态条 / 错误页的纯判据 ----------

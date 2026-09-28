@@ -412,6 +412,23 @@ function renderStatus(busy) {
 
 // ---------- 关于页（spec §10：合规与品牌） ----------
 
+/**
+ * 关于页要展示的两个合规件路径（spec §10「分发必须保留许可全文」/ Ruling R54）。
+ *
+ * 优先用宿主解析出的**随包真实路径**（`meta.licensePath` / `meta.noticePath`：安装版落在
+ * 安装目录的 `fnos-mods/`，开发版落在 `target/(debug|release)/fnos-mods/`，两处都由
+ * `tauri-build` 的 `copy_resources` 保证文件确实在）。这两个字段是 T12 才加上的，
+ * 老宿主（或只喂半个 meta 的单测）没有它们——那时才回落到源码树里的 vendored 位置，
+ * 而不是把 `undefined` 画到界面上。
+ */
+export function compliancePaths(meta) {
+  const m = meta || {};
+  return {
+    license: m.licensePath || `${VENDOR_DIR}/LICENSE`,
+    notice: m.noticePath || `${VENDOR_DIR}/NOTICE`
+  };
+}
+
 function metaRow(label, value, tag, className) {
   const row = el('div', { className: 'row' });
   row.appendChild(el('span', { className: 'row-label', text: label }));
@@ -443,6 +460,11 @@ function renderAbout(pane) {
     }));
   }
   card.appendChild(metaRow('配置文件', meta.configPath || '未知', 'code', 'row-value path'));
+  // spec §10 / R54：关于页必须指出**随包**许可全文与 NOTICE 的真实位置。
+  // 这两行是 T12 新增的（此前只显示源码树路径，安装后在磁盘上并不存在）。
+  const legalPaths = compliancePaths(meta);
+  card.appendChild(metaRow('上游许可全文', legalPaths.license, 'code', 'row-value path'));
+  card.appendChild(metaRow('来源与改动声明', legalPaths.notice, 'code', 'row-value path'));
   pane.appendChild(card);
 
   const actions = el('div', { className: 'card' });
@@ -510,7 +532,7 @@ function renderAbout(pane) {
   legal.appendChild(linkLine);
   legal.appendChild(el('p', {
     className: 'legal-line dim',
-    text: `上游许可全文与版权声明：${VENDOR_DIR}/LICENSE（另有 ${VENDOR_DIR}/NOTICE：来源仓库、锁定 commit、各文件 SHA-256、本壳的包装性改动清单）。点击上面的链接会用系统默认浏览器打开；若被系统策略拦截，可手动复制地址。`
+    text: `上游许可全文：${legalPaths.license}；来源与改动声明：${legalPaths.notice}（后者含来源仓库、锁定 commit、各文件 SHA-256、本壳的包装性改动清单）。两者都随安装包分发；上方的链接会用系统默认浏览器打开上游仓库，若被系统策略拦截，可手动复制上面的路径。`
   }));
   pane.appendChild(legal);
 }

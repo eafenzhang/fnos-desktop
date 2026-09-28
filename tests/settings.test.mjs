@@ -7,11 +7,12 @@
 // 这些断言依赖「导入 app.js 不需要 DOM」：`boot()` 只在真实页面（有 `#pane`）里自动执行。
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { adoptConfig, state } from '../ui/settings/app.js';
+import { adoptConfig, compliancePaths, state } from '../ui/settings/app.js';
 import * as bridge from '../ui/settings/bridge.js';
 import {
   clampLightness, normalizeMods, normalizeModsEntry, normalizeOrigin, parseHttpOrigin
 } from '../ui/settings/normalize.js';
+import { VENDOR_DIR } from '../ui/settings/schema.js';
 
 test('导入 app.js 不触发 boot（无 DOM 也能单测内部逻辑）', async () => {
   // `boot()` 现在挂在 `window.addEventListener('focus')` 上并会 `render()`（要 #nav/#pane），
@@ -160,4 +161,32 @@ test('D: 桥不可用时返回 rejected Promise（不白屏），且不吞掉命
   } finally {
     if (prev !== undefined) globalThis.window = prev;
   }
+});
+
+// ---------- E：关于页的合规件路径（T12 / R54） ----------
+
+test('E: 关于页优先展示宿主解析出的随包路径，而不是源码树路径', () => {
+  const installed = {
+    licensePath: 'C:\\Users\\u\\AppData\\Local\\fnOS\\fnos-mods\\LICENSE',
+    noticePath: 'C:\\Users\\u\\AppData\\Local\\fnOS\\fnos-mods\\NOTICE'
+  };
+  assert.deepEqual(compliancePaths(installed), {
+    license: installed.licensePath,
+    notice: installed.noticePath
+  });
+  // 关键不变式：有宿主路径时**不得**再出现 `src-tauri/assets/...`（安装后磁盘上没有它）
+  assert.equal(compliancePaths(installed).license.includes(VENDOR_DIR), false);
+});
+
+test('E: 老宿主（meta 缺字段/整个缺失）回落源码树路径，绝不画 undefined', () => {
+  for (const meta of [{}, undefined, null, { shellVersion: '0.1.0' }]) {
+    const p = compliancePaths(meta);
+    assert.equal(p.license, `${VENDOR_DIR}/LICENSE`);
+    assert.equal(p.notice, `${VENDOR_DIR}/NOTICE`);
+    assert.equal(p.license.includes('undefined'), false);
+  }
+  // 只有一个字段时另一条也各自回落（两行不共享一个判据）
+  const half = compliancePaths({ licensePath: 'X:\\a\\LICENSE' });
+  assert.equal(half.license, 'X:\\a\\LICENSE');
+  assert.equal(half.notice, `${VENDOR_DIR}/NOTICE`);
 });
