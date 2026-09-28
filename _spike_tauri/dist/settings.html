@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>fnOS 设置（探针）</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin:0; font:14px/1.6 "Microsoft YaHei",system-ui,sans-serif; background:#1b1c1e; color:#e8e8ea; display:flex; height:100vh; }
+  nav { width:190px; background:#232427; padding:14px 8px; box-sizing:border-box; }
+  nav h1 { font-size:15px; margin:6px 8px 16px; color:#9aa0a6; font-weight:600; }
+  nav a { display:block; padding:8px 10px; border-radius:6px; color:#cfd2d6; text-decoration:none; }
+  nav a.on { background:#0a84ff33; color:#7ab8ff; }
+  main { flex:1; padding:22px 26px; overflow:auto; }
+  h2 { font-size:17px; margin:0 0 4px; }
+  p.sub { color:#8b9096; margin:0 0 18px; }
+  .card { background:#232427; border:1px solid #2e3034; border-radius:10px; padding:14px 16px; margin-bottom:12px; }
+  .row { display:flex; align-items:center; justify-content:space-between; padding:7px 0; }
+  .k { color:#c8ccd1; }
+  .v { color:#7ab8ff; font-variant-numeric:tabular-nums; }
+  code { background:#0f1012; padding:2px 6px; border-radius:4px; color:#8ce99a; }
+</style>
+</head>
+<body>
+<nav><h1>fnOS 系统设置</h1>
+  <a class="on" href="#">桌面与外观</a>
+  <a href="#">主题与字体</a>
+  <a href="#">标题栏样式</a>
+  <a href="#">启动台样式</a>
+  <a href="#">关于</a>
+</nav>
+<main>
+  <h2>桌面与外观</h2>
+  <p class="sub">本地设置窗（探针）——验证「托盘 → 打开本地窗口」链路，与外部站点窗口并存。</p>
+  <div class="card">
+    <div class="row"><span class="k">窗口来源</span><span class="v" id="kind">tauri://localhost (WebviewUrl::App)</span></div>
+    <div class="row"><span class="k">chromium 内核</span><span class="v" id="ua">-</span></div>
+    <div class="row"><span class="k">corner-shape 支持</span><span class="v" id="cs">-</span></div>
+  </div>
+  <div class="card">
+    <div class="row"><span class="k">注入开关</span><span class="v">由托盘勾选项驱动（探针只打日志）</span></div>
+  </div>
+</main>
+<script>
+  document.getElementById('ua').textContent = navigator.userAgent;
+  document.getElementById('cs').textContent =
+    "squircle:" + CSS.supports('corner-shape','squircle') + " / round:" + CSS.supports('corner-shape','round');
+</script>
+</body>
+</html>

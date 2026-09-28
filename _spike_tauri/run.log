@@ -1,0 +1,9 @@
+[probe] setup 开始；tauri 2.12.0
+[probe] ✅ 托盘图标 + 右键菜单创建成功（勾选项/显示隐藏/系统设置/退出）
+[probe] 注入载荷: mods CSS 195500 字节
+[probe] ✅ 主窗口已创建，加载 https://fnos.net/
+[probe] page-load Started https://fnos.net/
+[probe] page-load Finished https://fnos.net/
+[probe] ✅ 主进程 eval 注入远程页面：已下发
+[probe] 远程页面标题（eval 之后）= fnOS 方案C 探针
+[probe] ✅ 设置窗创建成功（本地 WebviewUrl::App，与外部站点窗口并存）
