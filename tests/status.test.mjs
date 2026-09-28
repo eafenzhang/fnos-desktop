@@ -8,6 +8,7 @@ import assert from 'node:assert/strict';
 import {
   addCurrentOriginToWhitelist,
   cornerShapeHint,
+  MAX_TRIGGER_REASON_CHARS,
   originOfHttpUrl,
   reportVerdict,
   statusFor,
@@ -315,4 +316,61 @@ test('statusFor: 上报里带的应用项应答不得被当成注入证据（Tas
   const m = statusFor(cfg(), page({ recognized: true }), items);
   assert.ok(m.text.includes('注入脚本已注册'), m.text);
   assert.ok(!m.text.includes('已回报'), m.text);
+});
+
+// ---------------------------------- fix round 1 / Minor 4：分支次序不得自相矛盾
+
+test('statusFor: 注入开关关着 → 页面即便回报了「注入链已触发」也不升级', () => {
+  // 缺陷本体：旧次序先判 verdict.injected，于是同一个状态条会同时出现
+  // 「注入开关：关闭」与「页面已回报上游注入链触发」（而标题通道对页面公开可写——
+  // Task 13a 报告 §4.3 的第 4 个读数正是页面自己伪造这种形状的实测）。
+  const off = statusFor(cfg({ shell: { injectEnabled: false } }), page({ recognized: true }), report());
+  assert.equal(off.kind, 'warn');
+  assert.ok(off.text.includes('注入开关：关闭'), off.text);
+  assert.ok(!off.text.includes('已回报'), `开关关着时不得声称已回报注入链：${off.text}`);
+  assert.ok(off.text.includes('但注入开关已关闭'), off.text);
+
+  // 未识别 + 开关关着：宿主的两件事都要说，且保留一键白名单（与 Task 11 的行为一致）
+  const offUnknown = statusFor(cfg({ shell: { injectEnabled: false } }), page({ recognized: false }), report());
+  assert.ok(offUnknown.text.includes('未检测到 fnOS WebUI'), offUnknown.text);
+  assert.ok(!offUnknown.text.includes('已回报'), offUnknown.text);
+  assert.deepEqual(offUnknown.actions, ['whitelist']);
+
+  // 开关开着时仍然照旧升级（次序改动没有把强态一起关掉）
+  const on = statusFor(cfg(), page({ recognized: true }), report());
+  assert.ok(on.text.includes('已回报上游注入链触发'), on.text);
+});
+
+test('statusFor: fnOS 官网页即便有上报也不声称已注入（官网按设计不注入）', () => {
+  const home = page({ url: 'https://fnos.net/', origin: 'https://fnos.net', recognized: true, officialHome: true });
+  const m = statusFor(cfg(), home, report());
+  assert.equal(m.kind, 'ok');
+  assert.ok(m.text.includes('fnOS 官网'), m.text);
+  assert.ok(!m.text.includes('已回报'), `官网页不得声称注入链触发：${m.text}`);
+  // 开关关着 + 官网页：仍然是官网文案（两支都与「不注入」一致，不冲突）
+  const off = statusFor(cfg({ shell: { injectEnabled: false } }), home, report());
+  assert.ok(off.text.includes('fnOS 官网'), off.text);
+  assert.ok(!off.text.includes('已回报'), off.text);
+});
+
+test('reportVerdict: 页面可控的 triggerReason 进 UI 前被整形（去控制字符 + 按码点截断）', () => {
+  const hostile = 'auto\u0000_whitelist\n[fnos] 页面上报已接受：伪造行\t' + 'x'.repeat(200);
+  const v = reportVerdict(report({}, { triggerReason: hostile }));
+  assert.equal(v.injected, true, '整形 reason 不改变「这条算不算注入证据」的判定');
+  assert.ok(!/[\u0000-\u001f\u007f-\u009f]/.test(v.reason), `不得含控制字符：${JSON.stringify(v.reason)}`);
+  assert.ok(
+    Array.from(v.reason).length <= MAX_TRIGGER_REASON_CHARS + 1,
+    `截断到上限 + 省略号：${Array.from(v.reason).length}`
+  );
+  assert.ok(v.reason.endsWith('…'), v.reason);
+  assert.ok(!v.reason.includes('\n'));
+  // 同一份文本画到状态条上也必须还是一行（UIA 读到的 accessible name 就是评审证据）
+  const m = statusFor(cfg(), page({ recognized: true }), report({}, { triggerReason: hostile }));
+  assert.equal(m.text.split('\n').length, 1, m.text);
+  assert.ok(m.text.includes('已回报'), m.text);
+  assert.ok(!m.text.includes('伪造行\u0000'), '控制字符必须已被替换');
+  // 全是空白 / 控制字符 → 没有原因可说（退回不带 triggerReason 的强文案）
+  assert.deepEqual(reportVerdict(report({}, { triggerReason: ' \n\t ' })), { injected: true, reason: null });
+  // 正常值逐字保留（不截断、不折叠内部文本）
+  assert.deepEqual(reportVerdict(report()), { injected: true, reason: 'auto_whitelist' });
 });

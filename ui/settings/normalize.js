@@ -19,7 +19,7 @@
 // | fontWeight | 非 450/normal/600 → 空串 | 同上 |
 // | lockscreenDefaultUsername | 截断到 80（按**码点**，与 Rust `chars().take(80)` 一致） | 同上 |
 // | enabledOrigins | trim + 小写（**只小写 ASCII**）+ 丢空 + 大小写不敏感去重 | 同上（R23） |
-// | launchpadIconRedrawMap | 只留 `^prefect_icon/[a-z0-9-]+\.png$` | `is_valid_prefect_icon_path` |
+// | launchpadIconRedrawMap | 只留 `^prefect_icon/[a-z0-9-]+\.png$`（**大小写不敏感**，R30） | `is_valid_prefect_icon_path` |
 //
 // 与 Rust 有意不同的一点（**不是**遗漏）：`Config::normalize` 会把 `shell.nasUrl` 的 origin
 // 并入 `mods.enabledOrigins`，但那段逻辑在 `shell` 段上，`normalizeMods(mods)` 拿不到
@@ -96,9 +96,42 @@ export function clampLightness(input) {
   return `#${to(rr)}${to(gg)}${to(bb)}`;
 }
 
-/** 上游 `launchpadIconRedrawMap` 的取值约束（= Rust `is_valid_prefect_icon_path`）。 */
+/**
+ * 上游 `launchpadIconRedrawMap` 的取值约束：`^prefect_icon/[a-z0-9-]+\.png$`，**按大小写
+ * 不敏感**判定——与 Rust `config.rs::is_valid_prefect_icon_path` 逐条同义（R30 的 JS 镜像；
+ * fix round 1 才真正对齐，见下）。
+ *
+ * 为什么需要 `i`：图标资源在磁盘上是 camelCase（`src-tauri/assets/fnos-mods/prefect_icon/`
+ * 下就是 `panIndex.png`），shim 建索引时把小写化后的键当唯一键（`shim.js` 的
+ * `assetIndex[String(k).toLowerCase()]`，`tests/shim.test.mjs` 有一条用例锁着「大小写不
+ * 敏感」），因此 `prefect_icon/Emby.png` / `PREFECT_ICON/emby.PNG` 在运行期**都能解析到同一份
+ * 资源**。Rust 侧已放行这些值，而设置窗在**提交 patch 之前**跑本函数
+ * （`app.js::commit` → `normalizeForSubmit` → `normalizeModsEntry`，键来自 `MODS_KEYS`），
+ * 旧的全小写正则会把它们**静默丢掉**——用户看到的现象是「设置了完美图标，页面却没变化」，
+ * 正是 R30 要根除的静默丢配置。
+ *
+ * 放宽的**只有大小写这一维**（与 Rust 完全一致）：`..` 穿越、子目录
+ * （`prefect_icon/sub/a.png`）、反斜杠（`prefect_icon\a.png`：shim 的查表键用 `/`，反斜杠
+ * 永远解析不到资源）、双扩展名（`a.png.png`）、空名、空格、非 ASCII 一律照旧拒绝。
+ *
+ * 三个容易写错的语义细节（都选了与 Rust 同义的那一种）：
+ * - `/i` **不带 `u`** 时只折 ASCII（`[a-z]` 只是多匹配 `A-Z`，不会把 `K`(U+212A) 折成 `k`），
+ *   与 Rust 的 `eq_ignore_ascii_case` 同一种语义；带上 `u` 反而引入 Unicode 折叠，两侧就不再
+ *   同义了。
+ * - `$`（不带 `m`）只匹配输入末尾，所以尾随换行**仍是拒绝**——与 Rust 的 `strip_suffix`
+ *   逐字节比较一致（`prefect_icon/a.png\n` 两侧都拒）。
+ * - 名称字符集不含 `.`，所以 `a.png.png` 是「主体含 `.`」而被拒（与 Rust 的判定顺序同结论）。
+ *
+ * 两侧的**输入表**逐行相同：Rust 侧是 `config.rs::tests::redraw_map_regex_is_case_insensitive_only`
+ * （20 条断言 + `normalize()` 的 retain/幂等两条），JS 侧是 `tests/normalize.test.mjs` 的
+ * `PREFECT_ICON_PATH_TABLE`；`commands.rs::tests::prefect_icon_rule_mirror_stays_in_step` 还
+ * 逐字锁住本常量的正则文本（含 `i`）并逐行核对那张表。**改一侧必须同时改另一侧。**
+ */
+export const PREFECT_ICON_PATH = /^prefect_icon\/[a-z0-9-]+\.png$/i;
+
+/** 上游 `launchpadIconRedrawMap` 的单值判定（= Rust `is_valid_prefect_icon_path`）。 */
 export function isPrefectIconPath(v) {
-  return typeof v === 'string' && /^prefect_icon\/[a-z0-9-]+\.png$/.test(v);
+  return typeof v === 'string' && PREFECT_ICON_PATH.test(v);
 }
 
 /** 白名单条目：trim + **只小写 ASCII**（R23：上游按 `location.origin` 大小写敏感比较）。

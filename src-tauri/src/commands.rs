@@ -97,9 +97,10 @@ pub struct AppState {
     /// 最近一次**通过校验**的页面上报（Task 13a；见 [`crate::report`]）。
     ///
     /// **只在内存里**：不落盘、不进 `Config`、不给页面回执。它是「页面声称注入链已触发」的
-    /// 证据，不是任何权限的来源。每次新建/重建主窗口、切错误页、以及新文档与上报不同源时
-    /// 都会清空（见 [`begin_load`] / [`set_error_state`] / [`on_page_event`]）——旧页面的
-    /// 上报绝不能拿来描述新页面。
+    /// 证据，不是任何权限的来源。每次新建/重建主窗口、切错误页、以及新文档与上报**不同文档**
+    /// （origin 或 URL 不同，fix round 1 / Minor 3）时都会清空
+    /// （见 [`begin_load`] / [`set_error_state`] / [`on_page_event`]）——旧页面的上报绝不能
+    /// 拿来描述新页面。
     pub page_report: Mutex<Option<report::ReportEntry>>,
 }
 
@@ -182,24 +183,50 @@ fn load_failure_reason(url: &str) -> Option<String> {
 
 /// 页面自检探针的回话 → 失败原因；`None` = 判定为「确实加载成功了」。
 ///
-/// 只认明确的 `err: true`：解析不出来（页面把标题换成了别的东西 / 探针被 CSP 拦）时
+/// 只认明确的 `err:true`：解析不出来（页面把标题换成了别的东西 / 探针被 CSP 拦）时
 /// 一律**不**降级为失败——宁可漏报，也不要把正常页面误判成加载失败。
+///
+/// **`detail` 是页面可控的**（探针标题与上报标题走同一条可写通道，见 [`handle_title`]），
+/// 而它有四个去处：宿主 stderr 日志（`on_load_probe` / `mark_failed`）、`LoadState.last_error`
+/// → 设置窗状态条、内置错误页的 `__FNOS_SET_ERROR__` 载荷。因此它按 fix round 1 /
+/// Important 1 的同一条纪律收口（[`sane_probe_detail`]）：控制字符折成空格、连续空白折叠、
+/// 按码点截断到 160——与注入脚本 `LOAD_PROBE_JS` 自己做的整形
+/// （`m.replace(/\s+/g,' ').slice(0,160)`）同形，所以真实错误页的文案一个字都不会变，而页面
+/// 自写的换行不再能在日志里伪造出整行 `[fnos] …`。
 fn probe_verdict(payload: &str) -> Option<String> {
     let value: Value = serde_json::from_str(payload).ok()?;
     if value.get("err").and_then(Value::as_bool) != Some(true) {
         return None;
     }
-    let detail = value
-        .get("detail")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim();
+    let detail = sane_probe_detail(value.get("detail").and_then(Value::as_str).unwrap_or(""));
     Some(if detail.is_empty() {
         "WebView2 报告该地址无法访问（网络错误）".to_string()
     } else {
         format!("WebView2 报告：{detail}")
     })
 }
+
+/// 探针 `detail` 的整形（页面可控文本 → 能安全进日志/UI/错误页的一行文本）。
+///
+/// 规则与 `LOAD_PROBE_JS` 页面侧的 `m.replace(/\s+/g,' ').slice(0,160)` 对齐：控制字符
+/// （C0 / DEL / C1，含换行与制表）与 Unicode 空白（U+2028 / U+2029 / U+0085 …）一律折成**一个**
+/// 空格、去首尾空白、按**码点**截断到 160。正文本身保留——排障要看得到页面到底写了什么。
+fn sane_probe_detail(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len().min(1024));
+    for c in raw.chars() {
+        if c.is_control() || c.is_whitespace() || matches!(c, '\u{2028}' | '\u{2029}') {
+            if !out.is_empty() && !out.ends_with(' ') {
+                out.push(' ');
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out.trim().chars().take(PROBE_DETAIL_MAX_CHARS).collect()
+}
+
+/// 探针 `detail` 进日志/UI 前的码点上限（= 注入脚本 `LOAD_PROBE_JS` 的 `slice(0,160)`）。
+const PROBE_DETAIL_MAX_CHARS: usize = 160;
 
 /// origin 的 host 是否属于飞牛（`fnos.net` 或 `*.fnos.net`）。
 ///
@@ -683,7 +710,13 @@ pub fn handle_title<R: Runtime>(window: &WebviewWindow<R>, title: &str) {
         return;
     }
     // 现场排障 + 运行期证据（错误页会把自检结论写进标题，见 ui/settings/error.html）。
-    eprintln!("[fnos] 主窗口标题: {title}");
+    //
+    // `title` 是**页面可控**的（`document.title`）：日志只是它的一个渲染，必须过
+    // `report::log_safe`（fix round 1 / Important 1）——否则一句
+    // `document.title = "x\n[fnos] 页面上报已接受：…"` 就能在研究 stderr 里插出一行伪造日志。
+    // `set_title` 拿到的仍是**原文**：spec §7「窗口标题跟随页面」是产品行为，标题栏不承担
+    // 「证据」职责（Windows 会把标题栏里的控制字符当空白渲染），两者要求不同、处理也不同。
+    eprintln!("[fnos] 主窗口标题: {}", report::log_safe(title));
     let _ = window.set_title(title);
 }
 
@@ -691,8 +724,11 @@ pub fn handle_title<R: Runtime>(window: &WebviewWindow<R>, title: &str) {
 ///
 /// 四道闸门全在 [`report::validate`] 里（字节上限 → 合法 JSON → 必须是对象 → `type` 白名单），
 /// 未通过就丢掉并留一行固定短语，**绝不 panic、绝不把页面可控正文写进日志或 UI**。
-/// 通过后连同**上报文档的 origin** 一起存进 `AppState`（内存）：origin 用于「换了页面就不认
-/// 旧上报」的诚实性判定（见 [`get_page_report`]）。
+/// 通过后连同**上报文档的 origin 与 URL** 一起存进 `AppState`（内存）：两者用于「换了页面/
+/// 换了文档就不认旧上报」的诚实性判定（见 [`get_page_report`] / [`report::ReportEntry`]）。
+///
+/// 唯一一处会打印页面可控字段的日志是 [`report::accepted_log_line`]：`type` 与 `dir` 都在
+/// 允许表里过一遍，白名单外一律渲染成固定串 `report::UNKNOWN`（Important 1 的日志注入修复）。
 fn on_page_report<R: Runtime>(window: &WebviewWindow<R>, payload: &str) {
     let value = match report::validate(payload) {
         Ok(v) => v,
@@ -714,34 +750,38 @@ fn on_page_report<R: Runtime>(window: &WebviewWindow<R>, payload: &str) {
             return;
         }
     };
-    // 类型只用于日志，且一定来自允许表（validate 已保证），不可能是页面随手写的长文本。
-    let ty = value.get("type").and_then(Value::as_str).unwrap_or("?");
-    let dir = value.get("dir").and_then(Value::as_str).unwrap_or("?");
-    let origin = window
-        .url()
-        .ok()
-        .and_then(|u| config::origin_of(u.as_str()));
-    // 日志先打（`origin` 随后就随 entry 一起进内存了：不 clone、不留第二份）
+    // 类型与方向只用于日志；两个都过允许表（`accepted_log_line` 内部再查一次，
+    // 白名单外 → 固定串），因此这个日志行**不可能**被页面写成两行（Important 1）。
+    let ty = value.get("type").and_then(Value::as_str).unwrap_or("");
+    let dir = value.get("dir").and_then(Value::as_str);
+    let url = window.url().ok();
+    let origin = url.as_ref().and_then(|u| config::origin_of(u.as_str()));
+    let url = url.map(|u| u.to_string());
+    // 日志先打（`origin` / `url` 随后就随 entry 一起进内存了：不 clone、不留第二份）
     eprintln!(
-        "[fnos] 页面上报已接受：type={ty} dir={dir} origin={} 字节={}",
-        origin.as_deref().unwrap_or("<未知>"),
-        payload.len()
+        "{}",
+        report::accepted_log_line(ty, dir, origin.as_deref(), payload.len())
     );
     let state = window.state::<AppState>();
-    *state.page_report.lock().unwrap() = Some(report::ReportEntry { value, origin });
+    *state.page_report.lock().unwrap() = Some(report::ReportEntry { value, origin, url });
 }
 
-/// 新文档与最近一次上报不同源 → 丢掉旧上报。
+/// 新文档与最近一次上报**不是同一个文档**（origin 或 URL 不同）→ 丢掉旧上报。
 ///
-/// 主窗口可以在不改任何配置的情况下换页面（页内链接、托盘「打开 NAS」、重定向）。旧页面上报的
-/// 「已注入」不能拿来描述新页面——`get_page_report` 也会再判一次，这里是「新文档到达时顺手清掉」，
-/// 免得一条过期证据一直躺在内存里。
-fn drop_report_if_origin_changed<R: Runtime>(app: &AppHandle<R>, url: &str) {
-    let current = config::origin_of(url);
+/// 主窗口可以在不改任何配置的情况下换页面（页内链接、托盘「打开 NAS」、重定向，甚至是同一
+/// 个白名单 origin 下的另一个文档）。旧页面上报的「已注入」不能拿来描述新页面——
+/// `get_page_report` 也会再判一次，这里是「新文档到达时顺手清掉」，免得一条过期证据一直
+/// 躺在内存里。
+///
+/// fix round 1 / Minor 3：判据从「只看 origin」收紧为「origin **与文档 URL** 都对得上」
+/// （[`report::ReportEntry::matches_document`]）。同源换文档时第二个文档完全可能没注入
+/// （缺 fnOS 签名），旧证据留在设置窗上就是拿上一张页面描述这一张。
+fn drop_report_if_document_changed<R: Runtime>(app: &AppHandle<R>, url: &str) {
+    let current_origin = config::origin_of(url);
     let state = app.state::<AppState>();
     let mut slot = state.page_report.lock().unwrap();
     let stale = match slot.as_ref() {
-        Some(entry) => !report::same_origin(entry.origin.as_deref(), current.as_deref()),
+        Some(entry) => !entry.matches_document(current_origin.as_deref(), Some(url)),
         None => false,
     };
     if stale {
@@ -754,21 +794,32 @@ fn drop_report_if_origin_changed<R: Runtime>(app: &AppHandle<R>, url: &str) {
 /// **只授予设置窗**（`capabilities/default.json`），与 `get_page_state` 同一档：主窗口
 /// （含内置错误页）拿不到任何命令授权，所以页面永远无法自己读取或改写这条证据。
 ///
-/// 只有「上报来源 origin == 主窗口当前 origin」时才返回内容：取不到当前 origin（窗口已销毁 /
-/// URL 解析不出来）一律 `None`，设置窗于是退回 Task 11 的弱文案——宁可不说，也不谎称已注入。
+/// 只有「上报来源 origin == 主窗口当前 origin」**且「上报时的文档 URL == 当前文档 URL」**时
+/// 才返回内容（[`report::ReportEntry::matches_document`]）：取不到当前 URL/origin（窗口已销毁
+/// / 导航还没完成）或文档已换，一律清掉并返回 `None`，设置窗于是退回 Task 11 的弱文案
+/// ——宁可不说，也不谎称已注入。
 #[tauri::command]
 pub fn get_page_report<R: Runtime>(app: AppHandle<R>) -> Option<Value> {
-    let current = app
+    let current_url = app
         .get_webview_window(MAIN_WINDOW)
-        .and_then(|w| w.url().ok())
+        .and_then(|w| w.url().ok());
+    let current_origin = current_url
+        .as_ref()
         .and_then(|u| config::origin_of(u.as_str()));
+    let current_url = current_url.map(|u| u.to_string());
     let state = app.state::<AppState>();
-    let slot = state.page_report.lock().unwrap();
-    let entry = slot.as_ref()?;
-    if !report::same_origin(entry.origin.as_deref(), current.as_deref()) {
+    let mut slot = state.page_report.lock().unwrap();
+    let stale = match slot.as_ref() {
+        Some(entry) => !entry.matches_document(current_origin.as_deref(), current_url.as_deref()),
+        None => false,
+    };
+    if stale {
+        // 「及时丢掉」的第二层：页内导航不走 `begin_load`，`on_page_event` 也可能因为
+        // 世代闸门而迟到，所以读取路径自己再判一次——判到就清，绝不把旧证据给设置窗。
+        *slot = None;
         return None;
     }
-    Some(entry.value.clone())
+    Some(slot.as_ref()?.value.clone())
 }
 
 /// 主窗口页面加载事件。
@@ -796,9 +847,10 @@ pub fn on_page_event<R: Runtime>(
     eprintln!("[fnos] 主窗口页面已加载: {url}");
     // Task 13a：页内导航（托盘「打开 NAS」的 `navigate`、页面里的链接、重定向）**不走**
     // `begin_load`，所以上面那段带世代闸门的代码会直接 return——清理必须放在闸门**之前**，
-    // 否则新文档与旧上报不同源时那条证据会一直留着。`get_page_report` 读取时还会再判一次
-    // （那时的 URL 已经是新文档），两层都必要：这里负责「及时丢掉」，那里负责「绝不误报」。
-    drop_report_if_origin_changed(app, url);
+    // 否则新文档与旧上报不同文档（换 origin，或同一个 origin 下的另一篇文档）时那条证据会
+    // 一直留着。`get_page_report` 读取时还会再判一次（那时的 URL 已经是新文档），两层都必要：
+    // 这里负责「及时丢掉」，那里负责「绝不误报」。
+    drop_report_if_document_changed(app, url);
     {
         let state = app.state::<AppState>();
         let mut load = state.load.lock().unwrap();
@@ -1578,6 +1630,52 @@ mod tests {
         assert!(!bare.trim().is_empty());
     }
 
+    /// 探针 `detail` **页面可控**，必须整形后才能进日志 / 状态条 / 错误页
+    /// （fix round 1 / Important 1 的同类审计：同一条 `document.title` 通道）。
+    #[test]
+    fn probe_detail_cannot_forge_a_log_line() {
+        // 攻击形状：JSON `\n` 被 serde 解码成真换行 + 一整行伪造的 `[fnos] …`
+        let forged = r#"{"err":true,"detail":"x\n[fnos] 页面上报已接受：type=FNOS_CHECK dir=out origin=http://evil.example 字节=1"}"#;
+        let reason = probe_verdict(forged).expect("err:true 必须给出原因");
+        assert_eq!(reason.lines().count(), 1, "失败原因必须只有一行：{reason}");
+        assert!(
+            !reason.chars().any(|c| c.is_control()),
+            "日志/UI 里不得出现任何控制字符：{reason}"
+        );
+        assert!(
+            reason.contains("[fnos] 页面上报已接受"),
+            "正文要保留（排障要看得到页面写了什么）：{reason}"
+        );
+        assert!(
+            reason.contains("x [fnos]"),
+            "换行折成一个空格，而不是把两行粘在一起：{reason}"
+        );
+        // 行分隔符 / NEL / 制表符同样是折成一个空格
+        let seps = probe_verdict(r#"{"err":true,"detail":"a\u2028b\u0085c\td"}"#).unwrap();
+        assert_eq!(seps, "WebView2 报告：a b c d");
+        assert_eq!(seps.lines().count(), 1);
+        // 只有空白 / 控制字符 → 回到固定短语（不是空串）
+        assert_eq!(
+            probe_verdict(r#"{"err":true,"detail":" \n\t "}"#).unwrap(),
+            "WebView2 报告该地址无法访问（网络错误）"
+        );
+        // 超长 detail 按码点截断（页面可以把它写到标题通道的上限）
+        let long = format!(r#"{{"err":true,"detail":"{}"}}"#, "y".repeat(4000));
+        let clipped = probe_verdict(&long).unwrap();
+        assert!(
+            clipped.chars().count() <= PROBE_DETAIL_MAX_CHARS + "WebView2 报告：".chars().count(),
+            "截断后长度受限：{}",
+            clipped.chars().count()
+        );
+        // 星平面字符不被截成半个（按码点而不是按字节）
+        let astral = format!(r#"{{"err":true,"detail":"{}"}}"#, "😀".repeat(200));
+        let cut = probe_verdict(&astral).unwrap();
+        assert_eq!(
+            cut,
+            format!("WebView2 报告：{}", "😀".repeat(PROBE_DETAIL_MAX_CHARS))
+        );
+    }
+
     /// 宿主解析探针用的前缀必须与注入脚本里那个字面量**同源**，否则失败会被静默吞掉。
     #[test]
     fn probe_prefix_and_script_agree() {
@@ -1634,6 +1732,60 @@ mod tests {
             assert!(
                 upstream.contains(&format!("'{ty}'")),
                 "允许表里的 {ty} 必须在 vendored 的 content-script.js 里真实存在"
+            );
+        }
+    }
+
+    /// R30 的 **JS 镜像**必须与 Rust 规则同步（fix round 1 / Important 2）。
+    ///
+    /// 同一条 `prefect_icon/*.png` 规则在**两个**实现里生效——设置窗提交前
+    /// （`ui/settings/normalize.js::isPrefectIconPath` ← `app.js::commit` ← `MODS_KEYS`）与
+    /// Rust 归一化时（`config.rs::Config::normalize` 的 `retain`）。任何一个落后于另一个都是
+    /// **静默丢配置**：fix round 1 之前 JS 用的是全小写正则，于是 `prefect_icon/Emby.png`
+    /// （磁盘上真实存在的 `panIndex.png` 这类名字）在设置窗里就被丢掉，Rust 的放宽规则永远
+    /// 见不到它。
+    ///
+    /// 用与 `report_prefix_and_shim_agree` 同一手法做两件事：
+    /// ① 逐字锁住 JS 的正则文本（**必须带 `i`**——那正是 R30 要修的那一处）；
+    /// ② 读 `tests/normalize.test.mjs` 的**输入表**，逐行断言 20 条与
+    ///    `config.rs::tests::redraw_map_regex_is_case_insensitive_only` 同形、同序、同期望
+    ///    （`config.rs` 不在本轮改动范围内，所以「两侧同步」的机械锁落在这里）。
+    #[test]
+    fn prefect_icon_rule_mirror_stays_in_step() {
+        let js = include_str!("../../ui/settings/normalize.js");
+        assert!(
+            js.contains("PREFECT_ICON_PATH = /^prefect_icon\\/[a-z0-9-]+\\.png$/i;"),
+            "JS 镜像的正则必须与 Rust 规则同形且带 `i`（大小写不敏感，R30）"
+        );
+        let table = include_str!("../../tests/normalize.test.mjs");
+        // 与 config.rs 那份用例**逐行相同**的输入表（顺序也相同）。
+        let rows: [(&str, bool); 20] = [
+            ("prefect_icon/emby.png", true),
+            ("prefect_icon/home-assistant.png", true),
+            ("prefect_icon/a1-b2.png", true),
+            ("prefect_icon/Emby.png", true),
+            ("prefect_icon/emby.PNG", true),
+            ("PREFECT_ICON/emby.PnG", true),
+            ("Prefect_Icon/Home-Assistant.PNG", true),
+            ("../x", false),
+            ("prefect_icon/a.png.png", false),
+            ("prefect_icon/", false),
+            ("prefect_icon/sub/dir.png", false),
+            ("other/emby.png", false),
+            ("prefect_icon\\\\emby.png", false),
+            ("prefect_icon/em by.png", false),
+            ("prefect_icon/.png", false),
+            ("prefect_icon/emby.png ", false),
+            (" prefect_icon/emby.png", false),
+            ("prefect_icon/图标.png", false),
+            ("图标", false),
+            ("prefect_icon/图的.png", false),
+        ];
+        for (v, want) in rows {
+            let needle = format!("row('{v}', {want},");
+            assert!(
+                table.contains(&needle),
+                "tests/normalize.test.mjs 的输入表缺少/改动了这一行（两侧必须同步）：{needle}"
             );
         }
     }
