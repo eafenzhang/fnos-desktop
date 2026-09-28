@@ -120,7 +120,7 @@ config (纯数据) ──► injector (纯函数) ──► main/tray/commands (
 ### 5.1 上游机制的确切事实（已核实，非推测）
 
 - 上游 `content-script.js`（3337 行）在 `document_start` 运行，先等 `storage` 与签名判定，再注入。
-- **7 个 CSS 文件走外链**：`<link id="fnos-ui-mods-*-style" rel=stylesheet href=chrome.runtime.getURL('xxx.css')>`（`cs:2612-2635`、`2449-2455`、`2396-2409`）。勘误（2026-09-28，由 T4 实测）：正文原写「6 个」漏计 `lockscreen_mod.css`，权威集合是 basic / windows_titlebar / mac_titlebar / classic_launchpad / spotlight_launchpad / desktop_icon / lockscreen 共 7 个（`cs:2402` 锁定）。
+- **7 个 CSS 文件在注入载荷里，上游按配置只外链其中的子集**：`<link id="fnos-ui-mods-*-style" rel=stylesheet href=chrome.runtime.getURL('xxx.css')>`（`cs:2612-2635`、`2449-2455`、`2396-2409`）。勘误（2026-09-28，T10 实测）：默认配置下同一页面只出现 **4 个 link**（basic + titlebar + launchpad + desktop_icon），`lockscreen_mod.css` 仅在登录页由上游动态增删；原写「7 个文件走外链」把「载荷里的文件数」与「页面上的 link 数」混为一谈。权威文件集合是 basic / windows_titlebar / mac_titlebar / classic_launchpad / spotlight_launchpad / desktop_icon / lockscreen 共 7 个（`cs:2402` 锁定）。
 - **`mod.js` 走外链** `<script src=getURL('mod.js')>`（`cs:2666-2676`）；`mod.js` **零 `chrome.*`**、**不读配置**（自足脚本）。
 - **参数化内容才内联**：主题色 10 阶调色板、字体 `@font-face`、自定义 CSS/JS、桌面图标网格变量。
 - `safeRuntimeGetURL` 在 `chrome?.runtime?.id` 缺失时返回 `''`，而 `injectStyle` 里 `if (!nextHref) return;` → **缺 shim 就完全注入失败**（`cs:242-252`、`2621-2622`）。
@@ -186,6 +186,7 @@ Tauri initialization_script（每次顶层文档导航、HTML 解析前）
 ### 5.6 载荷体积（M1 需实测）
 
 约 400 KB/次导航（`content-script.js` 113KB + 7 CSS 约 218KB + `mod.js` 63KB + 配置；勘误：原写「6 CSS」，权威数量见 §5.1）。探针实测 195KB CSS 在 `initAt≈200ms` 完成注入，属可接受范围；M1 记录真实首个内容渲染时间，若退化明显再改为「按需注入 CSS」。
+**实测校准（2026-09-28，T10）**：真实载荷 **≈423 KB（≈413 KiB）**（7 CSS 225,656 B + `mod.js` 62,913 + `icon-map.json` 750 + JSON 配置块 295,226 → 文本资源合计 289,319 B；再加上 shim 6,244 + bootstrap 7,684 + `content-script.js` 112,921），比本节估算的 ~400KB 高约 5%；在本地页上测得**注入在 ≤180 ms 内完成**（`ms_first` 上界、DCL 199 ms、load 209 ms）。裁定：**暂不做按需注入**，若真实 WebUI 上出现可感延迟再启用「按需 CSS」方案。
 
 ---
 
@@ -417,7 +418,7 @@ Tauri initialization_script（每次顶层文档导航、HTML 解析前）
 ### 12.2 端到端验收清单（M1–M3 完成时逐条执行，需 D7 的 FN ID `ea121314`）
 
 1. 启动 → 主窗口打开 `https://fnos.net/`，**页面无任何 mods 注入痕迹**（官网被正确跳过）
-2. 托盘右键菜单四项存在，勾选项渲染为 ✓
+2. 托盘右键菜单 **5 个可点击项 + 1 条分隔线** 存在，勾选项渲染为 ✓（勘误 2026-09-28：原文误写「四项」，见 §7 的菜单块）
 3. 设置窗填 NAS WebUI 地址（或走 FN ID 登录后取当前页）→ 保存后 `enabledOrigins` 含该 origin
 4. 在 NAS WebUI 页面：`basic_mod.css` 生效（外观变化）、`mod.js` 行为生效（窗口动画/squircle）
 5. 切换 `titlebarStyle` / `launchpadStyle` / 主题色 → **不刷新页面即时生效**
