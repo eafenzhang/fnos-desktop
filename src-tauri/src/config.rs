@@ -537,8 +537,8 @@ impl Config {
         }
     }
 
-    /// 配置文件绝对路径。消费方在 Task 7/8 接线前暂未使用。
-    #[allow(dead_code)]
+    /// 配置文件绝对路径（`paths::config_dir()/config.json`）。Task 7/8 接线后由
+    /// `commands.rs` 的读写路径统一消费——顺带让 `#[allow(dead_code)]` 可以摘掉（R18）。
     pub fn config_path() -> PathBuf {
         crate::paths::config_dir().join("config.json")
     }

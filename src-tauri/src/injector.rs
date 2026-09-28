@@ -7,6 +7,9 @@ use serde_json::json;
 
 pub const SHELL_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const MODS_COMMIT: &str = "483c3e2e217faebc1be45b4e824865854a61e3dd";
+/// 上游 fnOS_UI_Mods 的版本号（R38）：`injector` 的载荷与 `commands::ConfigView.meta`
+/// 共用同一个常量，避免字面量在两处漂移。
+pub const MODS_VERSION: &str = "1.0.2";
 
 const SHIM_JS: &str = include_str!("../inject/shim.js");
 const BOOTSTRAP_JS: &str = include_str!("../inject/bootstrap.js");
@@ -83,7 +86,7 @@ pub fn build_init_script(cfg: &Config) -> String {
         "meta": Meta {
             shell_version: SHELL_VERSION,
             mods_commit: MODS_COMMIT,
-            mods_version: "1.0.2",
+            mods_version: MODS_VERSION,
         },
         "mods": &cfg.mods,
         "local": &cfg.local,
@@ -212,6 +215,10 @@ mod tests {
             "bootstrap.js 读 meta.shellVersion"
         );
         assert!(s.contains("\"modsVersion\""), "shim.js 读 meta.modsVersion");
+        assert!(
+            s.contains(&format!("\"modsVersion\":\"{MODS_VERSION}\"")),
+            "载荷的 modsVersion 必须来自 MODS_VERSION 常量（R38：字面量不得重复）"
+        );
         assert!(s.contains("\"modsCommit\""));
         assert!(
             !s.contains("\"shell_version\""),
