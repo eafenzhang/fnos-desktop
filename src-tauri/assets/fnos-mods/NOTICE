@@ -1,0 +1,70 @@
+fnOS Desktop Shell — vendored third-party resources
+
+Upstream: https://github.com/aurysian-yan/fnOS_UI_Mods
+Pinned commit: 483c3e2e217faebc1be45b4e824865854a61e3dd
+License: FnOS UI Mods Non-Commercial License 1.0 (see LICENSE, copied verbatim below)
+
+Packaging changes made by this project (upstream files themselves are UNMODIFIED):
+  1. chrome.* compatibility shim injected ahead of content-script.js (inject/shim.js)
+  2. chrome.runtime.getURL() reimplemented to return data: URLs instead of chrome-extension:// URLs
+  3. mod.js delivered through the shim-provided data: URL, with a MutationObserver fallback that
+     executes the unmodified original if the data: script is blocked by page CSP
+  4. configuration is supplied by the host application instead of chrome.storage
+
+File SHA-256:
+  0b2783e045934f8b71bb2419ad45c04afb610c7f291cc1e5086df346029b867f       1390  LICENSE
+  776a453a2bbe75be26eb7a03952fe3750280ee1bc3225c468efae723b7b311ad     112921  content-script.js
+  cd88ff5c5413b49698cbb4fc524250a59c3a48dbe93cc6d13f558999f2e213a3      62913  mod.js
+  cedf9f007a64f10ea9160772af376f545d7dd7a752b3c68f224169386ed2be73     195500  basic_mod.css
+  72e0aac727d329022b72f684e4f3c2cc3eaf775ab9d171912b2b541ac32b164f       2422  windows_titlebar_mod.css
+  53a7b2f2ea34e2800683995373a3db7426021d81ee252aeb9536f26e75a1eb80       6111  mac_titlebar_mod.css
+  fa0284dd25bf58951a686082ccc01f5dc4666ed1facbc6d18aefe155ffd1a51b       1556  classic_launchpad_mod.css
+  e780f1a3ff1e919c2ca2dd6f2dc5582dcf168915d0d80f1576dddb825967b845       2746  spotlight_launchpad_mod.css
+  d60a498f3c2c291c388c0b251326df00165d0fa40d3a4b49d69c204fb5c454c1       5108  desktop_icon_mod.css
+  51d8e233684c44af2b8f73de011248e440ee27b5c9df34e0f5eb67799eecbb57      12213  lockscreen_mod.css
+  3aec53babc7ffc524f1cd604c71ba71f4a0a08cf07883b83432f1d302e49e003        750  prefect_icon/icon-map.json
+  848a1dae653f7a947f40f2b1b9dc2da5a53027963d659a11e7d224196b77d077      66978  prefect_icon/alist.png
+  8b09b764127f722724dba1511b321d11d18e3fc30144f810a61ca66b73fc114e      68339  prefect_icon/emby.png
+  115e36b11df7be6dcb34a31cd8581d9f43bda2384d30cc68dc0d5d368e0d4609      60649  prefect_icon/home-assistant.png
+  e5cf37c9720a98e0b2f643b1edc89a819a9509f855a2b61bb40c5f7b16a7a840      24667  prefect_icon/icloud.png
+  6087fe776df40772f254b9bee512bb7cba34ce1b66db5f0927e0664b226103d5      65847  prefect_icon/it-tools.png
+  182d5f4c4ffe6e2f86ab87a9dfa81965f75bdacf3f26659fa91b2cc2fae28c16      64478  prefect_icon/kodi.png
+  91f60ac9058b84f1183ceed7b54df21901ca630b48a23c3ad7b0e5ca279fb0d0      58834  prefect_icon/one-panel.png
+  d4320311038a4cce36bb301a8e1ea85f2d5f7a2b68571c4f84d487953fade32e      60108  prefect_icon/oray-hsk.png
+  a80bb8c6b71858af0901de5d4dfa8456afba52ca5d6c619b0c003e760f1ef801      59071  prefect_icon/panIndex.png
+  f38897b6b2e75357cc7ff6881d512e419dac8976d6edc6ee654fd7fb8c028045      50608  prefect_icon/qbittorrent.png
+  fc277fdc759048daa5f71572799f5376a187dbcdc932f624467941c0f8bff2cf      61604  prefect_icon/quarkpan.png
+  f02ec77b05a8a087faa72a599b8e497e94be1a2b9a6def5bea63add7c49ad782      71082  prefect_icon/syncthing.png
+  bbb1d54f17125e9d59ce7747e7807536f1b3582084c5ef52337d757d40eebc6f      34039  prefect_icon/transmission.png
+  cb91434b3e81d8af9ebbf21ef19c018b49350892ddf2224cf85b9061aaabb5d8      55050  prefect_icon/xunlei.png
+
+LICENSE (verbatim):
+FnOS UI Mods Non-Commercial License 1.0
+
+Copyright (c) 2026 FnOS UI Mods contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to use,
+copy, modify, and distribute the Software for non-commercial purposes only,
+subject to the following conditions:
+
+1. Commercial use is strictly prohibited.
+   "Commercial use" includes, but is not limited to:
+   - selling the Software;
+   - bundling the Software in paid products or services;
+   - providing paid hosting, integration, customization, consulting, or
+     support based primarily on the Software;
+   - any use intended for commercial advantage or monetary compensation.
+
+2. Redistributions of the Software, with or without modification, must retain
+   this copyright notice and this license text.
+
+3. Any modified version must clearly document that changes were made.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT, OR OTHERWISE, ARISING FROM,
+OUT OF, OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
