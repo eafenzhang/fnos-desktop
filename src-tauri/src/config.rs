@@ -80,6 +80,17 @@ pub struct LocalConfig {
     pub login_wallpaper_file_name: Option<String>,
 }
 
+/// 主窗口尺寸的合法区间（Item 2）。
+///
+/// 归一化是窗口几何的**唯一校验入口**（`WindowGeom::clamp_to_usable`，由 `Config::normalize`
+/// 调用）：`0x0` / 负数 / 超大值都不允许渗给消费方。round 1 只在 `tray::apply_window_geom`
+/// 加了消费侧防御，而 `commands::build_main_window` 的 `.inner_size(w, h)` 是**更早**的第一次
+/// 消费，于是配置里历史遗留的 `0x0` 仍然会建出一张 0 尺寸的窗口。
+pub const MIN_WINDOW_W: f64 = 480.0;
+pub const MIN_WINDOW_H: f64 = 360.0;
+pub const MAX_WINDOW_W: f64 = 16384.0;
+pub const MAX_WINDOW_H: f64 = 16384.0;
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct WindowGeom {
@@ -97,6 +108,29 @@ impl Default for WindowGeom {
             x: None,
             y: None,
         }
+    }
+}
+
+/// 单维夹取：非有限（`NaN` / `inf`）或 `<= 0` → 默认值；否则夹到 `[min, max]`。
+///
+/// `<= 0` 一律当「没有值」而不是「夹到下限」：`0x0` 是历史缺陷写坏配置的指纹
+///（最小化窗口的 `inner_size` 就是 0），负数更是纯粹的坏值，两者都该回到默认几何。
+fn usable_window_dim(value: f64, default: f64, min: f64, max: f64) -> f64 {
+    if !value.is_finite() || value <= 0.0 {
+        default
+    } else {
+        value.clamp(min, max)
+    }
+}
+
+impl WindowGeom {
+    /// 把 `w` / `h` 夹成**任何消费方都能直接用**的几何（`0x0` / 负数 → 默认 1200×820，
+    /// 越界 → `[MIN_WINDOW_*, MAX_WINDOW_*]`）；`x` / `y` 不在这里处理——它们的防御在
+    /// `tray::apply_window_geom`（`-32000` 是 Windows 给最小化窗口的坐标哨兵值）。
+    pub fn clamp_to_usable(&mut self) {
+        let default = WindowGeom::default();
+        self.w = usable_window_dim(self.w, default.w, MIN_WINDOW_W, MAX_WINDOW_W);
+        self.h = usable_window_dim(self.h, default.h, MIN_WINDOW_H, MAX_WINDOW_H);
     }
 }
 
@@ -565,6 +599,11 @@ impl Config {
             Some(_) => self.shell.home_url = self.shell.home_url.trim().to_string(),
             None => self.shell.home_url = DEFAULT_HOME_URL.into(),
         }
+        // Item 2：窗口几何在这里夹取（`load` 与 `save` 都必经 `normalize`，
+        // `set_config` / `reset_config` / `set_inject_enabled` 也各自显式调用），因此
+        // `commands::build_main_window` 的 `inner_size(cfg.shell.window.w, h)` 拿到的
+        // 一定是可用几何——历史遗留的 `0x0` 不会再建出 0 尺寸窗口。
+        self.shell.window.clamp_to_usable();
         // 保存 NAS WebUI 地址时自动把其 origin 并入注入白名单（跳过 1.5s 探测），幂等。
         // `nas_target()` 先做完整校验：非法的 `nasUrl`（如 `javascript:…`）不得混进白名单，
         // 否则会往非飞牛页面注入。
@@ -978,6 +1017,80 @@ mod tests {
         );
         assert!(c.shell.nas_url_parsed().is_some());
         assert_eq!(c.mods.enabled_origins, vec!["http://192.168.1.10:5666"]);
+    }
+
+    /// Item 2：窗口几何的夹取规则本身（`normalize` 是唯一入口）。
+    /// `0x0` / 负数 → 默认几何；越界 → 上下限；合法值（含边界值）原样通过。
+    #[test]
+    fn window_geometry_is_clamped_to_usable_range() {
+        for (w, h, want_w, want_h) in [
+            (0.0, 0.0, 1200.0, 820.0),              // 历史坏配置的指纹 → 默认几何
+            (-1.0, -9999.0, 1200.0, 820.0),         // 负数 → 默认几何
+            (1.0, 1.0, MIN_WINDOW_W, MIN_WINDOW_H), // 过小的正数 → 下限（不是默认值）
+            (100000.0, 100000.0, MAX_WINDOW_W, MAX_WINDOW_H), // 荒谬的大值 → 上限
+            (1200.0, 820.0, 1200.0, 820.0),         // 合法值原样通过
+            (480.0, 360.0, 480.0, 360.0),           // 正好在下限上 → 原样通过
+            (16384.0, 16384.0, MAX_WINDOW_W, MAX_WINDOW_H), // 正好在上限上 → 原样通过
+        ] {
+            let mut c = Config::default();
+            c.shell.window.w = w;
+            c.shell.window.h = h;
+            c.normalize();
+            assert_eq!(c.shell.window.w, want_w, "w={w}, h={h}");
+            assert_eq!(c.shell.window.h, want_h, "w={w}, h={h}");
+        }
+
+        // 两维独立判定：只有 h 坏时不该牵连合法的 w
+        let mut c = Config::default();
+        c.shell.window.w = 1300.0;
+        c.shell.window.h = 0.0;
+        c.normalize();
+        assert_eq!(c.shell.window.w, 1300.0);
+        assert_eq!(c.shell.window.h, 820.0);
+    }
+
+    /// Item 2：`Config::load`（sanitize → `from_value` → `normalize`）与 `Config::save`
+    /// 两条链路都必须产出可用几何——`commands::build_main_window` 的 `inner_size` 消费的
+    /// 正是这份值，`save_window_geom` 则是把运行期尺寸写回 state / 磁盘的那条路径。
+    #[test]
+    fn window_geometry_from_file_is_clamped() {
+        let dir = temp_dir("geom");
+        let p = dir.join("config.json");
+
+        // 手改出来的 0x0（round 1 报告里的实测残留值）
+        std::fs::write(
+            &p,
+            br#"{"shell":{"window":{"w":0,"h":0,"x":null,"y":null}}}"#,
+        )
+        .unwrap();
+        let c = Config::load(&p);
+        assert_eq!((c.shell.window.w, c.shell.window.h), (1200.0, 820.0));
+        // 同文件里的其它键不受牵连
+        assert_eq!(c.shell.home_url, DEFAULT_HOME_URL);
+
+        // 负数 → 默认；超大 → 上限；x/y 语法未变（仍可为 null）
+        std::fs::write(
+            &p,
+            br#"{"shell":{"window":{"w":-5,"h":100000,"x":1,"y":2}}}"#,
+        )
+        .unwrap();
+        let c = Config::load(&p);
+        assert_eq!(c.shell.window.w, 1200.0);
+        assert_eq!(c.shell.window.h, MAX_WINDOW_H);
+        assert_eq!((c.shell.window.x, c.shell.window.y), (Some(1.0), Some(2.0)));
+
+        // 落盘是最后一道防线：内存里被塞了 0 尺寸也不能写进磁盘
+        let mut mem = Config::default();
+        mem.shell.window.w = 0.0;
+        mem.shell.window.h = 0.0;
+        mem.save(&p).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        assert_eq!(v["shell"]["window"]["w"], 1200.0);
+        assert_eq!(v["shell"]["window"]["h"], 820.0);
+        assert_eq!(Config::load(&p).shell.window.h, 820.0);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// `commands::resolve_main_url` 的兜底分支断言 `DEFAULT_HOME_URL` 一定可解析

@@ -20,8 +20,53 @@ pub struct AppState {
     pub recreating: AtomicBool,
     /// `reload_main(url)` 的一次性覆盖地址，重建时消费掉。
     pub recreate_url: Mutex<Option<String>>,
-    /// 重建前主窗口是否可见；重建后原样恢复（设置窗改注入开关时，主窗口不该突然弹出/消失）。
-    pub recreate_visible: AtomicBool,
+    /// 重建前主窗口的显示态，重建后原样恢复（Item 3）。整组一次性读取，
+    /// 避免三个独立原子量在中途被改得不一致。
+    pub recreate_display: Mutex<DisplayState>,
+}
+
+/// 重建时必须原样保留的窗口显示态（Item 3）。
+///
+/// 只看 `is_visible()` 是不够的：**最小化的窗口 `is_visible()` 仍是 true**，
+/// 于是「最小化时切换注入开关」会把窗口弹到前台；最大化态则必须显式记下来，
+/// 否则重建回来的是一张普通窗口。这里刻意只是一个三字段的值 + 两个动作，
+/// 不引入状态机。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DisplayState {
+    pub visible: bool,
+    pub minimized: bool,
+    pub maximized: bool,
+}
+
+impl Default for DisplayState {
+    fn default() -> Self {
+        Self {
+            visible: true,
+            minimized: false,
+            maximized: false,
+        }
+    }
+}
+
+impl DisplayState {
+    /// 建窗时是否直接可见：隐藏态与最小化态都先隐藏建窗，否则新窗口会在
+    /// `minimize()` / `hide()` 生效之前先闪一下前台。
+    fn start_visible(self) -> bool {
+        self.visible && !self.minimized
+    }
+
+    /// 把旧窗口的显示态原样套到新窗口上。顺序即优先级：
+    /// 最小化（不 `show()` / 不 `set_focus()`，否则会把用户主动最小化的窗口提到前台）
+    /// → 隐藏（保持隐藏）→ 最大化（还原最大化）→ 普通可见窗口（建窗时已可见，无需动作）。
+    fn apply_to<R: Runtime>(self, window: &WebviewWindow<R>) {
+        if self.minimized {
+            let _ = window.minimize();
+        } else if !self.visible {
+            let _ = window.hide();
+        } else if self.maximized {
+            let _ = window.maximize();
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -181,8 +226,24 @@ pub fn build_main_window<R: Runtime>(
     url: tauri::Url,
     cfg: &Config,
 ) -> tauri::Result<WebviewWindow<R>> {
+    // 首启路径：建窗即可见（`start_visible = true`）。
+    build_main_window_with(app, url, cfg, true)
+}
+
+/// `build_main_window` 的实体；`start_visible = false` 供重建路径使用——旧的隐藏 / 最小化
+/// 窗口不该让新窗口先可见地闪一下（Item 3）。
+fn build_main_window_with<R: Runtime>(
+    app: &AppHandle<R>,
+    url: tauri::Url,
+    cfg: &Config,
+    start_visible: bool,
+) -> tauri::Result<WebviewWindow<R>> {
     let mut builder = WebviewWindowBuilder::new(app, MAIN_WINDOW, WebviewUrl::External(url))
         .title("fnOS")
+        // 不变式（Item 2）：`cfg.shell.window` 已经由 `Config::normalize`
+        //（`WindowGeom::clamp_to_usable`）夹成可用几何，而所有进入 `AppState` 的 `Config`
+        // 都经过它（`load` / `set_config` / `reset_config` / `set_inject_enabled` /
+        // `save_window_geom`），所以这里不会再拿到 `0x0` 或负数。
         .inner_size(cfg.shell.window.w, cfg.shell.window.h)
         // spec §7「主窗口：标题跟随页面」。tauri/wry **不会**自动把 `document.title`
         // 同步到窗口标题：wry 只在 `WebviewBuilder::with_document_title_changed_handler`
@@ -200,6 +261,9 @@ pub fn build_main_window<R: Runtime>(
     let script = injector::build_init_script(cfg);
     if !script.is_empty() {
         builder = builder.initialization_script(script);
+    }
+    if !start_visible {
+        builder = builder.visible(false);
     }
 
     let window = builder.build()?;
@@ -224,24 +288,25 @@ pub fn resolve_main_url(cfg: &Config, url_override: Option<&str>) -> tauri::Url 
     }
 }
 
-/// 真正建新主窗口：消费一次性 URL 覆盖与可见性，建完后同步托盘菜单并**无论成败**清
+/// 真正建新主窗口：消费一次性 URL 覆盖与显示态，建完后同步托盘菜单并**无论成败**清
 /// `recreating`（否则一次失败会让下次关窗绕过 `closeToTray`）。
 fn rebuild_main<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     let state = app.state::<AppState>();
     let cfg = current(app);
     let override_url = state.recreate_url.lock().unwrap().take();
     let url = resolve_main_url(&cfg, override_url.as_deref());
-    let visible = state.recreate_visible.load(Ordering::SeqCst);
+    let display = *state.recreate_display.lock().unwrap();
 
-    let built = build_main_window(app, url, &cfg).map_err(|e| e.to_string());
+    let built =
+        build_main_window_with(app, url, &cfg, display.start_visible()).map_err(|e| e.to_string());
     state.recreating.store(false, Ordering::SeqCst);
     if let Err(e) = tray::sync_menus(app, &cfg) {
         eprintln!("[fnos] 托盘同步失败: {e}");
     }
     let window = built?;
-    if !visible {
-        let _ = window.hide();
-    }
+    // Item 3：隐藏态保持隐藏、最小化态保持最小化（不抢前台）、最大化态还原最大化。
+    // 三者都不做 `set_focus()`——重建是配置变更的副作用，不该替用户切换前台窗口。
+    display.apply_to(&window);
     Ok(())
 }
 
@@ -252,8 +317,9 @@ fn rebuild_main<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
 /// 替换；`__FNOS_APPLY_CONFIG__` 只能推 `mods` / `local`。round 0 的
 /// `location.reload()` 因此永远关不掉注入。
 ///
-/// 时序：置 `recreating` → 记下可见性 + 存几何 → `close()` 旧窗口 → 关闭请求这次不再被拦
-/// → `Destroyed` 回调（`on_main_destroyed`）里建同 label 新窗口 → 清标志 → `sync_menus`。
+/// 时序：置 `recreating` → 记下显示态（可见 / 最小化 / 最大化）+ 存几何 → `close()` 旧窗口
+/// → 关闭请求这次不再被拦 → `Destroyed` 回调（`on_main_destroyed`）里建同 label 新窗口
+/// → 套回显示态 → 清标志 → `sync_menus`。
 /// **不能**在 `close()` 之后立刻建：label 注册表在 `Destroyed` 才释放，否则
 /// `WindowLabelAlreadyExists`。
 pub fn recreate_main_window<R: Runtime>(
@@ -273,14 +339,18 @@ pub fn recreate_main_window<R: Runtime>(
     }
 
     let Some(win) = app.get_webview_window(MAIN_WINDOW) else {
-        // 没有主窗口（closeToTray=false 关掉之后、或上一轮重建失败）：直接建一个
-        state.recreate_visible.store(true, Ordering::SeqCst);
+        // 没有主窗口（closeToTray=false 关掉之后、或上一轮重建失败）：直接建一个可见窗口
+        *state.recreate_display.lock().unwrap() = DisplayState::default();
         return rebuild_main(app);
     };
 
-    state
-        .recreate_visible
-        .store(win.is_visible().unwrap_or(true), Ordering::SeqCst);
+    // Item 3：显示态必须在关窗**之前**一次性捕获。`is_minimized()` 要单独看——
+    // 最小化窗口的 `is_visible()` 仍是 true；`is_maximized()` 不看则重建后丢最大化态。
+    *state.recreate_display.lock().unwrap() = DisplayState {
+        visible: win.is_visible().unwrap_or(true),
+        minimized: win.is_minimized().unwrap_or(false),
+        maximized: win.is_maximized().unwrap_or(false),
+    };
     save_window_geom(app); // 重建后按老几何摆回原位
 
     if let Err(e) = win.close() {
@@ -440,7 +510,7 @@ pub fn save_and_install_state<R: Runtime>(app: &AppHandle<R>, cfg: &Config) {
         config: Mutex::new(cfg.clone()),
         recreating: AtomicBool::new(false),
         recreate_url: Mutex::new(None),
-        recreate_visible: AtomicBool::new(true),
+        recreate_display: Mutex::new(DisplayState::default()),
     });
 }
 
@@ -470,6 +540,10 @@ pub fn save_window_geom<R: Runtime>(app: &AppHandle<R>) {
         cfg.shell.window.x = Some(pos.x as f64 / scale);
         cfg.shell.window.y = Some(pos.y as f64 / scale);
     }
+    // Item 2：这里直接复用归一化的夹取规则，保证**内存 state 与磁盘**一样永远是可用几何
+    //（`build_main_window` / `apply_window_geom` 消费的就是 state 里这份值）。
+    // 窗口被拖到小于下限时内存/磁盘记下限值，比将来拿一个不可用尺寸去建窗安全。
+    cfg.shell.window.clamp_to_usable();
     let _ = cfg.save(&Config::config_path());
     *app.state::<AppState>().config.lock().unwrap() = cfg;
 }

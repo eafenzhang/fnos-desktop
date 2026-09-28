@@ -106,8 +106,9 @@ pub fn toggle_main<R: Runtime>(app: &AppHandle<R>) {
 
 pub fn apply_window_geom<R: Runtime>(w: &WebviewWindow<R>, cfg: &Config) {
     let g = &cfg.shell.window;
-    // 防御：历史配置里可能已经留下 `w/h = 0`（最小化时保存几何的旧缺陷，已在
-    // `commands::save_window_geom` 修掉）。0 尺寸的 set_size 会让窗口不可见。
+    // 防御（消费侧）：权威夹取在 `config::WindowGeom::clamp_to_usable`（`Config::normalize`
+    // 必经，Item 2），所以正常路径下这里不会看到 `w/h = 0`；保留这道判断是为了让
+    //「0 尺寸的 set_size 会让窗口不可见」这条不可能再从任何来源发生。
     if g.w > 0.0 && g.h > 0.0 {
         let _ = w.set_size(tauri::LogicalSize::new(g.w, g.h));
     }

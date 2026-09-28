@@ -10,6 +10,10 @@ Packaging changes made by this project (upstream files themselves are UNMODIFIED
   3. mod.js delivered through the shim-provided data: URL, with a MutationObserver fallback that
      executes the unmodified original if the data: script is blocked by page CSP
   4. configuration is supplied by the host application instead of chrome.storage
+  5. content-script.js is not evaluated as a top-level document-start script: its unmodified
+     bytes are embedded in a generated wrapper (src-tauri/src/injector.rs) that runs them only
+     once document.documentElement exists (MutationObserver on document, DOMContentLoaded
+     fallback) and records a synchronous throw as window.__FNOS_UPSTREAM_ERROR__
 
 File SHA-256:
   0b2783e045934f8b71bb2419ad45c04afb610c7f291cc1e5086df346029b867f       1390  LICENSE

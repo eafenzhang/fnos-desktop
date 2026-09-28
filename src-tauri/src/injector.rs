@@ -83,8 +83,9 @@ fn assets() -> Assets {
 ///
 /// 壳的语义：
 /// - `documentElement` 已存在 → 立即执行（与旧行为一致）；
-/// - 否则用 `MutationObserver` 观察 **`document` 本身**，解析器创建 `<html>` 时立刻触发
-///   （微任务，仍早于页面自己的脚本）；
+/// - 否则用 `MutationObserver` 观察 **`document` 本身**，解析器创建 `<html>` 时触发；
+///   这里只要求「执行时 `documentElement` 存在」，**不**声称比页面自己的脚本更早 ——
+///   一次 mutation 回调是微任务，完全可能被解析器已经执行过的 `<head>` 脚本排在后面；
 /// - MutationObserver 不可用 / 已经过了 loading 阶段 → `DOMContentLoaded` 兜底；
 /// - 上游抛错时记一笔 `window.__FNOS_UPSTREAM_ERROR__` 便于现场排查。
 fn wrap_upstream(content: &str) -> String {

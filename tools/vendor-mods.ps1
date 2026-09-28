@@ -195,6 +195,10 @@ $lines.Add('  2. chrome.runtime.getURL() reimplemented to return data: URLs inst
 $lines.Add('  3. mod.js delivered through the shim-provided data: URL, with a MutationObserver fallback that')
 $lines.Add('     executes the unmodified original if the data: script is blocked by page CSP')
 $lines.Add('  4. configuration is supplied by the host application instead of chrome.storage')
+$lines.Add('  5. content-script.js is not evaluated as a top-level document-start script: its unmodified')
+$lines.Add('     bytes are embedded in a generated wrapper (src-tauri/src/injector.rs) that runs them only')
+$lines.Add('     once document.documentElement exists (MutationObserver on document, DOMContentLoaded')
+$lines.Add('     fallback) and records a synchronous throw as window.__FNOS_UPSTREAM_ERROR__')
 $lines.Add('')
 $lines.Add('File SHA-256:')
 
