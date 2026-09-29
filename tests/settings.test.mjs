@@ -1,22 +1,21 @@
-// 设置窗的**应用层**行为（Review round 1 的三条修复 + 打磨项 + T14b fix round 1）：
+// 设置窗的**应用层**行为（Review round 1 的三条修复 + 打磨项 + T14b/T14c 修复轮）：
 //
 // A. `adoptConfig` 不得把 IPC 已归一化的值再夹一次（§8.4 的正面落实）；T14b fix round 1
 //    起设置窗**没有任何 mods 归一化**——镜像函数已删除，本文件用源码级断言锁住
 //    「app.js 不得引用 normalize.js」
-// B. origin 添加只接受 http(s)，拒绝 `"null"` 系（scheme-less / mailto / data / javascript）
-// D. 关于页外链走 `open_url` 命令（命令名与参数形状与 Rust 侧一致）
+// D. 桥的命令名/参数形状与 Rust 侧一致（open_url / import_wallpaper / 本地存储三命令）
+// T14c. Dock 自动隐藏的开关入口在上游界面里（chrome-shim 注入），设置窗只保留上游界面
 //
 // 这些断言依赖「导入 app.js 不需要 DOM」：`boot()` 只在真实页面（有 `#upstreamHost`）里自动执行。
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readdirSync, readFileSync } from 'node:fs';
 import {
-  adoptConfig, appItemsAnswer, appItemsFromReport, applyPatchFromPopup, compliancePaths,
+  adoptConfig, appItemsAnswer, appItemsFromReport, applyPatchFromPopup,
   isTooLargeReport, pageCheckAnswer, reportSlots, state,
 } from '../ui/settings/app.js';
 import * as bridge from '../ui/settings/bridge.js';
-import { PREFECT_ICON_PATH, normalizeOrigin, parseHttpOrigin } from '../ui/settings/normalize.js';
-import { VENDOR_DIR } from '../ui/settings/app.js';
+import { PREFECT_ICON_PATH } from '../ui/settings/normalize.js';
 
 test('导入 app.js 不触发 boot（无 DOM 也能单测内部逻辑）', async () => {
   // `boot()` 只挂在「有 #upstreamHost 的真实页面」上（Task 14b 起判据是这个 id），
@@ -79,7 +78,7 @@ test('A: 设置窗不再有任何 mods 归一化（app.js 不得引用 normalize
   for (const dead of ['clampLightness', 'normalizeMods', 'normalizeModsEntry', 'isPrefectIconPath']) {
     assert.ok(!app.includes(dead), `app.js 不得出现镜像函数名 ${dead}`);
   }
-  // normalize.js 里被保留下来的只有两件事：跨语言镜像常量与 origin 整理（含解析）。
+  // normalize.js 里被保留下来的只剩一件事：跨语言镜像常量。
   // 按导出判（注释里提这些名字是允许的——文档要能说清删了什么），按字符串判会误伤。
   const normalize = readFileSync(new URL('../ui/settings/normalize.js', import.meta.url), 'utf8');
   for (const gone of ['normalizeMods', 'normalizeModsEntry', 'clampLightness', 'isPrefectIconPath']) {
@@ -87,72 +86,18 @@ test('A: 设置窗不再有任何 mods 归一化（app.js 不得引用 normalize
     assert.ok(!normalize.includes(`export const ${gone}`), `normalize.js 不得再导出 ${gone}（已按评审意见删除）`);
   }
   assert.ok(!normalize.includes('export const MODS_KEYS'), 'normalize.js 不得再导出 MODS_KEYS（已随镜像删除）');
+  // normalizeOrigin / parseHttpOrigin 也随状态条退役删除（白名单整理收口在 Rust config.rs）
+  for (const gone of ['normalizeOrigin', 'parseHttpOrigin']) {
+    assert.ok(!normalize.includes(`export function ${gone}`), `normalize.js 不得再导出 ${gone}（已随状态条退役）`);
+  }
   assert.deepEqual(
     (normalize.match(/^export (?:const|function) \w+/gm) || []).sort(),
-    ['export const PREFECT_ICON_PATH', 'export function normalizeOrigin', 'export function parseHttpOrigin'].sort(),
-    'normalize.js 的导出面只剩 PREFECT_ICON_PATH / normalizeOrigin / parseHttpOrigin'
+    ['export const PREFECT_ICON_PATH'],
+    'normalize.js 的导出面只剩 PREFECT_ICON_PATH（跨语言镜像常量）'
   );
 });
 
-// ---------- B：origin 校验 ----------
-
-test('B: 旧写法为什么拦不住 scheme-less 输入（缺陷机理）', () => {
-  // URL 的 scheme 允许含 `.`，于是 `nas.example.com:8000` 被当成 scheme，
-  // `8000` 成了 opaque path，`.origin` 返回**字符串 `"null"`**——truthy。
-  assert.equal(new URL('nas.example.com:8000').origin, 'null');
-  assert.equal(new URL('nas:8000').origin, 'null');
-  assert.equal(new URL('mailto:a@b.c').origin, 'null');
-  assert.equal(new URL('javascript:alert(1)').origin, 'null');
-  assert.equal(new URL('data:text/html,x').origin, 'null');
-  assert.ok('null'); // 真值 → 旧的 `if (!origin)` 分支永远不会走到
-});
-
-test('B: 只接受 http(s) 绝对地址，其余一律拒绝', () => {
-  const accepted = [
-    ['http://nas.local:5666', 'http://nas.local:5666'],
-    ['https://NAS.Example.com', 'https://nas.example.com'],
-    ['HTTP://NAS.LOCAL:8000', 'http://nas.local:8000'],
-    ['  https://nas.local  ', 'https://nas.local'],
-    ['http://192.168.1.10:8000/ui/index.html', 'http://192.168.1.10:8000'],
-    ['http://nas.local:80/', 'http://nas.local'], // 默认端口省略（= Rust origin_of）
-    ['https://nas.local:443/ui', 'https://nas.local']
-  ];
-  for (const [input, expect] of accepted) {
-    assert.equal(parseHttpOrigin(input), expect, `应接受并规范化：${input}`);
-  }
-
-  const rejected = [
-    'nas.example.com:8000', // 无 scheme（旧实现的 junk 来源）
-    'nas:8000',
-    'nas.example.com',
-    'localhost:8000',
-    'mailto:a@b.c',
-    'data:text/html,<script>alert(1)</script>',
-    'javascript:alert(1)',
-    'ftp://nas.local',
-    'file:///C:/Windows/System32/calc.exe',
-    'about:blank',
-    '//nas.local:8000',
-    'http://',
-    'https://',
-    '',
-    '   '
-  ];
-  for (const input of rejected) {
-    assert.equal(parseHttpOrigin(input), '', `应拒绝：${input}`);
-  }
-});
-
-test('B: 拒绝时不产生任何白名单条目（"null" 不再可能落盘）', () => {
-  // 旧行为的产物就是这个字符串；这里锁死它不可能再作为条目出现。
-  const origin = parseHttpOrigin('nas.example.com:8000');
-  assert.equal(origin, '');
-  assert.notEqual(normalizeOrigin(String(origin)), 'null');
-  const list = [origin].filter(Boolean);
-  assert.deepEqual(list, []);
-});
-
-// ---------- D：关于页外链的命令接线 ----------
+// ---------- D：桥的命令接线 ----------
 
 test('D: openUrl 调用的命令名/参数形状与 Rust open_url 一致', async () => {
   const calls = [];
@@ -193,34 +138,6 @@ test('D: importWallpaper 的命令名/参数形状与 Rust import_wallpaper 一�
     else globalThis.window = prev;
   }
   assert.deepEqual(calls, [['import_wallpaper', { name: '我的壁纸.png', dataBase64: 'iVBORw0KGgo=' }]]);
-});
-
-// ---------- E：关于页的合规件路径（T12 / R54） ----------
-
-test('E: 关于页优先展示宿主解析出的随包路径，而不是源码树路径', () => {
-  const installed = {
-    licensePath: 'C:\\Users\\u\\AppData\\Local\\fnOS\\fnos-mods\\LICENSE',
-    noticePath: 'C:\\Users\\u\\AppData\\Local\\fnOS\\fnos-mods\\NOTICE'
-  };
-  assert.deepEqual(compliancePaths(installed), {
-    license: installed.licensePath,
-    notice: installed.noticePath
-  });
-  // 关键不变式：有宿主路径时**不得**再出现 `src-tauri/assets/...`（安装后磁盘上没有它）
-  assert.equal(compliancePaths(installed).license.includes(VENDOR_DIR), false);
-});
-
-test('E: 老宿主（meta 缺字段/整个缺失）回落源码树路径，绝不画 undefined', () => {
-  for (const meta of [{}, undefined, null, { shellVersion: '0.1.0' }]) {
-    const p = compliancePaths(meta);
-    assert.equal(p.license, `${VENDOR_DIR}/LICENSE`);
-    assert.equal(p.notice, `${VENDOR_DIR}/NOTICE`);
-    assert.equal(p.license.includes('undefined'), false);
-  }
-  // 只有一个字段时另一条也各自回落（两行不共享一个判据）
-  const half = compliancePaths({ licensePath: 'X:\\a\\LICENSE' });
-  assert.equal(half.license, 'X:\\a\\LICENSE');
-  assert.equal(half.notice, `${VENDOR_DIR}/NOTICE`);
 });
 
 // ---------- F：完美图标逐项（Task 13b） ----------
@@ -435,7 +352,7 @@ test('H: pageCheckAnswer 只用宿主观测（识别或页面回报的注入链�
   assert.deepEqual(pageCheckAnswer({ recognized: true, loadFailed: true }, injected), { isFnOSWebUi: false });
   // 取不到主窗口状态（IPC 失败）→ false，绝不猜成 true
   assert.deepEqual(pageCheckAnswer(null, injected), { isFnOSWebUi: false });
-  // 伪造的注入回报不升级（与 status.js::reportVerdict 同源）：dir 不是 out 不算
+  // 伪造的注入回报不升级（与 app.js::reportVerdict 同一条判据）：dir 不是 out 不算
   assert.deepEqual(
     pageCheckAnswer({ recognized: false }, { type: 'FNOS_INJECTION_TRIGGERED', dir: 'response', payload: {} }),
     { isFnOSWebUi: false }
@@ -459,7 +376,7 @@ test('H: 上游 UI 被装进 iframe，且**只在配置快照就位之后**才�
   assert.ok(src.includes('设置窗没有映射这条命令'), '表外的命令名必须被明确拒绝');
 });
 
-test('H: 退休的分组 UI 不得留下任何可达引用（settings.html / app.js 都没有 nav/pane/schema）', () => {
+test('H: 退休的分组 UI 与本壳自有 UI 都不得留下任何可达引用（设置窗只剩上游界面）', () => {
   const html = readFileSync(new URL('../ui/settings/settings.html', import.meta.url), 'utf8');
   const app = readFileSync(new URL('../ui/settings/app.js', import.meta.url), 'utf8');
   for (const dead of ['id="nav"', 'id="pane"', 'schema.js', 'SCHEMA']) {
@@ -470,10 +387,15 @@ test('H: 退休的分组 UI 不得留下任何可达引用（settings.html / app
   }
   // schema.js 这个模块本身已经删除
   assert.throws(() => readFileSync(new URL('../ui/settings/schema.js', import.meta.url), 'utf8'));
-  // 上游界面是**主内容**：html 里必须有它的宿主 id（app.js 的 boot 判据也用它）
+  // 上游界面是**唯一内容**（T14c 修复轮 3：状态条 / 外壳卡 / 关于页已按用户要求全部删除）
   assert.ok(html.includes('id="upstreamHost"'), 'settings.html 必须有上游界面宿主');
-  assert.ok(html.includes('id="about"'), 'settings.html 必须保留关于/合规容器');
-  assert.ok(html.includes('id="status"'), 'settings.html 必须保留状态条');
+  for (const gone of ['id="about"', 'id="status"', 'id="shellCard"', 'id="shellFields"', 'shell-side']) {
+    assert.ok(!html.includes(gone), `settings.html 不得再有 ${gone}（本壳自有 UI 已全部裁撤）`);
+  }
+  // app.js 同步退役：不得再有渲染这些 UI 的函数
+  for (const gone of ['renderStatus', 'renderShell', 'renderAbout', 'compliancePaths']) {
+    assert.ok(!app.includes(`function ${gone}`), `app.js 不得再有 ${gone}（已随本壳自有 UI 退役）`);
+  }
 });
 
 test('T14c: Dock 自动隐藏的开关入口在上游界面里（chrome-shim 注入，右侧外壳栏已删）', () => {

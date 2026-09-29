@@ -1,14 +1,15 @@
-// 设置窗归一化的**残余锁定**（T14b fix round 1 之后）。
+// 设置窗归一化的**残余锁定**（T14c 修复轮 3 之后）。
 //
 // 设置窗不再做任何 mods 归一化（T14b 托管上游 popup；镜像函数已按评审意见删除，
-// 见 `ui/settings/normalize.js` 的头部说明）。本文件因此只剩两件事：
-//   1. `PREFECT_ICON_PATH` 常量与 Rust 规则的**跨语言镜像**：两侧共用的 20 行输入表；
-//   2. `normalizeOrigin` 的 ASCII 小写语义（R23；`status.js` 的白名单路径在用）。
+// 见 `ui/settings/normalize.js` 的头部说明）。本文件因此只剩一件事：
+// `PREFECT_ICON_PATH` 常量与 Rust 规则的**跨语言镜像**：两侧共用的 20 行输入表。
 // 「显示的值 = 生效的值」的其余不变式由 Rust 单测（config.rs / commands.rs）与
 // tests/settings.test.mjs 的 A 组（原样采纳 + 源码级断言）锁定。
+// （normalizeOrigin / parseHttpOrigin 已随状态条退役删除——白名单的整理与校验
+// 收口在 Rust `config.rs`。）
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { PREFECT_ICON_PATH, normalizeOrigin } from '../ui/settings/normalize.js';
+import { PREFECT_ICON_PATH } from '../ui/settings/normalize.js';
 
 // ——— R30 的 JS 镜像（fix round 1 / Important 2） ———
 
@@ -89,20 +90,4 @@ test('PREFECT_ICON_PATH：字符串形状的补充判定（与 Rust 规则同结
   // 非字符串的兜底**不再由正则提供**：判定函数（带 `typeof` 守卫）已随镜像一起删除，
   // 常量的消费语义是「调用方保证传入字符串」（Rust 侧由 serde 保证 String）。正则对
   // 非字符串会静默强转或抛错（Symbol），那不是这条镜像要锁的行为。
-});
-
-// ——— normalizeOrigin 的 ASCII 小写语义（R23；status.js 的白名单路径在用） ———
-
-test('白名单小写只折 ASCII（= Rust to_ascii_lowercase，不是 Unicode toLowerCase）', () => {
-  // Rust `config.rs:584` 用 `to_ascii_lowercase()`：非 ASCII 大写字母保持原样。
-  // 若这里用 `String#toLowerCase()`，同一份配置在设置窗里显示的条目会与页面比对的
-  // 条目差一个字符（§8.4 的缺陷类别），文档表格声称的「一一对应」也就不成立。
-  assert.equal(normalizeOrigin(' HTTP://ПРИМЕР.РФ:8000 '), 'http://ПРИМЕР.РФ:8000');
-  assert.equal(normalizeOrigin('HTTP://NAS.ПРИМЕР.local'), 'http://nas.ПРИМЕР.local');
-  // 对照：Unicode 折叠会把西里尔大写也压下去（旧实现的行为）
-  assert.notEqual('ПРИМЕР'.toLowerCase(), 'ПРИМЕР');
-  // trim + 去空格（与 Rust normalize 的白名单整理同义）
-  assert.equal(normalizeOrigin('  http://a.b  '), 'http://a.b');
-  assert.equal(normalizeOrigin(''), '');
-  assert.equal(normalizeOrigin(null), '');
 });

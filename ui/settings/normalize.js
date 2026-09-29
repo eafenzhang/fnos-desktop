@@ -1,25 +1,24 @@
-// 设置窗归一化的**残余文件**（T14b fix round 1 之后）。
+// 设置窗归一化的**残余文件**（T14c 修复轮 3 之后）。
 //
-// T14b 用上游 popup（iframe 托管）取代了本壳的 schema 驱动界面，`app.js` 的提交路径只剩
-// `shell.*` 两键（injectEnabled / nasUrl），设置窗**没有任何 mods 归一化可做**。此前镜像
-// Rust `Config::normalize` 的整套函数（`clampLightness` / `normalizeMods` /
-// `normalizeModsEntry` / `isPrefectIconPath`）已按评审意见删除——「显示的值 = 生效的值」
-// 现在只由两条支撑：JS 原样采纳 IPC 回包（`app.js::adoptConfig`，不做任何二次归一化）
-// + Rust 是唯一的归一化实现（`config.rs::Config::normalize`，在 `load` 与每次
-// `set_config` 后运行）。回归锁在 tests/settings.test.mjs 的 A 组（含源码级断言：
+// T14b 用上游 popup（iframe 托管）取代了本壳的 schema 驱动界面，`app.js` 的提交路径全部
+// 由 chrome-shim 直达 `set_config`，设置窗**没有任何 mods 归一化可做**。此前镜像 Rust
+// `Config::normalize` 的整套函数（`clampLightness` / `normalizeMods` / `normalizeModsEntry`
+// / `isPrefectIconPath`）已按评审意见删除（T14b fix round 1）；状态条随「仅保留上游界面」
+// 的裁撤退役（T14c 修复轮 3）后，`normalizeOrigin` / `parseHttpOrigin` 也失去了最后一个
+// 消费方（白名单的整理与校验收口在 Rust `config.rs`：`normalize` 的 ASCII 小写 + `origin_of`）。
+// 「显示的值 = 生效的值」现在只由两条支撑：JS 原样采纳 IPC 回包（`app.js::adoptConfig`）
+// + Rust 是唯一的归一化实现。回归锁在 tests/settings.test.mjs 的 A 组（含源码级断言：
 // app.js 不得引用本文件）。
 //
-// 本文件因此只剩两件事：
+// 本文件因此只剩一件事：
 //
-// 1. `PREFECT_ICON_PATH` —— R30 的跨语言镜像常量。它的**生产消费者**已经没有了
-//    （退休的 `schema.js` 是最后一个调用判定函数的地方），但常量与它的大小写语义**保留**：
-//    `ui/settings/chrome-shim.js::getURL` 依赖同一条大小写不敏感语义（内嵌资产表大小写
-//    敏感，`prefect_icon/panIndex.png` 与 `prefect_icon/panindex.png` 必须解析到同一份
-//    字节），而 Rust 的 `commands.rs::tests::prefect_icon_rule_mirror_stays_in_step`
-//    逐字锁着这行正则文本 + tests/normalize.test.mjs 的 20 行输入表。
-//    **改一侧必须同时改另一侧，否则那条 Rust 用例会红。**
-// 2. `normalizeOrigin` / `parseHttpOrigin` —— 白名单条目的整理与用户输入的 origin 解析
-//    （`status.js` 的白名单/状态条路径在用 `normalizeOrigin`；R23 的 ASCII 小写语义）。
+// `PREFECT_ICON_PATH` —— R30 的跨语言镜像常量。它的**生产消费者**已经没有了
+// （退休的 `schema.js` 是最后一个调用判定函数的地方），但常量与它的大小写语义**保留**：
+// `ui/settings/chrome-shim.js::getURL` 依赖同一条大小写不敏感语义（内嵌资产表大小写
+// 敏感，`prefect_icon/panIndex.png` 与 `prefect_icon/panindex.png` 必须解析到同一份
+// 字节），而 Rust 的 `commands.rs::tests::prefect_icon_rule_mirror_stays_in_step`
+// 逐字锁着这行正则文本 + tests/normalize.test.mjs 的 20 行输入表。
+// **改一侧必须同时改另一侧，否则那条 Rust 用例会红。**
 
 /**
  * 上游 `launchpadIconRedrawMap` 取值约束的正则：`^prefect_icon/[a-z0-9-]+\.png$`，
@@ -51,49 +50,3 @@
  * 还逐字锁住本常量的正则文本（含 `i`）并逐行核对那张表。
  */
 export const PREFECT_ICON_PATH = /^prefect_icon\/[a-z0-9-]+\.png$/i;
-
-/** 白名单条目：trim + **只小写 ASCII**（R23：上游按 `location.origin` 大小写敏感比较）。
- *
- * 用 `to_ascii_lowercase` 的语义（`[A-Z]` 逐个映射），不用 `String#toLowerCase()`：
- * 后者按 Unicode 折叠（`ПРИМЕР` → `пример`），而 Rust 侧是 `to_ascii_lowercase()`，
- * 非 ASCII 大写字母**保持原样**（`config.rs:584`）。白名单在状态条/外壳里的显示字符串
- * 必须与页面实际比对的字符串逐字符相同，否则手改过的条目在界面上是另一串字（§8.4 的
- * 原缺陷类别）。
- */
-export function normalizeOrigin(origin) {
-  return asciiLower(String(origin == null ? '' : origin).trim());
-}
-
-/** 只折 ASCII 大写字母（= Rust `str::to_ascii_lowercase`）。 */
-function asciiLower(s) {
-  return s.replace(/[A-Z]/g, (c) => String.fromCharCode(c.charCodeAt(0) + 32));
-}
-
-/**
- * 用户输入的站点地址 → 规范 origin（`scheme://host[:port]`，ASCII 小写、省略默认端口）。
- *
- * **只接受 `http://` / `https://` 开头的绝对地址**，其余一律返回空串（调用方视为校验失败）。
- * 为什么不能只靠 `new URL(value).origin` + `if (!origin)`：URL 的 scheme 允许含 `.`，
- * 于是 `nas.example.com:8000` 被当成「scheme = `nas.example.com`」、`8000` 成了 opaque path，
- * `.origin` 返回**字符串 `"null"`**；`"null"` 是 truthy，旧写法拦不住，junk 会被写进
- * `config.json` 的白名单（渲染成一个永远匹配不上的条目）。`nas:8000` / `mailto:` /
- * `data:` / `javascript:` / `ftp:` 同理。
- *
- * 与 `status.js::originOfHttpUrl` 同源、区别只在**输入**：这里的输入是用户手打的
- * （任意 junk 都可能），那边来自 Rust（已是合法 URL 或已知的失败地址）。
- */
-export function parseHttpOrigin(input) {
-  const raw = String(input == null ? '' : input).trim();
-  // 第一道闸：scheme 必须是 http(s)。正则通过不代表能解析，所以下面还要真解析一次。
-  if (!/^https?:\/\//i.test(raw)) return '';
-  let url;
-  try {
-    url = new URL(raw);
-  } catch (e) {
-    return '';
-  }
-  if (url.protocol !== 'http:' && url.protocol !== 'https:') return '';
-  const origin = normalizeOrigin(url.origin);
-  // 对 http(s) 不该出现 `"null"`；留作回归防线（这个字面量正是缺陷 B 的载体）。
-  return origin === 'null' ? '' : origin;
-}

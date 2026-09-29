@@ -6,7 +6,6 @@
 <link rel="stylesheet" href="settings.css">
 </head>
 <body>
-<div id="status" class="status pending" role="status" aria-live="polite">正在读取配置…</div>
 <div class="shell">
   <section class="upstream" aria-label="上游设置界面">
     <!--
@@ -15,23 +14,17 @@
       `<script src="./chrome-shim.js"></script>`（见 tools/vendor-mods.ps1 与 NOTICE 的
       包装性改动第 7 条）：chrome.* 兼容层必须在上游 popup.js 之前定义 window.chrome。
       装进 iframe 的理由有两条：① 上游 UI 的字节一个都不改（它自带 body 尺寸与整套样式）；
-      ② 它的样式因此不可能与下面本壳自己的区域互相打架。
+      ② 它的样式因此不可能与窗外的东西互相打架。
       帧在拿到配置快照之后才创建（见 app.js::mountUpstreamFrame）：上游在脚本开头就同步读
       `chrome.runtime.getManifest().version`，所以快照必须先就位。
-      T14c 修复轮：右侧外壳栏已删除，「自动隐藏 Dock」由 chrome-shim 以上游自己的行样式
-      注入到上游界面里（siteToggle 行之后）——本文件不再有外壳卡在 iframe 旁边。
+      T14c 修复轮 3：按用户要求，设置窗**只保留上游界面**——状态条、外壳开关（注入总开关
+      / nasUrl）与关于/合规页全部删除；「自动隐藏 Dock」由 chrome-shim 以上游自己的行样式
+      注入到上游界面里（siteToggle 行之后）。
     -->
     <div id="upstreamHost" class="frame-host" data-state="loading">
       <p class="frame-note" id="upstreamNote">正在读取配置…</p>
     </div>
   </section>
-</div>
-<div class="below">
-  <section class="card" id="shellCard">
-    <h2 class="pane-title">外壳（本应用，不是上游界面）</h2>
-    <div id="shellFields"></div>
-  </section>
-  <section id="about" aria-label="关于与合规"></section>
 </div>
 <script type="module" src="app.js"></script>
 </body>

@@ -1,15 +1,14 @@
-// 设置窗（Task 14b 起）：**托管上游 popup UI** + 本壳自己的状态条 / 外壳开关 / 关于页。
+// 设置窗（T14c 修复轮 3 起）：**只承载上游 popup UI**，本壳不再画任何自有界面。
 //
 // 结构（`settings.html`）：
 //
-//   #status      顶部状态条（Task 11 / spec §12.3），判据全在 `status.js`（本文件只负责画）
-//   #upstreamHost 上游 UI：`popup.html` 装在一个 372×522 的 iframe 里（上游自己写死的尺寸）；
-//                「自动隐藏 Dock」由 chrome-shim 以上游行样式注入其中（T14c 修复轮起）
-//   #shellFields  底部卡里本壳的开关（`shell.injectEnabled` / `shell.nasUrl`）
-//   #about        关于/合规（spec §10）——右侧栏已删，外壳卡与关于一起移到底部
+//   #upstreamHost 上游 UI：`popup.html` 装在一个 372×522 的 iframe 里（上游自己写死的尺寸）。
+//                「自动隐藏 Dock」由 chrome-shim 以上游自己的行样式注入其中。
+//                状态条、外壳开关（注入总开关 / nasUrl）与关于/合规页已按用户要求全部
+//                删除——这两个 shell 键仅存于 `config.json`（Rust 侧照常归一化与生效），
+//                合规声明由随包的 NOTICE / LICENSE 与 README 承担。
 //
-// 本文件**不再**有任何 schema 驱动的分组渲染（Task 14b 退休）：面板、控件、逐项完美图标、
-// 壁纸与自定义代码的界面全部由上游 popup 提供。因此这里只剩下三件事：
+// 本文件剩下的职责只有三件：
 //
 // 1. **宿主桥**（`installHostBridge`）：iframe 里的 `chrome-shim.js` 不直接发 IPC，
 //    它把命令 postMessage 过来，由本文件用既有 IPC 通路执行。**命令白名单**在这里，
@@ -17,21 +16,15 @@
 // 2. **两个组合应答**：`page_check`（上游问「这一页是不是 fnOS WebUI」）与 `app_items`
 //    （上游要「启动台应用项列表」）。后者的数据源是**页面上报的槽位**（Task 13b），
 //    槽位是空的时候才请宿主去让页面再汇报一次，并在有界窗口内轮询（见 `answerAppItems`）。
-// 3. 本壳自己的三块 UI：状态条、外壳开关、关于页。
+// 3. **上游帧的挂载与自检**：配置快照就位后才建帧（时序硬约束，见 `mountUpstreamFrame`）；
+//    帧内没渲染出上游节点时如实显示失败说明（绝不静默留白）。
 //
 // 纪律（与前几轮一致）：
 // - **显示的值 = 生效的值**：`state.config` 一律原样采纳 `get_config` / `set_config` 的返回，
-//   不在 JS 侧二次归一化。T14b fix round 1 起设置窗**没有任何 mods 归一化**（normalize.js
-//   的镜像函数已按评审意见删除，本文件不得引用它——tests/settings.test.mjs 的 A 组锁着）；
-//   唯一的手工输入是 NAS 地址，原样提交、由 Rust 的 `Config::normalize` 收口。
-// - **显示与否都要有据**：状态条只读真实回包；应用项列表只读 Rust 分好槽的上报。
-// - 页面可控文本一律 `textContent`，绝不 `innerHTML`。
-import { addCurrentOriginToWhitelist, cornerShapeHint, statusBar, statusFor, reportVerdict } from './status.js';
+//   不在 JS 侧二次归一化（tests/settings.test.mjs 的 A 组锁着「app.js 不得引用 normalize.js」）。
+// - 页面可控文本（`triggerReason`）进判读前先过 `clipPageText` 整形；一律 `textContent`，
+//   绝不 `innerHTML`。
 import * as api from './bridge.js';
-
-/** 上游项目主页 + vendored 资源位置（spec §10：关于页必须给出这两件事）。 */
-export const UPSTREAM_REPO = 'https://github.com/aurysian-yan/fnOS_UI_Mods';
-export const VENDOR_DIR = 'src-tauri/assets/fnos-mods';
 
 /** 上游 popup 的页面（`ui/settings/popup.html`，与 vendored 副本逐字节相同 + 一行 shim 标签）。 */
 export const UPSTREAM_PAGE = 'popup.html';
@@ -47,11 +40,11 @@ export const APP_ITEMS_WAIT_MS = 6000;
 export const APP_ITEMS_POLL_MS = 400;
 
 /**
- * 界面状态。导出供单测与状态条读取。
+ * 界面状态。导出供单测与运行期证据口读取。
  *
  * `page` / `report` / `appItemsReport` 与 Task 11/13a/13b 同义：`page` 是 `get_page_state`
  * 的最近一次回包，`report` 与 `appItemsReport` 是 `get_page_report` 信封的两个槽位
- * （状态条证据 / 应用项列表）。三者必须在同一个快照里取（见 `fetchPageSnapshot`）。
+ * （注入证据 / 应用项列表）。三者必须在同一个快照里取（见 `fetchPageSnapshot`）。
  */
 export const state = {
   config: null, error: null, page: null, report: null, appItemsReport: null,
@@ -82,21 +75,6 @@ function message(e) {
   return String((e && e.message) || e || '未知错误');
 }
 
-function el(tag, opts = {}) {
-  const node = document.createElement(tag);
-  if (opts.id) node.id = opts.id;
-  if (opts.className) node.className = opts.className;
-  if (opts.text != null) node.textContent = opts.text;
-  if (opts.attrs) for (const [k, v] of Object.entries(opts.attrs)) node.setAttribute(k, String(v));
-  return node;
-}
-
-function button(text, className) {
-  const b = el('button', { text, className });
-  b.type = 'button'; // 显式：避免将来包进 <form> 时变成提交按钮
-  return b;
-}
-
 /** 有 DOM 才动 DOM（`node --test` 会在无 DOM 的 Node 里 import 本模块）。 */
 function domReady() {
   return typeof document !== 'undefined' && typeof document.getElementById === 'function';
@@ -110,8 +88,7 @@ function domReady() {
  * **`mods` 原样采纳，不做任何归一化**（Review finding A / §8.4）：Rust 归一化过的值
  * 再过一遍 JS 镜像就会漂移（`#cec1b2` → Rust `#c4b4a2` → JS 再夹一次 `#c4b4a1`），
  * 而页面按 Rust 那份生效。T14b fix round 1 起镜像函数已删除、设置窗没有任何 mods
- * 归一化；本文件仅剩的手工输入（NAS 地址）也原样提交、由 Rust 的 `Config::normalize`
- * 收口。回归测试见 `tests/settings.test.mjs` 的 A 组（含「不得引用 normalize.js」的
+ * 归一化。回归测试见 `tests/settings.test.mjs` 的 A 组（含「不得引用 normalize.js」的
  * 源码级断言）。
  */
 export function adoptConfig(raw) {
@@ -119,34 +96,6 @@ export function adoptConfig(raw) {
   const mods = raw.mods && typeof raw.mods === 'object' ? raw.mods : {};
   state.config = { ...raw, mods };
   snapshot.config = state.config;
-}
-
-/**
- * `shell.*` 键 → patch 值的形状表：每个可提交的键只有一个入口（`commitShell`），
- * 布尔键统一 `!!`、字符串键统一 `String`，新增键在这里登记而不是再开一条 if 分支。
- */
-const SHELL_KEYS = {
-  injectEnabled: (v) => !!v,
-  nasUrl: (v) => String(v == null ? '' : v),
-};
-
-/** 提交一个 `shell.*` 键；需要时跟随 `reload_main`（与 T13b 的设置窗行为一致）。 */
-async function commitShell(path, value) {
-  try {
-    const build = SHELL_KEYS[path];
-    if (!build) throw new Error(`未登记的 shell 键：${path}`);
-    const res = await api.setConfig({ shell: { [path]: build(value) } });
-    adoptConfig(res.config);
-    state.error = null;
-    if (res.needsReload) {
-      await api.reloadMain(null);
-      await fetchPageSnapshot();
-    }
-  } catch (e) {
-    state.error = `保存「${path}」失败：${message(e)}`;
-  }
-  renderShell();
-  renderStatus();
 }
 
 // ---------- 完美图标：应用项列表（数据来自页面上报的槽位） ----------
@@ -251,10 +200,54 @@ export async function answerAppItems() {
 }
 
 /**
+ * 页面可控文本（`triggerReason`）进判读前的唯一一道整形：控制字符（含换行/制表）与行
+ * 分隔符换成空格、连续空白折叠、按**码点**截断到 [`MAX_TRIGGER_REASON_CHARS`]。
+ * 原属 status.js（T14c 修复轮 3 随状态条 UI 退役迁入）——`pageCheckAnswer` 判读上报时
+ * 仍然需要它：`triggerReason` 是页面可写的，长度与控制字符必须先收口。
+ */
+export const MAX_TRIGGER_REASON_CHARS = 60;
+
+function clipPageText(s) {
+  const cleaned = String(s)
+    .replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const cps = Array.from(cleaned);
+  if (cps.length <= MAX_TRIGGER_REASON_CHARS) return cleaned;
+  return cps.slice(0, MAX_TRIGGER_REASON_CHARS).join('') + '…';
+}
+
+/**
+ * 最近一次页面上报（`get_page_report` 回包）的判读结果：`{ injected, reason }`。
+ *
+ * **唯一能认定「注入链已触发」的证据**：上游 `content-script.js` 的
+ * `notifyInjectionTriggered()` 在 `startInject()` 末尾 `chrome.runtime.sendMessage(...)`；
+ * 本壳的 shim（`inject/shim.js` 的 `sendMessage`）把这条消息**原文**放进信封的 `payload`，
+ * 宿主校验 type 白名单后存内存。它比「脚本已注册」强一档：说明**上游自己的注入链**
+ * 确实跑到了最后一步。
+ *
+ * 不升级的形状（全部按「没有上报」处理，宁可退回弱判定）：
+ * - 不是对象 / `null`（没上报、被拒、换页面后作废）；
+ * - `type` 不是 `FNOS_INJECTION_TRIGGERED`（例如应用项列表应答）；
+ * - `dir !== 'out'`：`'response'` 是**别人问它、它作答**，不代表这次加载触发过注入；
+ * - `payload` 缺失 → 仍然算注入已触发（triggerReason 只是附加信息，缺了不影响结论）。
+ *
+ * `reason` 会过一遍 [`clipPageText`]（页面公开可写的文本，进判读/日志前先整形）。
+ */
+function reportVerdict(report) {
+  if (!report || typeof report !== 'object') return { injected: false, reason: null };
+  if (report.type !== 'FNOS_INJECTION_TRIGGERED') return { injected: false, reason: null };
+  if (report.dir !== 'out') return { injected: false, reason: null };
+  const payload = report.payload && typeof report.payload === 'object' ? report.payload : null;
+  const raw = payload && typeof payload.triggerReason === 'string' ? clipPageText(payload.triggerReason) : '';
+  return { injected: true, reason: raw || null };
+}
+
+/**
  * 上游问「这一页是不是 fnOS WebUI」。
  *
  * 判据只用宿主观测：**识别**（白名单 / *.fnos.net / nasUrl 的 origin，`config.rs::is_recognized`）
- * **或**页面自己的注入链回报（`status.js::reportVerdict`，与状态条的强态同源）。
+ * **或**页面自己的注入链回报（`reportVerdict`，本文件；原 status.js 已随状态条退役迁入）。
  * 错误页 / 加载失败一律 false：上游据此决定要不要 `FNOS_APPLY`，对着一张错误页说 true 只会
  * 让它白干活。
  */
@@ -322,7 +315,7 @@ async function fetchPageState() {
     const page = await api.getPageState();
     return page && typeof page === 'object' ? page : null;
   } catch (e) {
-    return null; // 「取不到」与「取到了、确实没识别」是两件事（见 status.js）
+    return null; // 「取不到」与「取到了、确实没识别」是两件事
   }
 }
 
@@ -411,11 +404,6 @@ export function installHostBridge() {
     Promise.resolve()
       .then(() => handler(data.args || {}))
       .then((value) => {
-        // 写完配置/重建主窗口之后：状态条与外壳区必须跟着换，否则会停在旧判定上
-        if (data.cmd === 'set_config' || data.cmd === 'reload_main' || data.cmd === 'apply') {
-          renderStatus();
-          renderShell();
-        }
         reply(true, value === undefined ? null : value);
       })
       .catch((e) => reply(false, undefined, message(e)));
@@ -433,7 +421,7 @@ export function installHostBridge() {
  * **帧内的 `data-state` 不在挂载时就写 ready**（fix round 1 / Minor 2）：只有帧内真的出现
  * 上游自己的节点（`#siteToggle` + `code.version`）才算渲染成功。旧实现在这里立刻写
  * `ready`，而 CSS 又把占位说明在 ready 态隐藏，于是「上游界面没渲染出来」的兜底
- * （`reportFrameVerdict`）永远不可能被用户看见——正是「绝不静默留白」要防的那种情形。
+ * （`applyFrameVerdict`）永远不可能被用户看见——正是「绝不静默留白」要防的那种情形。
  */
 export function mountUpstreamFrame() {
   if (!domReady()) return null;
@@ -561,319 +549,6 @@ function applyFrameVerdict(final = false) {
   return false;
 }
 
-// ---------- 状态条（spec §12.3） ----------
-
-/** 判据是否还停在「加载失败 / 加载中」（重试后的轮询用于决定何时停）。 */
-function stillFailed(page) {
-  return !!page && (page.loadFailed === true || page.loading === true);
-}
-
-/**
- * 「重试」：走既有 `reload_main`（Rust 侧销毁主窗口并按配置重建）。
- *
- * 重建是异步的，紧接着取一次 `get_page_state` 大概率还是旧的失败态，所以轮询一小会儿：
- * 状态条于是从「加载失败」走到真实结果，而不是卡在旧快照上。错误页本身没有任何 IPC
- * 授权，重试入口只能在设置窗与托盘——这正是本函数存在的理由。
- */
-async function retryMain() {
-  state.error = null;
-  renderStatus(true);
-  try {
-    await api.reloadMain(null);
-  } catch (e) {
-    state.error = `重试失败：${message(e)}`;
-    await fetchPageSnapshot();
-    renderStatus();
-    renderShell();
-    return;
-  }
-  const deadline = Date.now() + 8000;
-  do {
-    await sleep(600);
-    await fetchPageSnapshot();
-    renderStatus(true);
-  } while (Date.now() < deadline && stillFailed(state.page));
-  renderStatus();
-  renderShell();
-}
-
-/**
- * 「把当前页加入白名单」：走 `set_config {mods:{enabledOrigins}}`。
- *
- * origin 来自 `get_page_state`（Rust 用 `config::origin_of` 解析出来的），不是页面上抓来的
- * 字符串；去重/小写由 `status.js::addCurrentOriginToWhitelist` 与 Rust 的 `Config::normalize`
- * 双保险。写完显式重建主窗口：注入载荷是建窗时注册的（活窗口换不掉），不重建就要等下一次导航。
- */
-async function whitelistCurrentOrigin() {
-  const origin = state.page && state.page.origin;
-  if (!origin) return;
-  const next = addCurrentOriginToWhitelist(origin, (state.config && state.config.mods || {}).enabledOrigins);
-  try {
-    const res = await api.setConfig({ mods: { enabledOrigins: next } });
-    adoptConfig(res.config);
-    state.error = null;
-    await api.reloadMain(null);
-  } catch (e) {
-    state.error = `加入白名单失败：${message(e)}`;
-  }
-  await fetchPageSnapshot();
-  renderStatus();
-  renderShell();
-}
-
-/** 把状态条重新画一遍（`status.js::statusFor` 是唯一的判据来源）。 */
-function renderStatus(busy) {
-  if (!domReady()) return;
-  const model = statusFor(state.config, state.page, state.report);
-  const bar = statusBar(model.text, model.kind);
-  if (!bar) return;
-  for (const action of model.actions) {
-    if (action === 'retry') {
-      const b = button('重试');
-      b.id = 'statusRetry';
-      b.disabled = !!busy;
-      b.addEventListener('click', () => { retryMain(); });
-      bar.appendChild(b);
-    } else if (action === 'whitelist') {
-      const b = button('把当前页加入白名单');
-      b.id = 'statusWhitelist';
-      b.disabled = !!busy;
-      b.addEventListener('click', () => { whitelistCurrentOrigin(); });
-      bar.appendChild(b);
-    }
-  }
-}
-
-// ---------- 外壳开关（上游 UI 里没有的两项） ----------
-
-/** 上一次真的画进 DOM 的外壳状态（值没变就不重建——见 [`renderShell`]）。 */
-let shellRenderKey = null;
-
-/**
- * 正在编辑中的 NAS 地址（未保存的输入）。
- *
- * `renderShell` 会 `host.textContent = ''` 再重建，**重建就会丢掉用户正在敲的字**。聚焦刷新
- * （`refresh()`）或任何一次重画都可能发生，所以重建前先把「与已保存值不同」的输入记下来，
- * 重建后原样放回（含焦点与光标位置）。
- */
-function captureNasEdit(host) {
-  const nas = host.querySelector('#f_shell_nasUrl');
-  if (!nas) return null;
-  const saved = nas.dataset.savedValue == null ? '' : nas.dataset.savedValue;
-  if (nas.value === saved) return null; // 没有未保存的改动：按配置值重建即可
-  return {
-    value: nas.value,
-    focused: document.activeElement === nas,
-    start: nas.selectionStart,
-    end: nas.selectionEnd,
-  };
-}
-
-/**
- * `shell.injectEnabled`（注入总开关）与 `shell.nasUrl`。
- *
- * 这两项还留在本壳（T14c 修复轮的设计取舍）：上游 popup 是**扩展**的设置界面，它假设
- * 「扩展总是被注入」，所以没有注入总开关，也没有「NAS 地址」这个概念（上游用
- * `enabledOrigins` 白名单表达同一件事的另一半）。而本壳这两个键有真实语义：
- * `injectEnabled=false` 会让宿主**不注册**任何 mods 初始化脚本（T7+8 的 gap (a)）；
- * `nasUrl` 在保存时会把它的 origin 并入白名单，是「一键把 NAS 加进来」的入口。
- * 「自动隐藏 Dock」**不在这里**——它已按用户要求并入上游界面，由 chrome-shim 用上游
- * 自己的行样式注入（`chrome-shim.js::injectDockRow`，siteToggle 行之后）。
- *
- * **值没变就不重建**（fix round 1 / Minor 1）：旧实现在每次 `refresh()`（窗口获得焦点）
- * 都无条件 `host.textContent = ''` 重画，于是 alt-tab 一次就把用户没保存的 NAS 地址清成
- * 配置里的旧值。现在两道闸：① 渲染键（两个键 + 错误条）与上次相同 → 直接返回，DOM 一个
- * 字节都不动（焦点与输入都留着）；② 万一必须重建，也先把未保存的输入捞出来再放回去。
- */
-function renderShell() {
-  if (!domReady()) return;
-  const host = document.getElementById('shellFields');
-  if (!host) return;
-  const shell = (state.config && state.config.shell) || {};
-  const injected = shell.injectEnabled !== false;
-  const nasValue = typeof shell.nasUrl === 'string' ? shell.nasUrl : '';
-
-  const renderKey = JSON.stringify({
-    injectEnabled: injected, nasUrl: nasValue, error: state.error || '',
-  });
-  if (renderKey === shellRenderKey && host.childElementCount > 0) return;
-
-  const edit = captureNasEdit(host);
-  host.textContent = '';
-  shellRenderKey = renderKey;
-
-  const injectField = el('div', { className: 'field' });
-  const injectId = 'f_shell_injectEnabled';
-  const injectLabel = el('label', { text: '注入 mods（总开关）' });
-  injectLabel.htmlFor = injectId;
-  const inject = el('input', { id: injectId });
-  inject.type = 'checkbox';
-  inject.checked = injected;
-  inject.addEventListener('change', () => { commitShell('injectEnabled', inject.checked); });
-  injectField.append(injectLabel, inject, el('p', {
-    className: 'hint',
-    text: '关掉之后宿主不再为任何窗口注册 mods 载荷（改这一项会重建主窗口）。',
-  }));
-  host.appendChild(injectField);
-
-  const nasField = el('div', { className: 'field' });
-  const nasId = 'f_shell_nasUrl';
-  const nasLabel = el('label', { text: 'NAS WebUI 地址' });
-  nasLabel.htmlFor = nasId;
-  const nas = el('input', { id: nasId });
-  nas.type = 'text';
-  nas.placeholder = 'http://192.168.1.10:8000';
-  nas.dataset.savedValue = nasValue; // 「已保存的值」：判断有没有未保存改动的唯一依据
-  nas.value = edit ? edit.value : nasValue;
-  const nasSave = button('保存');
-  nasSave.id = 'f_shell_nasUrl_save';
-  const commitNas = () => { commitShell('nasUrl', nas.value); };
-  nasSave.addEventListener('click', commitNas);
-  nas.addEventListener('keydown', (e) => { if (e.key === 'Enter') commitNas(); });
-  nasField.append(nasLabel, nas, nasSave, el('p', {
-    className: 'hint',
-    text: '保存后宿主会把它的 origin 并入 mods.enabledOrigins（白名单）。',
-  }));
-  host.appendChild(nasField);
-
-  const actions = el('div', { className: 'field' });
-  const openDir = button('打开配置目录');
-  openDir.id = 'shellOpenDir';
-  openDir.addEventListener('click', async () => {
-    try {
-      await api.openConfigDir();
-      state.error = null;
-    } catch (e) {
-      state.error = `打开配置目录失败：${message(e)}`;
-    }
-    renderShell();
-  });
-  actions.appendChild(openDir);
-  host.appendChild(actions);
-
-  if (state.error) host.insertBefore(el('p', { className: 'error-banner', text: state.error }), host.firstChild);
-
-  if (edit) {
-    // 未保存的输入原样放回（值 + 光标），必要时把焦点也还回去——「绝不丢弃进行中的输入」。
-    nas.value = edit.value;
-    try { nas.setSelectionRange(edit.start, edit.end); } catch (e) { /* 不支持就不设 */ }
-    if (edit.focused && typeof nas.focus === 'function') nas.focus();
-  }
-}
-
-// ---------- 关于页（spec §10：合规与品牌） ----------
-
-/**
- * 关于页要展示的两个合规件路径（spec §10 / Ruling R54）。
- *
- * 优先用宿主解析出的**随包真实路径**（`meta.licensePath` / `meta.noticePath`），老宿主
- * （或只喂半个 meta 的单测）没有它们时才回落到源码树里的 vendored 位置，而不是画 `undefined`。
- */
-export function compliancePaths(meta) {
-  const m = meta || {};
-  return {
-    license: m.licensePath || `${VENDOR_DIR}/LICENSE`,
-    notice: m.noticePath || `${VENDOR_DIR}/NOTICE`,
-  };
-}
-
-function metaRow(label, value, tag, className) {
-  const row = el('div', { className: 'row' });
-  row.appendChild(el('span', { className: 'row-label', text: label }));
-  row.appendChild(el(tag || 'b', { className: className || 'row-value', text: value }));
-  return row;
-}
-
-function renderAbout() {
-  if (!domReady()) return;
-  const about = document.getElementById('about');
-  if (!about) return;
-  about.textContent = '';
-  const meta = (state.config && state.config.meta) || {};
-
-  const card = el('div', { className: 'card' });
-  card.appendChild(el('h2', { className: 'pane-title', text: '关于' }));
-  card.appendChild(metaRow('应用版本', meta.shellVersion || '未知'));
-  card.appendChild(metaRow('mods commit', meta.modsCommit || '未知'));
-  card.appendChild(metaRow('mods 版本', meta.modsVersion || '未知'));
-  // Rust 侧字段是 `webview_version` + `#[serde(rename_all = "camelCase")]`，serde 只把 `_v`
-  // 变成 `V`，因此真实 JSON 键是 **`webviewVersion`**（不是 `webViewVersion`）。两个都读：
-  // 契约写法差异不该表现为「关于页永远显示未知」。
-  const webviewVersion = meta.webViewVersion || meta.webviewVersion;
-  card.appendChild(metaRow('WebView2 版本', webviewVersion || '未知（未取到运行时版本）'));
-  // spec §12.3 / §14：`corner-shape` 需要 Chromium/WebView2 139+；取不到版本时什么都不说。
-  const shapeHint = cornerShapeHint(webviewVersion);
-  if (shapeHint) {
-    card.appendChild(el('p', { id: 'cornerShapeHint', className: 'hint warn', text: shapeHint, attrs: { role: 'note' } }));
-  }
-  card.appendChild(metaRow('配置文件', meta.configPath || '未知', 'code', 'row-value path'));
-  // spec §10 / R54：必须指出**随包**许可全文与 NOTICE 的真实位置。
-  const legalPaths = compliancePaths(meta);
-  card.appendChild(metaRow('上游许可全文', legalPaths.license, 'code', 'row-value path'));
-  card.appendChild(metaRow('来源与改动声明', legalPaths.notice, 'code', 'row-value path'));
-  about.appendChild(card);
-
-  const actions = el('div', { className: 'card' });
-  const reset = button('恢复默认设置', 'danger');
-  reset.id = 'resetAll';
-  reset.addEventListener('click', async () => {
-    if (!window.confirm('确定恢复全部默认设置？注入开关与地址也会回到默认值。')) return;
-    try {
-      adoptConfig(await api.resetConfig('all'));
-      state.error = null;
-    } catch (e) {
-      state.error = `恢复默认失败：${message(e)}`;
-    }
-    renderShell();
-    renderStatus();
-  });
-  actions.appendChild(reset);
-  about.appendChild(actions);
-
-  // 许可与免责（spec §10）：非官方 + 非商业 + 上游出处 + vendored 许可全文位置。
-  const legal = el('div', { className: 'card legal' });
-  legal.appendChild(el('p', {
-    className: 'legal-line',
-    text: '本应用是第三方桌面壳，非飞牛（fnOS）官方产品，与飞牛官方无任何关联，也未获其授权或认可。',
-  }));
-  legal.appendChild(el('p', {
-    className: 'legal-line',
-    text: '随应用注入的界面修改资源（CSS/JS）来自上游开源项目 fnOS UI Mods，遵循其 Non-Commercial License 1.0，仅供非商业个人使用；本应用及这些资源均不得用于任何商业用途。上游资源按原样保留、未作修改，本壳仅做注入与包装性改动（清单见 NOTICE）。',
-  }));
-  legal.appendChild(el('p', {
-    className: 'legal-line',
-    text: '本窗的主界面就是上游自己的设置界面（popup.html + popup.js，逐字节原样 + 一行 chrome.* 兼容层标签），'
-      + '本壳只额外提供状态条、上面这两项外壳开关与这一页关于/合规信息。',
-  }));
-  const linkLine = el('p', { className: 'legal-line' });
-  linkLine.appendChild(document.createTextNode('上游项目：'));
-  const link = el('a', { text: UPSTREAM_REPO });
-  link.href = UPSTREAM_REPO;
-  link.rel = 'noopener noreferrer';
-  link.id = 'upstreamLink';
-  // 外链**不在窗内导航**，交给 Rust `open_url` 用系统默认浏览器打开（Review finding D）。
-  // 不加 preventDefault 的话 Chromium 会在设置窗自身里导航到 GitHub——UI 被顶掉，而
-  // capability 只授权本地来源；`target=_blank` 也救不了（wry 默认不注册 new_window_handler，
-  // 新窗口请求被静默吞掉）。`href` 仍保留：URL 可见、可复制、在无障碍树里仍是 Hyperlink。
-  link.addEventListener('click', async (e) => {
-    e.preventDefault();
-    try {
-      await api.openUrl(UPSTREAM_REPO);
-      state.error = null;
-    } catch (err) {
-      state.error = `打开上游链接失败：${message(err)}`;
-      renderShell();
-    }
-  });
-  linkLine.appendChild(link);
-  legal.appendChild(linkLine);
-  legal.appendChild(el('p', {
-    className: 'legal-line dim',
-    text: `上游许可全文：${legalPaths.license}；来源与改动声明：${legalPaths.notice}（后者含来源仓库、锁定 commit、各文件 SHA-256、本壳的包装性改动清单）。两者都随安装包分发；上方的链接会用系统默认浏览器打开上游仓库，若被系统策略拦截，可手动复制上面的路径。`,
-  }));
-  about.appendChild(legal);
-}
-
 // ---------- 生命周期 ----------
 
 let refreshing = false;
@@ -883,45 +558,30 @@ function sameConfig(a, b) {
 }
 
 /**
- * 重取配置 + 主窗口快照并就地重画。
+ * 重取配置 + 主窗口快照并就地更新 state。
  *
  * 为什么需要：配置可以被本窗**之外**的入口改动（手工编辑 `config.json`、`set_config` 的
  * 带外调用），而那些入口不向本窗发任何事件；主窗口更是**可以不改配置**就导航（用户点链接、
  * 错误页自动重试）。窗口重新获得焦点时刷新是最小实现。
  *
  * **不重挂上游帧**：上游 UI 有自己的输入状态与滚动位置，重新加载 iframe 会把它清掉；
- * 上游自己通过 `storage.sync.set` 写配置，所以它的界面与配置天然同步。本窗只重画
- * 状态条、外壳开关与关于页（它们才是本壳的视图）。
+ * 上游自己通过 `storage.sync.set` 写配置，所以它的界面与配置天然同步。
  */
 export async function refresh() {
   if (refreshing) return;
   refreshing = true;
-  let next = null;
-  let failure = null;
   try {
-    next = await api.getConfig();
+    const next = await api.getConfig();
+    if (!sameConfig(state.config, next)) adoptConfig(next);
   } catch (e) {
-    failure = e;
+    // 取不到就不动现有快照：本窗已经没有自有视图需要因此降级
   }
   await fetchPageSnapshot();
   refreshing = false;
-  if (failure) {
-    state.error = `刷新配置失败：${message(failure)}`;
-    renderStatus();
-    renderShell();
-    return;
-  }
-  if (!sameConfig(state.config, next)) {
-    adoptConfig(next);
-    state.error = null;
-    renderAbout();
-  }
-  renderStatus();
-  renderShell();
 }
 
 /**
- * 启动：取配置 → 写快照 → 挂宿主桥 → **然后**才建上游帧 → 画状态条/外壳/关于。
+ * 启动：取配置 → 写快照 → 挂宿主桥 → **然后**才建上游帧。
  *
  * 次序是硬约束（见 `mountUpstreamFrame` 的注释）：上游在脚本开头同步读版本号。
  * 导出以便单测；无 DOM 时模块加载不会自动执行（见文件末尾）。
@@ -930,12 +590,9 @@ export async function boot() {
   try {
     adoptConfig(await api.getConfig());
   } catch (e) {
-    state.error = `读取配置失败：${message(e)}`;
+    // 读不到配置也要把桥和帧装起来：chrome-shim 对空快照有明确的兜底与失败说明
   }
   await fetchPageSnapshot();
-  renderStatus();
-  renderShell();
-  renderAbout();
   installHostBridge();
   mountUpstreamFrame();
   // 运行期证据口（UIA / WebView2 CDP 都读它）：帧内自检 + 当前快照，用于证明

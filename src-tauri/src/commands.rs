@@ -1759,7 +1759,8 @@ pub fn open_settings<R: Runtime>(app: &AppHandle<R>) {
         WebviewUrl::App("settings.html".into()),
     )
     .title("fnOS 设置")
-    .inner_size(900.0, 640.0)
+    // T14c 修复轮 3：设置窗只剩上游 UI（372×522 的 iframe）+ 12px 内边距，窗口随之收窄。
+    .inner_size(400.0, 550.0)
     .build()
     {
         Ok(_) => {}
