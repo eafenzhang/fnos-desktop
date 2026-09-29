@@ -1045,6 +1045,7 @@ mod tests {
         assert_eq!(c.shell.keep_alive_minutes, 45);
     }
 
+    #[test]
     fn brand_color_lightness_is_clamped() {
         // 纯白明度 100% → 夹到 70%；纯黑 0% → 夹到 30%
         assert_eq!(normalize_brand_color("#ffffff"), "#b3b3b3"); // L=70%

@@ -120,12 +120,54 @@ test('本壳样式覆盖：绝对定位的整屏覆盖层恢复不透明（应�
   // 桌面壁纸顶行的亮蓝线：裁掉壁纸顶部 1px
   assert.ok(css.indexOf('#root .absolute.inset-0.z-0.object-contain{clip-path:inset(1px 0 0 0) !important;}') >= 0,
     '必须有「裁掉壁纸顶部 1px」的规则');
-  // Dock 宽度预留：具体值 + 与取值无关的兜底（都在样式层，元素一出现就是 0）
+});
+
+// Dock 预留清除（T14c 修复轮 14～15）：与上面那张表**分开**，按自动隐藏开关装卸。
+// 语义：藏 Dock 时才撤掉那条预留；Dock 常驻时预留必须留着（否则内容钻到 Dock 底下）。
+test('Dock 预留清除表：开关开着才装，三处预留都在样式层（元素一出现就是 0）', () => {
+  const doc = fakeDom({ readyState: 'complete' });
+  const w = load({ ...SHELL, shell: { dockAutoHide: true } }, doc);
+  const css = doc.adoptedStyleSheets.map((s) => s.cssText).join(String.fromCharCode(10));
   // 注：CSS 文本里类名带转义（`.pl-\[66px\]{…}`），断言用 `\\]` 匹配那一个反斜杠。
   assert.ok(css.includes('66px\\]{padding-left:0 !important;}'),
     '必须有「预留类置 0」的样式层规则');
   assert.ok(css.includes('#root .desktop > [class*="pl-["]{padding-left:0 !important;}'),
     '必须有与取值无关的兜底规则（作用域到 .desktop 的直接子元素）');
+  assert.ok(css.includes('[class*="pl-[280px]"]{padding-left:0 !important;}'),
+    '经典启动台的预留（pl-[280px]）也必须在样式层置 0');
+  assert.ok(css.includes('.box-border.flex.h-full.flex-col.items-center.justify-start.py-\\[64px\\]{padding-left:0 !important;}'),
+    '启动台容器还要一条与取值无关的（按结构锚定，别的 fnOS 版本换数值也命中）');
+  assert.equal(w.__FNOS_SHELL_CSS__.dockReclaim, true);
+});
+
+test('Dock 预留清除表：开关关着（含未给 shell 段）不装，基础表里也没有预留规则', () => {
+  for (const shell of [{}, { shell: {} }, { shell: { dockAutoHide: false } }]) {
+    const doc = fakeDom({ readyState: 'complete' });
+    const w = load({ ...SHELL, ...shell }, doc);
+    const css = doc.adoptedStyleSheets.map((s) => s.cssText).join(String.fromCharCode(10));
+    assert.ok(!css.includes('padding-left:0 !important;}'),
+      '关着时不装预留清除（Dock 常驻，内容该让出宽度）');
+    // 基础表仍然要在（不透明覆盖层 / 蓝线那些与开关无关）
+    assert.ok(css.includes('--semi-color-app-container'), '基础覆盖表必须照装');
+    assert.equal(w.__FNOS_SHELL_CSS__.dockReclaim, false);
+  }
+});
+
+test('Dock 预留清除表：免刷新装卸（装可幂等、卸后列表里真的没有）', () => {
+  const doc = fakeDom({ readyState: 'complete' });
+  const w = load({ ...SHELL, shell: { dockAutoHide: false } }, doc);
+  w.__FNOS_SHELL_CSS__.setDockReclaim(true);
+  assert.equal(w.__FNOS_SHELL_CSS__.dockReclaim, true);
+  const texts = doc.adoptedStyleSheets.map((s) => s.cssText);
+  assert.ok(texts.some((t) => t.includes('[class*="pl-[280px]"]')), '装上后启动台规则必须在');
+  w.__FNOS_SHELL_CSS__.setDockReclaim(true); // 幂等：不得重复装
+  assert.equal(doc.adoptedStyleSheets.filter((s) => s.cssText.includes('pl-[280px]')).length, 1);
+  w.__FNOS_SHELL_CSS__.setDockReclaim(false);
+  assert.equal(w.__FNOS_SHELL_CSS__.dockReclaim, false);
+  assert.ok(!doc.adoptedStyleSheets.some((s) => s.cssText.includes('pl-[280px]')),
+    '卸下后不得残留（否则 Dock 常驻时内容会钻到底下）');
+  // 基础表不受影响（它不在装卸范围内）
+  assert.ok(doc.adoptedStyleSheets.some((s) => s.cssText.includes('--semi-color-app-container')));
 });
 
 test('link 未生效时用 adoptedStyleSheets 补装 CSS', () => {

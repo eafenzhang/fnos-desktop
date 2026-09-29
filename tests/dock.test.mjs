@@ -202,6 +202,26 @@ test('默认关：不装观察器、不监听指针、不注入样式，但 shel
   }
 });
 
+// ---------- 样式层的预留清除：与开关联动 ----------
+
+test('样式层预留清除随开关装卸：接管时装、还原时卸（关掉自动隐藏不得留下清除表）', () => {
+  const doc = fakeDom();
+  const calls = [];
+  doc._win.__FNOS_SHELL_CSS__ = { setDockReclaim: (on) => calls.push(on) };
+  const w = load(doc, { dockAutoHide: true });
+  assert.deepEqual(calls, [true], '接管时必须装上样式层的预留清除表');
+  w.__FNOS_APPLY_SHELL__({ dockAutoHide: false });
+  assert.deepEqual(calls, [true, false], '关掉自动隐藏时必须真的卸下（Dock 常驻，内容该让宽度）');
+  w.__FNOS_APPLY_SHELL__({ dockAutoHide: true });
+  assert.deepEqual(calls, [true, false, true], '再打开时再装回');
+  w.__FNOS_APPLY_SHELL__({ dockAutoHide: true });
+  assert.deepEqual(calls, [true, false, true], '同值幂等：不得重复装卸');
+  // 钩子缺席（旧载荷 / 单测环境）时不得抛错：JS 中和那条兜底仍在
+  const bare = fakeDom();
+  const w2 = load(bare, { dockAutoHide: true });
+  assert.equal(typeof w2.__FNOS_DOCK_STATE__, 'function', '没有 shell-CSS 钩子也要能正常接管');
+});
+
 // ---------- 定位策略 ----------
 
 test('S1：上游根选择器命中（含列表优先、退化取第一个）', () => {

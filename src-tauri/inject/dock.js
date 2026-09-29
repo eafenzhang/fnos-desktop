@@ -43,6 +43,8 @@
  *   初始态   —— 注入载荷 `__FNOS_SHELL__.shell.dockAutoHide`（injector.rs 只发页面消费的键）
  *   免刷新态 —— shim 的 `__FNOS_APPLY_CONFIG__` 收到 `patch.shell` 时转调
  *               `__FNOS_APPLY_SHELL__(patch.shell)`（本文件定义；shim 不解释 shell 键语义）
+ *   样式层   —— 「预留置 0」那张表由 bootstrap 提供装卸口（`__FNOS_SHELL_CSS__`），本文件在
+ *               接管/还原时联动：开关关掉必须把表**真的卸下来**，否则内容会钻到常驻 Dock 底下。
  * 配置侧默认关（`config.rs::ShellConfig::default`），且注入总开关关闭时本文件根本不会被注入。
  */
 (function () {
@@ -392,6 +394,19 @@
     reclaimed = [];
   }
 
+  /**
+   * 样式层那张「预留置 0」表的装卸（bootstrap 提供；本层只做联动，不自己造表）。
+   *
+   * 为什么必须有它：样式表是**常驻**的，自动隐藏关掉时 Dock 常驻、内容本该让它一条宽度，
+   * 表还在就会让内容钻到 Dock 底下。所以开=装、关=卸，与接管/还原严格同步。
+   * `__FNOS_SHELL_CSS__` 不存在（旧载荷 / 单测环境）时静默跳过：JS 中和这条兜底仍在。
+   */
+  function applyDockReclaim(on) {
+    var api = W.__FNOS_SHELL_CSS__;
+    if (!api || typeof api.setDockReclaim !== 'function') return;
+    try { api.setDockReclaim(on); } catch (e) { /* 装/卸失败不致命：JS 中和仍在 */ }
+  }
+
   // ---------- 接管与还原 ----------
 
   /** 释放一个曾接管的元素：class、内联变量、display 全部还原（不留下孤儿状态）。 */
@@ -537,6 +552,7 @@
   }
 
   function install() {
+    applyDockReclaim(true);
     ensureStyle();
     if (!observer && typeof W.MutationObserver === 'function') {
       observer = new W.MutationObserver(scheduleLocate);
@@ -559,6 +575,7 @@
     W.removeEventListener('blur', onHideSignal);
     releaseAll();
     notifyResize(); // 空间还原了，也让窗口管理器重排一次
+    applyDockReclaim(false); // 样式层的预留清除表要真的卸下来（见文件头「开关链路」）
   }
 
   /** set_config 的免刷新入口（shim 的 `__FNOS_APPLY_CONFIG__` 转调；幂等）。 */

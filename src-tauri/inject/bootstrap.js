@@ -121,24 +121,48 @@
     // rgb(38,77,143)，只占 1px）。裁掉壁纸顶部 1px，那条线就没有了；下方由页面底色承接，
     // 视觉无缝。
     '#root .absolute.inset-0.z-0.object-contain' +
-    '{clip-path:inset(1px 0 0 0) !important;}' +
-    // Dock 宽度预留（T14c 修复轮 14）：fnOS 用 Tailwind 自定义值类 `pl-[66px]` 给内容区
-    // 留出 Dock 的宽度。此前只在 JS 里事后中和——fnOS 一旦（悬浮唤出 Dock、经典启动台
-    // 重渲染等时机）重新生成这个容器，就会有一帧带着预留，表现为「左侧空白闪一下」。
-    // 样式层没有这个中间帧：元素一出现就是 0。
-    // 只钉死这个**具体值**的类（66px 就是本机 Dock 宽，见实测），其余取值仍由
-    // `inject/dock.js` 的 `reclaimLayoutPadding` 兜（它按「满尺寸容器 + 预留值落在
-    // 24–200px」判定，覆盖别的 fnOS 版本）。
+    '{clip-path:inset(1px 0 0 0) !important;}';
+
+  /**
+   * Dock 预留清除（T14c 修复轮 14～15）——**单独一张表，按自动隐藏开关装卸**。
+   *
+   * 为什么单独一张：这些规则只在「Dock 平时藏起来」的前提下成立。关掉自动隐藏时 Dock 常驻，
+   * 内容本来就要给它让出那条宽度，把预留置 0 只会让内容钻到 Dock 底下（吃字、点不到）。
+   * 上面那张表（不透明/蓝线）与开关无关，永远装。
+   *
+   * 为什么必须放样式层：fnOS 用 Tailwind 工具类给内容区预留 Dock 宽度，而它的容器会被
+   * **动态重建**（悬浮唤出 Dock、切启动台、经典启动台重渲染等时机）。靠 `inject/dock.js`
+   * 事后中和内联样式，必然慢一个回合——实测经典启动台从左侧滑入时，前 9 帧（约 120ms）
+   * 带着 68px 预留才被中和，用户看到的就是「左侧空白闪一下」。样式层没有这个中间帧：
+   * 元素一出现就是 0。
+   *
+   * 三处预留（都在本机 fnOS 上实测到）：
+   * ① 桌面内容区 `pl-[66px]`（66 = Dock 宽）——具体值一条；
+   * ② 同一条预留的与取值无关兜底：内容区是 `.desktop` 的**直接子元素**（实测
+   *    `#root > div > .desktop > div.relative.box-border.h-full.pl-[66px]`），别的 fnOS
+   *    版本换个数（`pl-[72px]`…）一样命中；作用域只到直接子元素，不会波及应用窗口内部
+   *    那些有意的内边距（它们在更深层级）；
+   * ③ 经典启动台容器 `.box-border.flex.h-full.flex-col.items-center.justify-start.py-[64px]`
+   *    ——fnOS 给的是 `pl-[280px]`，上游 mod 再压到 `calc(54px + .875rem)`（本机实测 68px），
+   *    两者都要置 0；同样给一条取值无关的（按 `pl-[280px]` 这个类名取值）加一条结构式的。
+   *
+   * 别的取值仍由 `inject/dock.js` 的 `reclaimLayoutPadding` 兜底（它按「满尺寸容器 +
+   * 预留值落在 24–200px」判定，覆盖本表没列到的版本差异）。
+   */
+  var DOCK_CSS_ID = 'fnos-shell-dock-reclaim';
+  var DOCK_CSS =
     '.pl-\\[66px\\]' +
     '{padding-left:0 !important;}' +
-    // 同一条预留的**与取值无关**的兜底：内容区容器是 `.desktop` 的**直接子元素**
-    // （实测 `#root > div > .desktop > div.relative.box-border.h-full.pl-[66px]`）。
-    // 万一别的 fnOS 版本/别的启动台样式用的是另一个数值（`pl-[72px]`…），这条一样命中；
-    // 作用域只到 `.desktop` 的直接子元素，**不会**波及应用窗口内部那些有意的
-    // Tailwind 内边距（它们在更深的层级）。
     '#root .desktop > [class*="pl-["]' +
+    '{padding-left:0 !important;}' +
+    '[class*="pl-[280px]"]' +
+    '{padding-left:0 !important;}' +
+    '.box-border.flex.h-full.flex-col.items-center.justify-start.py-\\[64px\\]' +
     '{padding-left:0 !important;}';
   var shellCssInstalled = false;
+  var dockCssInstalled = false;
+  var dockCssSheet = null; // adopted 路径下的表引用（卸下时要从列表里摘掉）
+  var dockCssEl = null;    // <style> 路径下的元素引用
 
   function installShellCss() {
     if (shellCssInstalled) return;
@@ -168,6 +192,66 @@
     } catch (e) {
       state.shellCss = 'failed'; // 装不上不静默：状态里留痕（排障用）
     }
+  }
+
+  /** 装 Dock 预留清除表（幂等；与上游 CSS 兜底同一条路：优先可构造样式表）。 */
+  function installDockCss() {
+    if (dockCssInstalled) return;
+    if (D.adoptedStyleSheets && typeof CSSStyleSheet === 'function') {
+      try {
+        var sheet = new CSSStyleSheet();
+        sheet.replaceSync(DOCK_CSS);
+        D.adoptedStyleSheets = D.adoptedStyleSheets.concat([sheet]);
+        dockCssSheet = sheet;
+        dockCssInstalled = true;
+        state.dockCss = 'adopted';
+        return;
+      } catch (e) { /* 落到 <style> */ }
+    }
+    if (D.getElementById(DOCK_CSS_ID)) {
+      dockCssInstalled = true;
+      state.dockCss = 'style';
+      return;
+    }
+    try {
+      var el = D.createElement('style');
+      el.id = DOCK_CSS_ID;
+      el.textContent = DOCK_CSS;
+      (D.head || D.documentElement).appendChild(el);
+      dockCssEl = el;
+      dockCssInstalled = true;
+      state.dockCss = 'style';
+    } catch (e) {
+      state.dockCss = 'failed';
+    }
+  }
+
+  /** 卸下 Dock 预留清除表（关掉自动隐藏时必须真的卸，否则内容钻到底下）。 */
+  function removeDockCss() {
+    if (!dockCssInstalled) return;
+    if (dockCssSheet && D.adoptedStyleSheets) {
+      try {
+        D.adoptedStyleSheets = Array.prototype.filter.call(D.adoptedStyleSheets, function (s) {
+          return s !== dockCssSheet;
+        });
+      } catch (e) { /* 列表不可写就算了：下面还有 <style> 路径要清 */ }
+    }
+    try {
+      if (dockCssEl && dockCssEl.parentNode) dockCssEl.parentNode.removeChild(dockCssEl);
+    } catch (e) { /* 元素没了就算了 */ }
+    dockCssSheet = null;
+    dockCssEl = null;
+    dockCssInstalled = false;
+    state.dockCss = 'off';
+  }
+
+  /**
+   * 开关入口（`inject/dock.js` 在接管/还原时调用；幂等）。语义就是「Dock 是否平时藏起来」：
+   * 藏 → 那条预留要一起撤掉；不藏 → 预留留着（Dock 常驻，内容该让宽度）。
+   */
+  function setDockReclaim(on) {
+    if (on) installDockCss();
+    else removeDockCss();
   }
 
   /* 执行 mod.js 原文。优先用 Function 显式绑定当前 window/document：
@@ -275,8 +359,16 @@
     ensureModJs: ensureModJs
   };
 
+  /** 给 `inject/dock.js` 用的开关口（见 setDockReclaim；状态可读，排障用）。 */
+  W.__FNOS_SHELL_CSS__ = {
+    setDockReclaim: setDockReclaim,
+    get dockReclaim() { return dockCssInstalled; }
+  };
+
   function afterLoad() {
     installShellCss();
+    // Dock 预留清除：按注入载荷里的开关定初值（`dock.js` 之后会用同一值再确认一次）
+    setDockReclaim(!!(SHELL.shell && SHELL.shell.dockAutoHide === true));
     cssSelfCheck();
     watchModScript();
     setTimeout(cssSelfCheck, CSS_RECHECK_DELAY);
