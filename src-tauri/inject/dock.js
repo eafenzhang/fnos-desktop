@@ -1,21 +1,30 @@
 /* fnOS Desktop Shell — Dock 自动隐藏（T14c，本壳自己的页面功能，不是上游 mod）
  *
  * 做什么：把 fnOS WebUI 的 Dock（任务栏）平时滑出屏幕边缘，鼠标顶到它所在的边缘时滑回。
- * 策略（上游类名策略）：Dock 根元素与列表的定位选择器**逐字取自上游 mod.js**
- * （`TASKBAR_ROOT_SELECTOR` / `TASKBAR_LIST_SELECTOR`，见 `setupTaskbarItemAnimations` 与
- * `resolveTaskbarNodes`）——上游已经替我们确认过「这个类名组合就是 Dock」，本壳不自己
- * 发明选择器、也不改上游节点的任何内容，只在自己的命名空间里加两个 class
- * （`fnos-shell-dock-autohide` / `fnos-shell-dock-hidden`）。
+ *
+ * 定位（多策略，全部锚定上游已知特征；T14c 修复轮 4 起策略化——上游的根选择器在部分
+ * fnOS 版本上匹配 0 个元素，实测反馈见诊断角标）：
+ *   S1 上游类名策略   —— 逐字复用上游 mod.js 的 TASKBAR_ROOT_SELECTOR（+ TASKBAR_LIST_SELECTOR
+ *                        验证），命中即用；这是与上游行为完全一致的首选路径。
+ *   S2 上游任务栏项策略 —— 用上游的 TASKBAR_ITEM_SELECTOR 找到任务栏图标项，沿祖先向上爬到
+ *                        最外层「Dock 形状」的容器（窄长条）。图标项与上游 isTaskbarAppItem
+ *                        同源，所以爬出来的就是上游认定的任务栏所在。
+ *   S3 贴边容器策略   —— Tailwind `.fixed` 元素里，贴屏幕边缘 + Dock 形状（窄长条）+
+ *                        含 ≥3 个图标（img/svg）的容器。
+ *   S4 全量扫描策略   —— S3 失败后的兜底：扫描 `body *` 的计算样式 position:fixed
+ *                        （贵，只在需要时做一次；locate 本就有 150ms 合并窗）。
+ *   全部失败          —— 左下角诊断角标报告每种策略的计数（绝不静默失效）；登录页
+ *                        （存在密码输入框）不弹诊断——那里本来就没有 Dock。
  *
  * 显隐规则（T14c 修复轮 3 定稿）：
  *   唤出   —— 指针顶到 Dock 所在的屏幕边缘热区（EDGE_PX）。**不是**「进入 Dock 的脚印」：
  *            藏在 Dock 底下的应用按钮就在那条带里，一靠近就唤出会把要点的按钮盖住。
  *   保持   —— 唤出后指针留在 Dock 脚印（自身尺寸 + 余量）内就一直显示，离开即藏（迟滞）。
  *   藏起   —— 指针离开脚印 / 离开窗口 / 窗口失焦 / **无操作超过 IDLE_MS** / 接管时。
- *            「无操作也藏」是硬需求：指针进入 iframe（fnOS 的应用窗口）之后，顶层文档
- *            收不到 pointermove——纯事件驱动的显隐会卡在「显示」，表现为「放着不动它不藏」。
+ *            指针进入 iframe（fnOS 的应用窗口）之后顶层文档收不到 pointermove——纯事件
+ *            驱动的显隐会卡在「显示」，所以必须有 idle 兜底。
  *   离场   —— 滑出动画结束后 `display:none`：transform 藏得住视觉，藏不住按 rect 做的
- *            工作区计算（全屏应用给 Dock 让出的那条宽度）与命中测试的旧读数。
+ *            工作区计算（全屏应用给 Dock 让出的那条宽度）。
  *
  * 开关链路：
  *   初始态   —— 注入载荷 `__FNOS_SHELL__.shell.dockAutoHide`（injector.rs 只发页面消费的键）
@@ -29,15 +38,15 @@
   var SHELL = W.__FNOS_SHELL__ || {};
   var SHELL_CFG = SHELL.shell || {};
 
-  // 逐字 = 上游 mod.js 的 TASKBAR_ROOT_SELECTOR。改这里必须连上游那份一起核对，
-  // tests/dock.test.mjs 会把两边源码里的这条选择器逐字比对。
+  // 以下三条选择器**逐字取自上游 mod.js**（TASKBAR_ROOT_SELECTOR / TASKBAR_ITEM_SELECTOR /
+  // TASKBAR_LIST_SELECTOR）。改这里必须连上游那份一起核对，tests/dock.test.mjs 会把两边
+  // 源码逐字比对。
   var DOCK_ROOT_SELECTOR = '.h-screen.fixed.left-0';
-  // 逐字 = 上游 mod.js 的 TASKBAR_LIST_SELECTOR。上游的 resolveTaskbarNodes（mod.js:1222-1229）
-  // 用「根节点里能找到这条列表」确认找对了元素——本壳镜像同一条验证：页面上可能有多个
-  // `.h-screen.fixed.left-0` 容器，querySelector 取第一个可能拿错，接管一个空容器的表现
-  // 恰好就是「开了开关什么都没发生」（T14c 修复轮 2）。
+  var DOCK_ITEM_SELECTOR =
+    '.flex.h-10.w-\\[47px\\].items-center.justify-center.gap-x-2.border-0.\\!border-l-\\[3px\\].border-solid.border-transparent.hover\\:bg-white-10';
   var DOCK_LIST_SELECTOR =
     '.scrollbar-hidden.absolute.inset-0.flex.flex-col.items-end.justify-start.gap-2.overflow-y-auto.pt-2';
+
   var HOST_CLASS = 'fnos-shell-dock-autohide';   // 常驻：宣告「本壳在管这个元素」
   var HIDDEN_CLASS = 'fnos-shell-dock-hidden';   // 状态：滑出屏幕（随后 display:none 离场）
   var STYLE_ID = 'fnos-shell-dock-style';
@@ -48,6 +57,7 @@
   var IDLE_MS = 3000;        // 「无操作」判定：这么久没有任何指针事件就藏
   var DIAG_DELAY_MS = 5000;  // 开启后这么久还没找到 Dock → 页面角标给出诊断（不静默失效）
   var TOAST_MS = 2600;       // 接管成功的提示停留时长
+  var DOCK_SIDE_MAX = 140;   // 「Dock 形状」的窄边上限 / 长边下限（像素）
 
   var enabled = SHELL_CFG.dockAutoHide === true;
   var dock = null;       // 当前接管的 Dock 元素（可能被 SPA 换掉，observer 会重新找）
@@ -61,6 +71,7 @@
   var diagTimer = null;  // 「还没找到 Dock」诊断角标的定时器
   var toastTimer = null; // 成功提示的定时器
   var greeted = false;   // 成功提示每次页面加载只出一次
+  var lastMiss = '';     // 最近一次「全部策略落空」的计数快照（诊断角标用）
 
   var CSS =
     '.' + HOST_CLASS + '{transition:transform .28s cubic-bezier(.4,0,.2,1);}' +
@@ -94,12 +105,28 @@
     (D.head || D.documentElement).appendChild(el);
   }
 
-  /**
-   * 上游同款验证：候选根里能找到任务栏列表的才算数（`resolveTaskbarNodes` 的镜像）。
-   * 列表还没渲染出来时退回第一个候选——上游同样容忍 `list: null`，observer 会在列表
-   * 出现后重新定位。
-   */
-  function findDock() {
+  /** 元素像不像 Dock 容器：窄长条（竖条：宽 ≤140 且高 ≥140；横条：高 ≤140 且宽 ≥140）。 */
+  function dockShaped(el) {
+    var w = el.offsetWidth || 0;
+    var h = el.offsetHeight || 0;
+    if (!(w > 0 && h > 0)) return false;
+    return (w <= DOCK_SIDE_MAX && h >= DOCK_SIDE_MAX) || (h <= DOCK_SIDE_MAX && w >= DOCK_SIDE_MAX);
+  }
+
+  /** 容器里图标（img/svg）够多才算 Dock：≥3 个。系统悬浮窗（如资源监控）没有这么多。 */
+  function iconRich(el) {
+    try { return el.querySelectorAll('img,svg').length >= 3; } catch (e) { return false; }
+  }
+
+  /** 本壳自己的元素（诊断角标等）绝不能被当成 Dock。 */
+  function isOwnEl(el) {
+    return !!(el && el.id && String(el.id).indexOf('fnos-shell') === 0);
+  }
+
+  // ---------- 多策略定位（S1 → S2 → S3 → S4；全部落空时把计数写进 lastMiss） ----------
+
+  /** S1：上游根选择器。含任务栏列表的候选优先（resolveTaskbarNodes 的镜像），退化取第一个。 */
+  function s1UpstreamRoot() {
     var candidates;
     try { candidates = D.querySelectorAll(DOCK_ROOT_SELECTOR); } catch (e) { return null; }
     if (!candidates || !candidates.length) return null;
@@ -111,6 +138,88 @@
       } catch (e) { /* 选择器异常按无列表处理 */ }
     }
     return fallback;
+  }
+
+  /** S2：上游任务栏项 → 沿祖先向上爬到最外层「Dock 形状」的容器。 */
+  function s2FromItems() {
+    var items;
+    try { items = D.querySelectorAll(DOCK_ITEM_SELECTOR); } catch (e) { return null; }
+    if (!items || !items.length) return null;
+    for (var i = 0; i < items.length; i++) {
+      // 从图标项的**父层**开始爬（图标项本身 47×40，不是「Dock 形状」）
+      var cur = items[i].parentElement;
+      var best = null;
+      for (var depth = 0; cur && depth < 10; depth++) {
+        if (!dockShaped(cur)) break;
+        best = cur;
+        cur = cur.parentElement;
+      }
+      // 爬到了至少一层 shaped 容器才算「找到了 Dock 所在」
+      if (best) return best;
+    }
+    return null;
+  }
+
+  /** S3/S4：贴屏幕边缘 + Dock 形状 + 图标丰富的固定定位容器。`deep` = 全量计算样式扫描。 */
+  function s3FixedNearEdge(deep) {
+    var nodes;
+    try { nodes = deep ? D.querySelectorAll('body *') : D.querySelectorAll('.fixed'); } catch (e) { return null; }
+    if (!nodes || !nodes.length) return null;
+    var vw = W.innerWidth || 0;
+    var vh = W.innerHeight || 0;
+    var limit = deep ? 2000 : nodes.length; // 全量扫描设上限，避免超大页面卡顿
+    for (var i = 0; i < nodes.length && i < limit; i++) {
+      var el = nodes[i];
+      if (isOwnEl(el)) continue;
+      if (deep) {
+        var cs = null;
+        try { cs = W.getComputedStyle ? W.getComputedStyle(el) : null; } catch (e) { /* 忽略 */ }
+        if (!cs || cs.position !== 'fixed') continue;
+      }
+      var r;
+      try { r = el.getBoundingClientRect(); } catch (e) { continue; }
+      if (!(r.width > 0 && r.height > 0)) continue;
+      var vertical = r.width <= DOCK_SIDE_MAX && r.height >= DOCK_SIDE_MAX;
+      var horizontal = r.height <= DOCK_SIDE_MAX && r.width >= DOCK_SIDE_MAX;
+      if (!vertical && !horizontal) continue;
+      var nearEdge = (vertical && (r.left <= 80 || (vw && r.right >= vw - 80)))
+        || (horizontal && (r.top <= 80 || (vh && r.bottom >= vh - 80)));
+      if (!nearEdge) continue;
+      if (!iconRich(el)) continue;
+      return el;
+    }
+    return null;
+  }
+
+  var STRATEGIES = [
+    ['S1 上游根选择器', function () { return s1UpstreamRoot(); }],
+    ['S2 任务栏项爬升', function () { return s2FromItems(); }],
+    ['S3 贴边固定容器', function () { return s3FixedNearEdge(false); }],
+    ['S4 全量扫描', function () { return s3FixedNearEdge(true); }]
+  ];
+
+  /** 依序尝试所有策略；返回找到的元素，全部落空时把各策略计数写进 `lastMiss`。 */
+  function findDock() {
+    var counts = [];
+    for (var i = 0; i < STRATEGIES.length; i++) {
+      var el = null;
+      try { el = STRATEGIES[i][1](); } catch (e) { el = null; }
+      if (el && !isOwnEl(el)) {
+        lastMiss = ''; // 找到了：旧的落空计数不再有诊断意义
+        return el;
+      }
+      // 记录该策略的候选规模（诊断用）：前两条是选择器匹配数，后两条是扫描节点数
+      var n = 0;
+      try {
+        if (i === 0) n = D.querySelectorAll(DOCK_ROOT_SELECTOR).length;
+        else if (i === 1) n = D.querySelectorAll(DOCK_ITEM_SELECTOR).length;
+        else if (i === 2) n = D.querySelectorAll('.fixed').length;
+        else n = -1;
+      } catch (e) { /* 保持 0 */ }
+      counts.push(STRATEGIES[i][0] + ' ' + (i === 3 ? '未执行/未命中' : n));
+    }
+    lastMiss = counts.join('；');
+    return null;
   }
 
   /**
@@ -214,17 +323,20 @@
     }, TOAST_MS);
   }
 
-  /** 开启后一段时间还没找到 Dock → 常驻诊断角标（选择器失明时绝不悄悄躺平）。 */
+  /**
+   * 开启后一段时间还没找到 Dock → 诊断角标（选择器失明时绝不悄悄躺平）。
+   * 登录页本来就没有 Dock（用户实测反馈）：页面里有密码输入框时静默顺延，不误报。
+   */
   function scheduleDiag() {
     if (diagTimer) W.clearTimeout(diagTimer);
     diagTimer = W.setTimeout(function () {
       diagTimer = null;
       if (!enabled || dock) return; // 已接管 / 已关闭：不需要诊断
-      var count = 0;
-      try { count = D.querySelectorAll(DOCK_ROOT_SELECTOR).length; } catch (e) { /* 保持 0 */ }
-      badge('fnOS壳·Dock自动隐藏：开启 ' + Math.round(DIAG_DELAY_MS / 1000) + ' 秒仍未找到 Dock 元素（'
-        + DOCK_ROOT_SELECTOR + ' 匹配 ' + count + ' 个）。找到后本提示自动消失；若持续显示，请截图反馈。',
-        true);
+      var onLogin = false;
+      try { onLogin = !!D.querySelector('input[type="password"]'); } catch (e) { /* 按「不在登录页」处理 */ }
+      if (onLogin) { scheduleDiag(); return; } // 登录页没有 Dock：静默等登录后再判
+      badge('fnOS壳·Dock自动隐藏：仍未找到 Dock 元素。各策略计数——' + lastMiss
+        + '。找到后本提示自动消失；若登录后仍持续显示，请截图反馈。', true);
     }, DIAG_DELAY_MS);
   }
 
@@ -244,7 +356,7 @@
       try { hovered = dock.matches(':hover'); } catch (e) { /* 老内核不支持就照藏 */ }
       if (hovered) shown = true;
       renderState();
-      greet();          // 找到了：失败诊断（若有）被成功提示就地替换，随后自动消失
+      greet(); // 找到了：失败诊断（若有）被成功提示就地替换，随后自动消失
     }
   }
 
@@ -330,7 +442,10 @@
 
   /** 诊断口：控制台里 `__FNOS_DOCK_STATE__()` 即可看到接管状态（不携带任何页面数据）。 */
   W.__FNOS_DOCK_STATE__ = function () {
-    return { enabled: enabled, found: !!dock, axis: axis, edgeMin: edgeMin, shown: shown };
+    return {
+      enabled: enabled, found: !!dock, axis: axis, edgeMin: edgeMin, shown: shown,
+      lastMiss: lastMiss,
+    };
   };
 
   if (enabled) install();
