@@ -1,11 +1,12 @@
 /* 设置窗样式（spec §8.1，Task 14b 起）。
  *
- * 布局是三块：
+ * 布局是三段（T14c 修复轮起为单列）：
  *   1. 顶部状态条（Task 11 / §12.3，占满整宽）；
- *   2. 左侧：上游 popup UI（`ui/settings/popup.html`，装在一个 372×522 的 iframe 里
+ *   2. 中间：上游 popup UI（`ui/settings/popup.html`，装在一个 372×522 的 iframe 里
  *      ——那正是上游 popup 自己写死的 body 尺寸，见 popup.html:44-51）。上游自带整套
  *      样式，本表**不碰** iframe 里的任何东西；
- *   3. 右侧：本壳自己的区域（外壳开关 + 关于/合规），可独立滚动。
+ *   3. 底部：本壳自己的区域（外壳开关 + 关于/合规），占满剩余高度、独立滚动。
+ *      （右侧栏已删——本壳区域从「旁边一列」改为「下面一段」；上游界面水平居中。）
  *
  * 零依赖、零构建链；所有控件都用原生元素，便于 WebView2 的无障碍树暴露
  *（运行时验证就是用 UIA / CDP 读这些元素来断言的）。 */
@@ -35,10 +36,11 @@ body {
 .status button { flex: 0 0 auto; padding: 3px 10px; font-size: 12px; }
 .status button[disabled] { opacity: .5; cursor: default; }
 
-/* 左右两栏：左边是上游界面（固定宽），右边是本壳的补充区域（自己滚动）。 */
-.shell { flex: 1 1 auto; display: flex; gap: 12px; min-height: 0; padding: 12px; }
+/* 单列：上游界面居中（固定宽），本壳区域是其下面的一段（占满剩余高度、自己滚动）。 */
+.shell { flex: 0 0 auto; display: flex; justify-content: center; gap: 12px; padding: 12px; }
 .upstream { flex: 0 0 auto; display: flex; flex-direction: column; min-height: 0; }
-.shell-side { flex: 1 1 auto; min-width: 0; overflow: auto; }
+.below { flex: 1 1 auto; min-height: 0; overflow: auto; padding: 0 12px 12px;
+         display: flex; flex-direction: column; gap: 12px; }
 
 /* iframe 的宿主：上游 popup 的 body 是 372×522（popup.html:44-51），
    所以这里给同样的内尺寸，让上游按它自己设计的样子渲染，不做任何缩放。

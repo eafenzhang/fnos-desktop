@@ -155,13 +155,17 @@ cargo tauri build --bundles nsis
   | `tabs.create` / `action.*` | `open_url`（系统默认浏览器）/ 空操作 |
   | 更新检查（`fetch` GitHub API） | **不发任何网络请求**：返回一份合成应答，sha 就是本壳内置的 vendored commit，于是上游自己算出「已记录当前最新提交 / 暂无更新」 |
 
-- 本壳只额外提供三块自己的区域（**不覆盖上游任何一个节点**）：顶部的**状态条**（Task 11/13a 的
-  诚实判定）、**外壳开关**（`shell.injectEnabled` 注入总开关、`shell.dockAutoHide` Dock 自动隐藏
-  （T14c，默认关；`inject/dock.js` 用上游 mod.js 的任务栏选择器找到 Dock 后加本壳自己的 class，
-  免刷新即时生效）与 `shell.nasUrl`——上游是「扩展」，它假设注入总开永远是开、也没有 NAS 地址
-  这个概念，而这些键在本壳里有真实语义；托盘精简后注入总开关只剩这一个入口）、以及**关于/合规**
-  页（版本 / mods commit / mods 版本 / WebView2 版本 / 配置路径 / 随包 LICENSE+NOTICE 路径 /
-  非官方与非商业声明 / 上游链接）。
+- 本壳自己的区域（**不覆盖上游任何一个节点**，T14c 修复轮起为**单列布局**：上游界面居中，
+  本壳内容全部在下方）：
+  - **注入进上游界面的「自动隐藏 Dock（本壳）」行**（T14c）：由 chrome-shim 用上游自己的
+    行样式（`.row`/`.switch`）插在「为当前站点注入」之后，带 `dataset.fnosShell` 诚实标注；
+    切换写 `set_config`，宿主免刷新推给主窗口的 `inject/dock.js`（默认关；用上游 mod.js 的
+    任务栏选择器找到 Dock 后加本壳自己的 class，开启后立即隐藏，鼠标移近所在边缘滑回）。
+  - 顶部的**状态条**（Task 11/13a 的诚实判定）。
+  - 底部的**外壳卡**（`shell.injectEnabled` 注入总开关与 `shell.nasUrl`——上游是「扩展」，
+    它假设注入总开永远是开、也没有 NAS 地址这个概念，而这两个键在本壳里有真实语义）。
+  - 底部的**关于/合规**页（版本 / mods commit / mods 版本 / WebView2 版本 / 配置路径 /
+    随包 LICENSE+NOTICE 路径 / 非官方与非商业声明 / 上游链接）。
 - 上游 UI 装在一个 372×522 的 iframe 里（那正是上游 popup 自己写死的 body 尺寸），因此它的样式
   与本壳的区域互不影响。帧在**配置快照就位之后**才创建——上游在脚本开头就同步读版本号。
 - 上游 UI 里没有、也不该有的东西，本壳不会假装有：字体文件导入被如实拒绝（见「已知限制」），

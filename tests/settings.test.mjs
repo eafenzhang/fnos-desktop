@@ -476,16 +476,26 @@ test('H: 退休的分组 UI 不得留下任何可达引用（settings.html / app
   assert.ok(html.includes('id="status"'), 'settings.html 必须保留状态条');
 });
 
-test('T14c: Dock 自动隐藏的开关入口在外壳区（渲染、禁用与提交形状）', () => {
+test('T14c: Dock 自动隐藏的开关入口在上游界面里（chrome-shim 注入，右侧外壳栏已删）', () => {
   const app = readFileSync(new URL('../ui/settings/app.js', import.meta.url), 'utf8');
-  // 渲染：checkbox + 标注 id；注入关闭时必须 disabled（页面上没有 dock.js，勾了也是谎报）
-  assert.ok(app.includes("f_shell_dockAutoHide"), '必须有 Dock 开关的元素 id');
-  assert.ok(app.includes("dock.disabled = !injected"), '注入关闭时开关必须不可用');
-  assert.ok(app.includes("commitShell('dockAutoHide'"), '必须经 commitShell 走 set_config');
-  // 渲染键必须含 dockAutoHide（值没变不重建的闸门要认得这个键）
-  assert.ok(app.includes('dockAutoHide, nasUrl: nasValue'), 'renderKey 必须包含 dockAutoHide');
-  // 提交形状表：布尔键统一 !!（不得把字符串发进 set_config）
-  assert.ok(app.includes('dockAutoHide: (v) => !!v'), 'SHELL_KEYS 必须登记 dockAutoHide');
+  const shim = readFileSync(new URL('../ui/settings/chrome-shim.js', import.meta.url), 'utf8');
+  const html = readFileSync(new URL('../ui/settings/settings.html', import.meta.url), 'utf8');
+  // 旧入口必须真正退场：右侧栏删了，app.js 不得残留 dock 开关的任何痕迹
+  assert.ok(!app.includes('f_shell_dockAutoHide'), 'app.js 不得再有旧外壳区的 Dock 开关');
+  assert.ok(!app.includes("commitShell('dockAutoHide'"), 'app.js 不得再经 commitShell 提交 dockAutoHide');
+  assert.ok(!html.includes('shell-side'), 'settings.html 不得再有右侧栏');
+  // 新入口在上游界面里：同款行样式 + 诚实标注 + 幂等
+  assert.ok(shim.includes("id = 'fnosShellDockToggle'"), '必须有本壳命名空间的开关 id');
+  assert.ok(shim.includes("getElementById('siteToggle')"), '必须锚定上游的「为当前站点注入」行');
+  assert.ok(shim.includes("closest('.row')"), '插入点必须是上游的 .row');
+  assert.ok(shim.includes("dataset.fnosShell = '1'"), '注入的行必须带本壳标记（诚实边界）');
+  assert.ok(shim.includes("'自动隐藏 Dock（本壳）'"), '行文字必须标注「本壳」');
+  assert.ok(shim.includes("getElementById('fnosShellDockToggle')"), '幂等闸门必须存在');
+  // 数据通路：初始态读父 frame 的配置快照，切换写 set_config（宿主免刷新推给主窗口）
+  assert.ok(shim.includes('configNow().shell'), '初始态必须读配置快照');
+  assert.ok(shim.includes("callHost('set_config', { patch: { shell: { dockAutoHide: !!input.checked } } })"),
+    '切换必须经 set_config 的 shell patch');
+  assert.ok(shim.includes('input.checked = !input.checked'), '写失败必须回滚开关状态（不假装保存成功）');
 });
 
 test('H: 新增的三个 IPC 命令在桥里的名字/参数形状与 Rust 侧一致', async () => {

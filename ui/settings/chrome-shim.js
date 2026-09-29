@@ -785,6 +785,61 @@
     return !!window.chrome && !!window.chrome.storage && !!window.chrome.storage.sync;
   }
 
+  // ---------- 本壳的设置行：Dock 自动隐藏（T14c；本壳功能，不是上游设置） ----------
+
+  /**
+   * 在上游「为当前站点注入」那一行后面插一行**同款样式**的开关（`.row` / `.label` /
+   * `.switch` / `.slider` 全部用上游自己的类，本层不写一行上游 CSS）。
+   *
+   * 为什么放在上游界面里（T14c 修复轮，用户要求）：设置窗右侧的外壳卡已删除，本壳功能
+   * 唯一还该出现的位置就是上游界面里一个诚实标注的行——`dataset.fnosShell` 与文字里的
+   * 「本壳」就是那条诚实边界。数据通路与上游自己的行一致地走宿主：初始态读
+   * `configNow().shell.dockAutoHide`（父 frame 的配置快照，帧创建前已就位），切换写
+   * `set_config`（宿主会免刷新推给主窗口的 dock.js）。
+   */
+  function injectDockRow() {
+    if (document.getElementById('fnosShellDockToggle')) return; // 幂等闸门
+    const siteInput = document.getElementById('siteToggle');
+    const siteRow = siteInput ? siteInput.closest('.row') : null;
+    if (!siteRow) {
+      notice('没能找到上游的「为当前站点注入」行，Dock 自动隐藏开关没有注入（本壳不改上游其余布局）。');
+      return;
+    }
+
+    const row = document.createElement('div');
+    row.className = 'row';
+    row.dataset.fnosShell = '1';
+    const label = document.createElement('div');
+    label.className = 'label';
+    label.textContent = '自动隐藏 Dock（本壳）';
+    const sw = document.createElement('label');
+    sw.className = 'switch';
+    const input = document.createElement('input');
+    input.type = 'checkbox';
+    input.id = 'fnosShellDockToggle';
+    const slider = document.createElement('span');
+    slider.className = 'slider';
+    sw.append(input, slider);
+    row.append(label, sw);
+
+    const shell = configNow().shell;
+    input.checked = !!(shell && typeof shell === 'object' && shell.dockAutoHide === true);
+    input.addEventListener('change', async () => {
+      try {
+        const result = await afterConfigWrite(
+          await callHost('set_config', { patch: { shell: { dockAutoHide: !!input.checked } } })
+        );
+        // 回包是权威值（Rust 归一化后）；以它回填，绝不假设写入一定成功
+        const next = result && result.config && result.config.shell;
+        input.checked = !!(next && next.dockAutoHide === true);
+      } catch (error) {
+        input.checked = !input.checked; // 写失败：回滚到切换前的状态，绝不假装保存成功
+        notice(`Dock 自动隐藏保存失败：${String((error && error.message) || error)}`);
+      }
+    });
+    siteRow.parentNode.insertBefore(row, siteRow.nextSibling);
+  }
+
   installFetchGuard();
   const installed = installChrome(chromeApi);
 
@@ -798,4 +853,6 @@
 
   // 说明框要在 popup.js 之前就准备好（它是 append 到 body 末尾的，不挡任何控件）。
   notice('');
+  // 本壳设置行：脚本在 body 末尾加载，上游的静态行（#siteToggle 所在 .row）此时已解析。
+  injectDockRow();
 })();
