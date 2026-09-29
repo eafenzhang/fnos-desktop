@@ -103,3 +103,29 @@ button {
 button:hover { background: #34383e; }
 button.danger { border-color: #ff453a66; color: #ff6961; }
 .card button + button { margin-left: 8px; }
+
+/* ---------- Task 13b：应用项逐项列表（appList）与登录壁纸（imageFile） ---------- */
+
+/* 应用项列表：可滚动，避免几十个应用把整页撑长（键与标题都可能很长，一律省略号截断） */
+.app-list { flex: 1 1 420px; min-width: 0; max-height: 340px; overflow: auto; }
+.app-item {
+  display: flex; gap: 10px; align-items: center; padding: 3px 0;
+  border-bottom: 1px solid var(--line);
+}
+.app-item:last-of-type { border-bottom: none; }
+.app-item select { flex: 0 0 auto; }
+.app-title {
+  flex: 0 0 160px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.app-key {
+  flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  color: var(--dim); font-size: 12px;
+}
+.app-actions { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-top: 8px; }
+
+/* 登录壁纸：文件输入 + 清除 + 当前值（当前值用 textContent 画，绝不 innerHTML） */
+.file-box { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.file-box input[type=file] {
+  color: #c8ccd1; background: #1f2124; border: 1px solid var(--line);
+  border-radius: 6px; padding: 5px 8px; max-width: 420px;
+}

@@ -51,11 +51,37 @@ export function openUrl(url) { return invoke('open_url', { url }); }
  */
 export function getPageState() { return invoke('get_page_state'); }
 /**
- * 最近一次页面上报（Task 13a）：`get_page_report` 同样是**只读**、同样只授设置窗。
+ * 页面上报（Task 13a 的状态证据 + Task 13b 的应用项列表）：`get_page_report` 同样是**只读**、
+ * 同样只授设置窗。
  *
- * 上报本身**不走 IPC**：shim 写 `document.title`（`FNOSREPORT:` 前缀），Rust 的
- * `on_document_title_changed` 校验后存内存。所以本命令是「读取口」，不是「上报口」——
+ * 上报本身**不走 IPC**：shim 写 `document.title`（`FNOSREPORT:` 单条 / `FNOSCHUNK:` 分片），
+ * Rust 的 `on_document_title_changed` 校验后存内存。所以本命令是「读取口」，不是「上报口」——
  * 页面上没有任何命令可调，capability 集合里也没有任何 `remote` 块。
- * 返回 `null` 表示没有可用上报（还没上报 / 上报被拒 / 换页面后旧上报已作废）。
+ *
+ * 返回体是**信封**（Task 13b 起）：
+ *
+ * ```json
+ * { "report": <最近一条状态相关上报 | null>, "appItems": <最近一条应用项列表上报 | null> }
+ * ```
+ *
+ * 两个槽位各自独立地受文档身份门约束（origin + 文档 URL 都对得上才返回，否则清掉并给
+ * `null`）——「还没上报 / 被拒 / 换页面后作废」都表现为对应的 `null`。拆两个槽位的理由
+ * （避免 T13a 的状态条强态被 T13b 主动拉取的列表上报冲掉）见
+ * `src-tauri/src/report.rs::is_app_items_report`；设置窗侧的解读见
+ * `ui/settings/app.js::reportSlots`。
  */
 export function getPageReport() { return invoke('get_page_report'); }
+
+/**
+ * 导入登录壁纸（Task 13b）：设置窗自己写不了文件，由宿主校验并写进配置目录。
+ *
+ * 参数形状：tauri 的命令参数默认按 **camelCase** 从 JS 取值
+ * （`tauri-macros-2.7.0/src/command/wrapper.rs` 的 `ArgumentCase::Camel`，是默认值），
+ * 所以 Rust 侧的 `data_base64` 在这里必须写成 `dataBase64`。
+ *
+ * 返回的是宿主**落盘用的文件名**（净化 + 内容指纹），调用方再走 `set_config` 写
+ * `local.loginWallpaperFileName`——导入与配置是两步，但都由设置窗发起（见 app.js）。
+ */
+export function importWallpaper(name, dataBase64) {
+  return invoke('import_wallpaper', { name, dataBase64 });
+}

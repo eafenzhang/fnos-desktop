@@ -8,7 +8,8 @@
 /// 因此必须在这里逐一列出 IPC 命令（与 `main.rs` 的 `invoke_handler` 逐字一致）。
 /// 漏一个的表现是**构建失败**（不是运行期 ACL 拒绝）——`open_url` 就是踩过这个坑之后
 /// 加进来的第 6 条，Task 11 的状态条数据源 `get_page_state` 是第 7 条，
-/// Task 13a 的页面上报读取口 `get_page_report` 是第 8 条（只授设置窗、并进 remote-deny）。
+/// Task 13a 的页面上报读取口 `get_page_report` 是第 8 条，Task 13b 的登录壁纸导入
+/// `import_wallpaper` 是第 9 条（**唯一会写文件的命令**；只授设置窗、并进 remote-deny）。
 fn main() {
     tauri_build::try_build(tauri_build::Attributes::new().app_manifest(
         tauri_build::AppManifest::new().commands(&[
@@ -20,6 +21,7 @@ fn main() {
             "reset_config",
             "get_page_state",
             "get_page_report",
+            "import_wallpaper",
         ]),
     ))
     .expect("failed to run tauri-build");

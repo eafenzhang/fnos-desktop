@@ -1,9 +1,17 @@
 //! 纯函数：把配置与 vendored 资源拼成一段 initialization_script。
-//! 不读文件、不碰 Tauri API —— 便于单测与快照锁定。
+//! 不碰 Tauri API —— 便于单测与快照锁定。
+//!
+//! 唯一的文件 IO 是**登录壁纸**（Task 13b）：`build_init_script` 会把
+//! `local.loginWallpaperFileName` 指的文件从配置目录读进内存。为了让测试保持封闭，
+//! 读文件被隔离在 [`load_wallpaper_from`]（显式传目录），而纯组装逻辑在
+//! [`build_init_script_with`]（接收已读好的壁纸）——单测只调后者。
 
-use crate::config::Config;
+use crate::base64;
+use crate::config::{self, Config};
+use crate::paths;
+use crate::report;
 use serde::Serialize;
-use serde_json::json;
+use serde_json::{json, Value};
 
 pub const SHELL_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const MODS_COMMIT: &str = "483c3e2e217faebc1be45b4e824865854a61e3dd";
@@ -11,12 +19,185 @@ pub const MODS_COMMIT: &str = "483c3e2e217faebc1be45b4e824865854a61e3dd";
 /// 共用同一个常量，避免字面量在两处漂移。
 pub const MODS_VERSION: &str = "1.0.2";
 
+/// 登录壁纸的大小上限（与 `config::MAX_WALLPAPER_BYTES` 同一个数）——超限时跳过并记一行日志。
+pub const MAX_WALLPAPER_BYTES: usize = config::MAX_WALLPAPER_BYTES;
+
 const SHIM_JS: &str = include_str!("../inject/shim.js");
 const BOOTSTRAP_JS: &str = include_str!("../inject/bootstrap.js");
 const CONTENT_SCRIPT_JS: &str = include_str!("../assets/fnos-mods/content-script.js");
 
 struct Assets {
     files: &'static [(&'static str, &'static str)],
+}
+
+/// 14 个「完美图标」PNG（Task 13b）：`(binaryAssets 的键, 原始字节)`。
+///
+/// **键一律小写**，因为 shim 的查表键是小写化的（`inject/shim.js` 的
+/// `assetIndex[String(k).toLowerCase()]`），而磁盘上的文件名是 camelCase
+/// （`prefect_icon/panIndex.png`）——写 camelCase 的键本身也能查到（两边都小写化后相等），
+/// 但让载荷里的键与「上游 `launchpadIconRedrawMap` 的规范写法」一致更不容易出错：
+/// `prefect_icon/<小写名>.png` 正是 `icon-map.json` 的取值形态。
+///
+/// 表必须与 vendored 目录**集合相等**：`tests::icon_table_matches_the_vendored_directory`
+/// 真的去读目录，双向比对（少一个 = 图标不可用，多一个 = 指向不存在的文件）。
+pub(crate) fn prefect_icons() -> &'static [(&'static str, &'static [u8])] {
+    &[
+        (
+            "prefect_icon/alist.png",
+            include_bytes!("../assets/fnos-mods/prefect_icon/alist.png"),
+        ),
+        (
+            "prefect_icon/emby.png",
+            include_bytes!("../assets/fnos-mods/prefect_icon/emby.png"),
+        ),
+        (
+            "prefect_icon/home-assistant.png",
+            include_bytes!("../assets/fnos-mods/prefect_icon/home-assistant.png"),
+        ),
+        (
+            "prefect_icon/icloud.png",
+            include_bytes!("../assets/fnos-mods/prefect_icon/icloud.png"),
+        ),
+        (
+            "prefect_icon/it-tools.png",
+            include_bytes!("../assets/fnos-mods/prefect_icon/it-tools.png"),
+        ),
+        (
+            "prefect_icon/kodi.png",
+            include_bytes!("../assets/fnos-mods/prefect_icon/kodi.png"),
+        ),
+        (
+            "prefect_icon/one-panel.png",
+            include_bytes!("../assets/fnos-mods/prefect_icon/one-panel.png"),
+        ),
+        (
+            "prefect_icon/oray-hsk.png",
+            include_bytes!("../assets/fnos-mods/prefect_icon/oray-hsk.png"),
+        ),
+        (
+            // 磁盘上是 camelCase 的 `panIndex.png`（icon-map.json 里的规范名是 `panindex`）
+            "prefect_icon/panindex.png",
+            include_bytes!("../assets/fnos-mods/prefect_icon/panIndex.png"),
+        ),
+        (
+            "prefect_icon/qbittorrent.png",
+            include_bytes!("../assets/fnos-mods/prefect_icon/qbittorrent.png"),
+        ),
+        (
+            "prefect_icon/quarkpan.png",
+            include_bytes!("../assets/fnos-mods/prefect_icon/quarkpan.png"),
+        ),
+        (
+            "prefect_icon/syncthing.png",
+            include_bytes!("../assets/fnos-mods/prefect_icon/syncthing.png"),
+        ),
+        (
+            "prefect_icon/transmission.png",
+            include_bytes!("../assets/fnos-mods/prefect_icon/transmission.png"),
+        ),
+        (
+            "prefect_icon/xunlei.png",
+            include_bytes!("../assets/fnos-mods/prefect_icon/xunlei.png"),
+        ),
+    ]
+}
+
+/// 完美图标是否**真的配置了**——这是「要不要把 1.1 MiB 的图标资源塞进初始化脚本」的唯一判据。
+///
+/// 三个键里任何一个非默认就意味着用户开了这项功能：
+/// - `launchpadIconScaleEnabled`：总开关（上游 `setLaunchpadIconScaleOnDom(enabled)` 的第一道门槛）；
+/// - `launchpadIconRedrawMap`：逐项重绘的映射（`redrawKeys` 必须能在它里面查到值才生效，
+///   所以只看 map 就够）；
+/// - `launchpadIconScaleSelectedKeys`：逐项缩放的选中项（上游在总开关关闭时也会归一化它，
+///   说明它本身可以独立于开关被写下来）。
+///
+/// **为什么这个判据必须两侧一致**：`commands::set_config` 用它决定 `needsReload`
+/// （载荷内容变了就必须重建窗口），`build_init_script` 用它决定要不要嵌入图标。
+/// 两处一旦分叉，用户会看到「开关打开了但页面没有任何图标」这种最难排障的状态。
+pub fn perfect_icon_enabled(cfg: &Config) -> bool {
+    cfg.mods.launchpad_icon_scale_enabled
+        || !cfg.mods.launchpad_icon_redraw_map.is_empty()
+        || !cfg.mods.launchpad_icon_scale_selected_keys.is_empty()
+}
+
+/// 一份已读进内存的登录壁纸。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WallpaperAsset {
+    /// `binaryAssets` 的键 = **小写**文件名（shim 的查表键小写化）。
+    pub key: String,
+    /// 由扩展名推导的 mime（`config::wallpaper_mime`）。
+    pub mime: &'static str,
+    pub bytes: Vec<u8>,
+}
+
+impl WallpaperAsset {
+    /// 完整的 `data:<mime>;base64,…`。
+    ///
+    /// shim 的 `getURL` 对 `binaryAssets` 里的值**原样透传**以 `data:` 开头者（其余按裸 base64
+    /// 包装）——所以 mime 在这里就定下来，不依赖 shim 的扩展名表。
+    pub fn data_url(&self) -> String {
+        format!("data:{};base64,{}", self.mime, base64::encode(&self.bytes))
+    }
+}
+
+/// 从 `dir` 读登录壁纸；任何一步不满足都返回 `None` 并记一行日志（**永不 panic**）。
+///
+/// 校验顺序：配置里有名字 → 名字形状与扩展名合法（[`config::wallpaper_mime`]）→ 文件可读 →
+/// 非空 → 不超 [`MAX_WALLPAPER_BYTES`]。之所以把形状判定放在读文件之前：不合法时连
+/// `Path::join` 都不做（名字里不可能有分隔符，但「先不信、先判」比「先拼路径」更容易审计）。
+///
+/// 日志里的名字都过 `[report::log_safe]`（形状判定已经拒掉控制字符，这里是纵深防御），
+/// 页面/用户可控文本不可能在 stderr 里伪造出换行。
+fn load_wallpaper_from(dir: &std::path::Path, cfg: &Config) -> Option<WallpaperAsset> {
+    let raw = cfg.local.login_wallpaper_file_name.as_deref()?;
+    let name = raw.trim();
+    if name.is_empty() {
+        return None;
+    }
+    let Some(mime) = config::wallpaper_mime(name) else {
+        eprintln!(
+            "[fnos] 登录壁纸文件名不可用（已跳过，未读文件）：{}",
+            report::log_safe(name)
+        );
+        return None;
+    };
+    let path = dir.join(name);
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!(
+                "[fnos] 登录壁纸读取失败（已跳过）：{} — {e}",
+                report::log_safe(name)
+            );
+            return None;
+        }
+    };
+    if bytes.is_empty() {
+        eprintln!(
+            "[fnos] 登录壁纸是空文件（已跳过）：{}",
+            report::log_safe(name)
+        );
+        return None;
+    }
+    if bytes.len() > MAX_WALLPAPER_BYTES {
+        eprintln!(
+            "[fnos] 登录壁纸超过 {} MiB 上限（已跳过）：{} 实为 {} 字节",
+            MAX_WALLPAPER_BYTES / 1024 / 1024,
+            report::log_safe(name),
+            bytes.len()
+        );
+        return None;
+    }
+    Some(WallpaperAsset {
+        key: name.to_ascii_lowercase(),
+        mime,
+        bytes,
+    })
+}
+
+/// [`load_wallpaper_from`] 的生产入口：目录就是配置文件所在目录。
+fn load_wallpaper(cfg: &Config) -> Option<WallpaperAsset> {
+    load_wallpaper_from(&paths::config_dir(), cfg)
 }
 
 // R34：消费方读 camelCase —— bootstrap.js:27 读 `meta.shellVersion`、shim.js:143 读 `meta.modsVersion`。
@@ -117,28 +298,60 @@ fn wrap_upstream(content: &str) -> String {
 }
 
 pub fn build_init_script(cfg: &Config) -> String {
+    build_init_script_with(cfg, load_wallpaper(cfg))
+}
+
+/// [`build_init_script`] 的**纯**内核：壁纸由调用方先读好（生产走 [`load_wallpaper`]，
+/// 单测直接喂一个 [`WallpaperAsset`] 或 `None`）。这样「读文件」不会污染单测的封闭性。
+///
+/// ## `binaryAssets` 的两条规则（Task 13b）
+///
+/// 1. **按需**：只有 [`perfect_icon_enabled`] 为真时才嵌入 14 个图标；否则整个键**不出现**
+///    （不是空对象）——默认载荷必须与 T13a 逐字节一致，否则每次建窗都白白多 1.1 MiB。
+/// 2. **键小写**：shim 的 `assetIndex` 用小写键（`shim.js` 的 `String(k).toLowerCase()`），
+///    而磁盘上的文件名有 camelCase（`panIndex.png`）。载荷里统一成小写，
+///    与上游 `launchpadIconRedrawMap` 的规范写法（`prefect_icon/panindex.png`）也一致。
+pub fn build_init_script_with(cfg: &Config, wallpaper: Option<WallpaperAsset>) -> String {
     if !cfg.shell.inject_enabled {
         return String::new();
     }
 
-    // `prefect_icon/*.png` 是二进制，不走这里的 `assets`：Task 13 按配置选择后用单独的
-    // `binaryAssets` 键承载。此处刻意完全不输出该键 —— shim.js 把它默认成 `{}`（shim.js:9）。
-    // 同理，`content-script.js` 由本函数末尾直接执行，不需要经 getURL 暴露。
+    // 文本资源（CSS / mod.js / icon-map.json）：`binaryAssets` 专属二进制，不进这里。
     let mut asset_map = serde_json::Map::new();
     for (name, text) in assets().files {
         asset_map.insert((*name).to_string(), json!(text));
     }
 
-    let payload = json!({
-        "meta": Meta {
+    // 二进制资源：图标按需 + 壁纸有则带上。值为**完整** data URL（shim 对 `data:` 前缀原样透传）。
+    let mut binary_map = serde_json::Map::new();
+    if perfect_icon_enabled(cfg) {
+        for (key, bytes) in prefect_icons() {
+            binary_map.insert(
+                (*key).to_string(),
+                json!(format!("data:image/png;base64,{}", base64::encode(bytes))),
+            );
+        }
+    }
+    if let Some(asset) = &wallpaper {
+        binary_map.insert(asset.key.clone(), json!(asset.data_url()));
+    }
+
+    let mut payload = serde_json::Map::new();
+    payload.insert(
+        "meta".into(),
+        json!(Meta {
             shell_version: SHELL_VERSION,
             mods_commit: MODS_COMMIT,
             mods_version: MODS_VERSION,
-        },
-        "mods": &cfg.mods,
-        "local": &cfg.local,
-        "assets": asset_map,
-    });
+        }),
+    );
+    payload.insert("mods".into(), json!(&cfg.mods));
+    payload.insert("local".into(), json!(&cfg.local));
+    payload.insert("assets".into(), Value::Object(asset_map));
+    if !binary_map.is_empty() {
+        payload.insert("binaryAssets".into(), Value::Object(binary_map));
+    }
+    let payload = Value::Object(payload);
 
     format!(
         "/* fnOS Desktop Shell init script v{ver} (mods {commit}) */\n\
@@ -168,9 +381,29 @@ mod tests {
         serde_json::from_str(&script[start..=end]).expect("配置段必须是合法 JSON")
     }
 
+    /// 单测一律走**纯**内核：`build_init_script` 会去读真实配置目录里的壁纸，
+    /// 那会让断言依赖开发者机器上的 `config.json`（不可重复）。
+    fn script(cfg: &Config) -> String {
+        build_init_script_with(cfg, None)
+    }
+
+    /// 与 `config.rs` 同一套「按 tag + pid 建独立临时目录」的做法（并行测试不互相污染）。
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("fnos-inj-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn binary_assets(v: &serde_json::Value) -> &serde_json::Map<String, serde_json::Value> {
+        v.get("binaryAssets")
+            .and_then(|b| b.as_object())
+            .expect("载荷必须有 binaryAssets 对象")
+    }
+
     #[test]
     fn script_has_four_sections_in_order() {
-        let s = build_init_script(&Config::default());
+        let s = script(&Config::default());
         // 锚点必须带 ` = `：shim.js/bootstrap.js 里也有 `W.__FNOS_SHELL__`，只用
         // `__FNOS_SHELL__` 会让载荷整体挪到 shim 之下时本测试仍然通过。
         let i_cfg = s.find("window.__FNOS_SHELL__ = ").expect("config section");
@@ -187,7 +420,7 @@ mod tests {
     fn payload_carries_all_assets_and_mods_config() {
         let mut cfg = Config::default();
         cfg.mods.brand_color = "#123456".into();
-        let s = build_init_script(&cfg);
+        let s = script(&cfg);
         assert!(s.contains("\"brandColor\":\"#123456\""));
 
         // 必须断言**解析后**的 `assets` 对象。对整串做 `s.contains(name)` 恒真：7 个 CSS 名已由
@@ -230,15 +463,18 @@ mod tests {
                 "assets 只承载文本，不得含二进制键 {key}"
             );
         }
+        // T13b 的门槛：默认配置（完美图标关闭、没有壁纸）时 `binaryAssets` **整个键都不出现**。
+        // 这条断言是「默认载荷没有变大」的机械锁——空对象也会让每次建窗多解析一段 JSON，
+        // 而 14 个图标的 base64 有 1 MiB 量级（见 payload_size_off_and_on）。
         assert!(
             v.get("binaryAssets").is_none(),
-            "本阶段刻意不输出 binaryAssets（Task 13 才按配置承载 .png）"
+            "未配置完美图标且没有壁纸时不得输出 binaryAssets（默认载荷必须与 T13a 一致）"
         );
     }
 
     #[test]
     fn upstream_is_wrapped_until_document_element_exists() {
-        let s = build_init_script(&Config::default());
+        let s = script(&Config::default());
         // 上游源码必须**逐字**保留（只包裹、不修改 vendored 代码）
         assert!(
             s.contains(CONTENT_SCRIPT_JS),
@@ -274,11 +510,15 @@ mod tests {
         let mut cfg = Config::default();
         cfg.shell.inject_enabled = false;
         assert!(build_init_script(&cfg).is_empty());
+        // 关掉注入时连壁纸也不该被读进来（更不该出现在脚本里）
+        cfg.mods.launchpad_icon_scale_enabled = true;
+        cfg.local.login_wallpaper_file_name = Some("wallpaper.png".into());
+        assert!(build_init_script(&cfg).is_empty());
     }
 
     #[test]
     fn payload_is_valid_json_prefix() {
-        let s = build_init_script(&Config::default());
+        let s = script(&Config::default());
         let start = s.find('{').unwrap();
         let end = s.find("};\n").unwrap();
         let json = &s[start..=end];
@@ -289,7 +529,7 @@ mod tests {
 
     #[test]
     fn meta_keys_are_camel_case_for_the_consumers() {
-        let s = build_init_script(&Config::default());
+        let s = script(&Config::default());
         assert!(
             s.contains("\"shellVersion\""),
             "bootstrap.js 读 meta.shellVersion"
@@ -305,5 +545,367 @@ mod tests {
             "snake_case 会让消费方静默回落 0.0.0"
         );
         assert!(!s.contains("\"mods_version\""));
+    }
+
+    // ---------- Task 13b：完美图标（按需嵌入的 PNG 资产） ----------
+
+    /// 图标表必须与 vendored 目录**集合相等**（真的去读目录，双向比对）。
+    ///
+    /// 这条锁的是最容易发生、也最难发现的一类漂移：往
+    /// `src-tauri/assets/fnos-mods/prefect_icon/` 里加/删一个 PNG，却忘了同步
+    /// [`prefect_icons`]。少了 = 设置窗里选得到但页面永远拿不到（`getURL` 返回空串，
+    /// 上游 `safeRuntimeGetURL` 于是放弃重绘）；多了 = 指向一个不存在的文件
+    /// （`include_bytes!` 会编译失败，所以「多」只可能表现为「多了个空壳」）。
+    #[test]
+    fn icon_table_matches_the_vendored_directory() {
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/fnos-mods/prefect_icon");
+        let mut on_disk: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("vendored 图标目录必须存在 {}：{e}", dir.display()))
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .filter(|name| name.to_ascii_lowercase().ends_with(".png"))
+            .map(|name| format!("prefect_icon/{}", name.to_ascii_lowercase()))
+            .collect();
+        on_disk.sort();
+
+        let mut table: Vec<String> = prefect_icons()
+            .iter()
+            .map(|(key, _)| (*key).to_string())
+            .collect();
+        table.sort();
+        assert_eq!(
+            table, on_disk,
+            "injector 的图标表必须与 vendored 目录一一对应（含大小写归一后的名字）"
+        );
+        assert_eq!(table.len(), 14, "完美图标资源是 14 个");
+        for (key, bytes) in prefect_icons() {
+            assert_eq!(*key, key.to_ascii_lowercase(), "{key} 必须是全小写键");
+            assert!(
+                bytes.starts_with(&[0x89, b'P', b'N', b'G']),
+                "{key} 必须是 PNG（魔数 89 50 4e 47）"
+            );
+            assert!(bytes.len() > 1024, "{key} 看起来是个占位文件");
+        }
+    }
+
+    /// 三个键**各自**都能单独把「需要图标资源」这件事打开（判据与 shim 的行为同义）。
+    #[test]
+    fn gating_covers_all_three_keys() {
+        // 默认配置本来就是三个键全默认；再显式清一遍，证明判据不是恒真
+        let mut off = Config::default();
+        off.mods.launchpad_icon_scale_enabled = false;
+        off.mods.launchpad_icon_redraw_map.clear();
+        off.mods.launchpad_icon_scale_selected_keys.clear();
+        assert!(!perfect_icon_enabled(&off));
+        assert!(payload_json(&script(&off)).get("binaryAssets").is_none());
+
+        let mut by_switch = Config::default();
+        by_switch.mods.launchpad_icon_scale_enabled = true;
+        assert!(perfect_icon_enabled(&by_switch));
+
+        let mut by_map = Config::default();
+        by_map
+            .mods
+            .launchpad_icon_redraw_map
+            .insert("/a/icon_1.png".into(), "prefect_icon/emby.png".into());
+        assert!(perfect_icon_enabled(&by_map));
+
+        let mut by_keys = Config::default();
+        by_keys
+            .mods
+            .launchpad_icon_scale_selected_keys
+            .push("/a/icon_1.png".into());
+        assert!(perfect_icon_enabled(&by_keys));
+
+        // 三个键都把「有图标资源」这件事打开 → 脚本里真的出现整套 14 个图标
+        for cfg in [&by_switch, &by_map, &by_keys] {
+            let v = payload_json(&script(cfg));
+            assert_eq!(
+                binary_assets(&v).len(),
+                14,
+                "任一键非默认都应嵌入整套 14 个图标"
+            );
+        }
+    }
+
+    /// 开启后：恰好 14 个键、全小写、每个都是 `data:image/png;base64,…`，
+    /// 且 base64 解码回来与 `include_bytes!` 的字节**逐字节相等**、长度与磁盘文件一致。
+    #[test]
+    fn icons_are_lowercase_png_data_urls_of_the_vendored_bytes() {
+        let mut cfg = Config::default();
+        cfg.mods.launchpad_icon_scale_enabled = true;
+        let v = payload_json(&script(&cfg));
+        let binary = binary_assets(&v);
+
+        let mut keys: Vec<&str> = binary.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys.len(), 14);
+        for key in &keys {
+            assert_eq!(
+                *key,
+                key.to_ascii_lowercase(),
+                "binaryAssets 的键必须全小写（shim 的查表键）"
+            );
+            assert!(key.starts_with("prefect_icon/"), "{key}");
+            assert!(key.ends_with(".png"), "{key}");
+        }
+        // camelCase 的磁盘名必须已经被归一成小写键（否则 shim 查得到、但 payload 里两套写法并存）
+        assert!(binary.contains_key("prefect_icon/panindex.png"));
+        assert!(!binary.contains_key("prefect_icon/panIndex.png"));
+
+        for (key, bytes) in prefect_icons() {
+            let value = binary
+                .get(*key)
+                .and_then(|v| v.as_str())
+                .unwrap_or_else(|| panic!("{key} 必须在 binaryAssets 里"));
+            let b64 = value
+                .strip_prefix("data:image/png;base64,")
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{key} 必须是 PNG data URL：{}",
+                        &value[..40.min(value.len())]
+                    )
+                });
+            assert_eq!(
+                base64::decode(b64).expect("载荷里的 base64 必须可解码"),
+                *bytes,
+                "{key} 的 base64 必须还原出磁盘上的原始字节（编码器错了就是坏图）"
+            );
+            assert_eq!(
+                b64.len(),
+                (bytes.len() + 2) / 3 * 4,
+                "{key} 的 base64 长度必须符合 4/3 膨胀公式"
+            );
+            // 文本资源那一支不受影响：assets 里不许出现同名 png
+            assert!(!v["assets"].as_object().unwrap().contains_key(*key));
+        }
+    }
+
+    /// 壁纸：按**小写**文件名嵌入，mime 由扩展名推导；`local` 段里的原文不被改写。
+    #[test]
+    fn wallpaper_is_embedded_under_its_lowercase_name() {
+        for (name, mime) in [
+            ("MyWall.png", "image/png"),
+            ("photo.JPG", "image/jpeg"),
+            ("photo.jpeg", "image/jpeg"),
+            ("shot.WebP", "image/webp"),
+        ] {
+            let mut cfg = Config::default();
+            cfg.local.login_wallpaper_file_name = Some(name.into());
+            let bytes = vec![0x11u8, 0x22, 0x33, 0x44];
+            let asset = WallpaperAsset {
+                key: name.to_ascii_lowercase(),
+                mime,
+                bytes: bytes.clone(),
+            };
+            let v = payload_json(&build_init_script_with(&cfg, Some(asset)));
+            let binary = binary_assets(&v);
+            assert_eq!(binary.len(), 1, "没有完美图标时 binaryAssets 只该有壁纸");
+            let value = binary
+                .get(&name.to_ascii_lowercase())
+                .and_then(|v| v.as_str())
+                .unwrap_or_else(|| panic!("{name} 必须以小写键出现"));
+            assert_eq!(
+                value,
+                &format!("data:{mime};base64,{}", base64::encode(&bytes)),
+                "{name}"
+            );
+            // `local` 段仍是用户写的原文（大小写不归一：显示值 = 配置值）
+            assert_eq!(v["local"]["loginWallpaperFileName"], json!(name));
+        }
+    }
+
+    /// **载荷实测**：关（默认）与开（14 个图标）两种状态的字节数，以及 base64 膨胀。
+    ///
+    /// 打印的数字就是报告里那一节；断言锁的是「开关打开后多出来的字节恰好等于
+    /// `, "binaryAssets": {…}` 这一段 JSON 的长度」——不是「大概 1.1 MiB」这种松判据。
+    #[test]
+    fn payload_size_off_and_on() {
+        /// 配置段 JSON 的字节数（与键序无关：长度由内容决定）。
+        fn payload_len(cfg: &Config) -> usize {
+            serde_json::to_string(&payload_json(&script(cfg)))
+                .expect("配置段必须可序列化")
+                .len()
+        }
+
+        let off_cfg = Config::default();
+        let on_cfg = {
+            let mut c = Config::default();
+            c.mods.launchpad_icon_scale_enabled = true;
+            c
+        };
+        let off_len = payload_len(&off_cfg);
+        let on_len = payload_len(&on_cfg);
+        let off_script_len = script(&off_cfg).len();
+        let on_script_len = script(&on_cfg).len();
+
+        let raw: usize = prefect_icons().iter().map(|(_, b)| b.len()).sum();
+        let b64_chars: usize = prefect_icons()
+            .iter()
+            .map(|(_, b)| base64::encode(b).len())
+            .sum();
+        // 期望的增量 = `,"binaryAssets":` + 那个对象本身的 JSON
+        let mut expect_map = serde_json::Map::new();
+        for (key, bytes) in prefect_icons() {
+            expect_map.insert(
+                (*key).to_string(),
+                json!(format!("data:image/png;base64,{}", base64::encode(bytes))),
+            );
+        }
+        let fragment = serde_json::to_string(&Value::Object(expect_map)).unwrap();
+        let overhead = ",".len() + "\"binaryAssets\":".len();
+        // 打开完美图标同时把 `launchpadIconScaleEnabled` 从 `false`(5) 写成了 `true`(4)：
+        // 这一个字节也必须算进去，否则断言会因为「差一个字节」而看起来像个玄学问题。
+        let switch_delta: isize = -(("false".len() - "true".len()) as isize);
+
+        println!("T13B-PAYLOAD off_payload_json_bytes={off_len}");
+        println!("T13B-PAYLOAD on_payload_json_bytes={on_len}");
+        println!("T13B-PAYLOAD off_script_bytes={off_script_len}");
+        println!("T13B-PAYLOAD on_script_bytes={on_script_len}");
+        println!("T13B-PAYLOAD icons_raw_bytes={raw}");
+        println!("T13B-PAYLOAD icons_base64_chars={b64_chars}");
+        println!(
+            "T13B-PAYLOAD base64_expansion_x1000={}",
+            b64_chars * 1000 / raw
+        );
+        println!("T13B-PAYLOAD measured_delta_bytes={}", on_len - off_len);
+        println!(
+            "T13B-PAYLOAD expected_delta_bytes={}",
+            fragment.len() as isize + overhead as isize + switch_delta
+        );
+
+        assert!(on_len > off_len, "打开完美图标后载荷必须变大");
+        assert_eq!(
+            on_len as isize - off_len as isize,
+            fragment.len() as isize + overhead as isize + switch_delta,
+            "多出来的字节必须恰好是 `,\"binaryAssets\":{{…}}` 这一段（再减去开关的 1 字节）"
+        );
+        // 量级锁：14 个图标的 base64 在 1 MiB 上下（报告里报的就是这两个数）
+        assert!(
+            (1_000_000..1_200_000).contains(&(on_len - off_len)),
+            "实测增量 {} 与预期量级不符",
+            on_len - off_len
+        );
+        // base64 的标准膨胀是 4/3（1000 倍表示下应落在 1333 附近）
+        assert_eq!(b64_chars * 1000 / raw, 1333);
+        // 关态就是 T13a 的原始载荷：9 个**文本**资源（7 个 CSS + mod.js + icon-map.json，
+        // 实测约 288 KiB）——量级是几百 KB，不含任何 base64 大块。
+        assert!(
+            off_len < 400_000,
+            "默认载荷不该有 MB 级内容（那是 base64 二进制的量级）：{off_len}"
+        );
+        assert!(
+            payload_json(&script(&off_cfg))
+                .get("binaryAssets")
+                .is_none(),
+            "关态必须连 binaryAssets 这个键都没有"
+        );
+    }
+
+    // ---------- Task 13b：登录壁纸的读文件路径（唯一的 IO） ----------
+
+    #[test]
+    fn load_wallpaper_reads_and_lowercases_the_configured_file() {
+        let dir = temp_dir("wallpaper-ok");
+        let bytes = [0x89u8, 0x50, 0x4e, 0x47, 0x0d, 0x0a];
+        std::fs::write(dir.join("MyWall.PNG"), bytes).unwrap();
+        let mut cfg = Config::default();
+        cfg.local.login_wallpaper_file_name = Some("MyWall.PNG".into());
+
+        let asset = load_wallpaper_from(&dir, &cfg).expect("合法壁纸必须被读出来");
+        assert_eq!(asset.key, "mywall.png", "键必须小写（shim 的查表键）");
+        assert_eq!(asset.mime, "image/png");
+        assert_eq!(asset.bytes, bytes);
+        assert!(asset
+            .data_url()
+            .starts_with("data:image/png;base64,iVBORw0K"));
+
+        // 首尾空白会被 trim（手改配置时常见）
+        cfg.local.login_wallpaper_file_name = Some("  MyWall.PNG  ".into());
+        assert_eq!(
+            load_wallpaper_from(&dir, &cfg).map(|a| a.key),
+            Some("mywall.png".into())
+        );
+
+        // 没有配置 → 不读、不报错
+        let bare = Config::default();
+        assert!(load_wallpaper_from(&dir, &bare).is_none());
+        // 空白名字 → 同上
+        let mut blank = Config::default();
+        blank.local.login_wallpaper_file_name = Some("   ".into());
+        assert!(load_wallpaper_from(&dir, &blank).is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 缺失 / 过大 / 空文件 / 非法名字：一律 `None`（记一行日志），**绝不 panic、绝不截断**。
+    #[test]
+    fn load_wallpaper_skips_missing_oversized_and_illegal_files() {
+        let dir = temp_dir("wallpaper-skip");
+
+        // 文件不存在（配置里写了名字，但用户还没放文件进去）
+        let mut missing = Config::default();
+        missing.local.login_wallpaper_file_name = Some("nope.png".into());
+        assert!(load_wallpaper_from(&dir, &missing).is_none());
+
+        // 超过 8 MiB 上限：文件真的存在，但被跳过（不截断、不部分嵌入）
+        std::fs::write(dir.join("huge.png"), vec![0u8; MAX_WALLPAPER_BYTES + 1]).unwrap();
+        let mut huge = Config::default();
+        huge.local.login_wallpaper_file_name = Some("huge.png".into());
+        assert!(load_wallpaper_from(&dir, &huge).is_none());
+        // 正好等于上限：允许（上限是「含」上限）
+        std::fs::write(dir.join("exact.png"), vec![7u8; MAX_WALLPAPER_BYTES]).unwrap();
+        let mut exact = Config::default();
+        exact.local.login_wallpaper_file_name = Some("exact.png".into());
+        assert_eq!(
+            load_wallpaper_from(&dir, &exact).map(|a| a.bytes.len()),
+            Some(MAX_WALLPAPER_BYTES)
+        );
+
+        // 空文件
+        std::fs::write(dir.join("empty.png"), []).unwrap();
+        let mut empty = Config::default();
+        empty.local.login_wallpaper_file_name = Some("empty.png".into());
+        assert!(load_wallpaper_from(&dir, &empty).is_none());
+
+        // 扩展名不在允许表内（文件确实存在也不读）
+        std::fs::write(dir.join("anim.gif"), b"GIF89a").unwrap();
+        let mut gif = Config::default();
+        gif.local.login_wallpaper_file_name = Some("anim.gif".into());
+        assert!(load_wallpaper_from(&dir, &gif).is_none());
+
+        // 穿越 / 分隔符 / 换行：形状判定直接拦住（连 join 都不做）
+        let mut bads: Vec<String> = [
+            "../secret.png",
+            "sub/wall.png",
+            "sub\\wall.png",
+            "C:\\wall.png",
+            "wall\npaper.png",
+            "wall\tpaper.png",
+            ".png",
+            "wallpaper.svg",
+            "wallpaper", // 没有扩展名
+            "wall.png ", // 尾部空白（Windows 会吃掉，配置值与实际文件不是一回事）
+            " wall.png", // 首部空白
+            "wall*paper.png",
+        ]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+        bads.push("a".repeat(300));
+        for bad in bads {
+            let mut cfg = Config::default();
+            cfg.local.login_wallpaper_file_name = Some(bad.clone());
+            assert!(load_wallpaper_from(&dir, &cfg).is_none(), "bad={bad:?}");
+        }
+        // 反过来：**内部空白与非 ASCII 名字要放行**（文件名真的可以长这样；R30 的教训是
+        // 「带点非 ASCII 就静默丢配置」比拒绝更难排障）。
+        std::fs::write(dir.join("my wall 壁纸.PNG"), b"\x89PNG\r\n").unwrap();
+        let mut cjk = Config::default();
+        cjk.local.login_wallpaper_file_name = Some("my wall 壁纸.PNG".into());
+        let asset = load_wallpaper_from(&dir, &cjk).expect("内部空格与非 ASCII 名字必须放行");
+        assert_eq!(asset.key, "my wall 壁纸.png", "键只做 ASCII 小写化");
+        assert_eq!(asset.mime, "image/png");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

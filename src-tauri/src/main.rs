@@ -1,6 +1,7 @@
 // R9：release 不带多余的控制台窗口；debug 保留控制台以便看日志
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod base64;
 mod commands;
 mod config;
 mod injector;
@@ -87,6 +88,9 @@ fn main() {
             // Task 13a：页面上报的读取口。上报本身走 `document.title`（不经 IPC、不需要任何
             // capability，见 src/report.rs），页面**没有任何**命令可调用；这个读命令只授设置窗。
             commands::get_page_report,
+            // Task 13b：登录壁纸导入。设置窗自己写不了文件（只有这个命令有文件写入），
+            // 同样只授设置窗，并且在 remote-deny.json 里显式 deny（见 build.rs 的注释）。
+            commands::import_wallpaper,
         ])
         .run(tauri::generate_context!())
         .expect("fnOS 启动失败");

@@ -14,7 +14,7 @@
 // 另外两条窗口级行为：
 // - **焦点刷新**（`refresh`）：托盘等带外改动不发事件，重新获得焦点时重取配置。
 // - **关于页外链**：不在窗内导航，交给 Rust `open_url` → 系统默认浏览器。
-import { SCHEMA, UPSTREAM_REPO, VENDOR_DIR } from './schema.js';
+import { SCHEMA, UPSTREAM_REPO, VENDOR_DIR, PREFECT_ICONS, prefectIconPath } from './schema.js';
 import { MODS_KEYS, normalizeModsEntry, parseHttpOrigin, DEFAULT_BRAND_COLOR } from './normalize.js';
 import { addCurrentOriginToWhitelist, cornerShapeHint, statusBar, statusFor } from './status.js';
 import * as api from './bridge.js';
@@ -26,11 +26,33 @@ const SECTIONS = ['mods', 'local', 'shell'];
  * 界面状态。导出供单测与状态条读取。
  *
  * `page` 是 Rust 侧 `get_page_state` 的**最近一次**回包（主窗口 URL / 是否命中白名单 /
- * 上次加载是否失败）；`report` 是 `get_page_report` 的最近一次回包（Task 13a：页面自己
- * 经标题通道回报的上游注入链信号）。三者相互独立：主窗口可以只导航不改配置，而页面上报
- * 又只在页面自己跑完注入链后才出现，所以 `refresh()` 三条都要取（见那里的注释）。
+ * 上次加载是否失败）；`report` / `appItemsReport` 是 `get_page_report` 回包信封里的**两个
+ * 槽位**（见 [`reportSlots`]）：前者是状态条证据（Task 13a 的上游注入链信号），后者是
+ * 「完美图标」逐项 UI 的数据源（Task 13b 的应用项列表）。
+ *
+ * 为什么要拆成两个槽位：Task 13b 的 shim 会在完美图标启用时主动向上游拉取应用项列表，那条
+ * 上报**晚于**上游的 `FNOS_INJECTION_TRIGGERED`。若是同一个「最近一次」槽位，状态条的强态
+ * 判据就会被自己拉的数据冲掉（T13b 审计发现的回归）。宿主侧的分流见
+ * `src-tauri/src/report.rs::is_app_items_report`。
+ *
+ * 三者相互独立：主窗口可以只导航不改配置，而页面上报又只在页面自己跑完注入链（或应答了
+ * 列表请求）后才出现，所以 `refresh()` 三条都要取（见那里的注释）。
  */
-export const state = { config: null, active: null, error: null, page: null, report: null };
+export const state = {
+  config: null, active: null, error: null, page: null, report: null, appItemsReport: null,
+};
+
+/**
+ * `get_page_report` 的回包信封 → 两个槽位（两个字段各自可能缺失/不是对象 → `null`）。
+ *
+ * 宿主**永远**返回对象（`{report, appItems}`），但设置窗可能正跑在一个更老的宿主上
+ * （升级中途），所以这里对非对象输入一律回落成两个 `null`，绝不把 `undefined` 画进界面。
+ */
+export function reportSlots(envelope) {
+  const e = envelope && typeof envelope === 'object' ? envelope : {};
+  const pick = (v) => (v && typeof v === 'object' ? v : null);
+  return { report: pick(e.report), appItems: pick(e.appItems) };
+}
 
 // ---------- DOM 小工具 ----------
 
@@ -150,7 +172,223 @@ async function commit(key, value, node) {
   }
 }
 
+// ---------- 完美图标：逐项语义（Task 13b） ----------
+//
+// **上游的语义（照抄，不发明形状）**：`content-script.js:755-794`
+//   - 光有 `launchpadIconRedrawMap[key]` 不够：`redrawKeys` 也必须包含 key，
+//     上游用 `normalizeLaunchpadKeyList(redrawKeys).filter(k => typeof map[k] === 'string')`
+//     重建 `currentLaunchpadIconRedrawMap`（cs:764-772）；
+//   - `maskOnlyKeys` 与 `scaleSelectedKeys` 都会被**剔除**掉已经在 `redrawSet` 里的 key
+//     （cs:773-778）——三种处置互斥，重绘优先；
+//   - 三种处置**全部**受 `launchpadIconScaleEnabled` 总开关约束
+//     （cs:644-648 的 `enabled && shouldXxx(...)`）。
+// 所以逐项 UI 每个应用只有一个「处置」：不处理 / 缩放 / 仅遮罩 / 重绘为某个内置图标。
+
+/** 应用项上报被接受的两个 type（上游 cs:2853-2855 的同一个分支）。 */
+const APP_ITEM_REPORT_TYPES = ['FNOS_GET_LAUNCHPAD_APP_ITEMS', 'FNOS_GET_LAUNCHPAD_APP_TITLES'];
+
+/**
+ * 从最近一次页面上报里取出应用项列表；取不到（没上报 / 形状不对）返回 `null`。
+ *
+ * 只认**形状**，不做任何猜测：`payload.items` 必须是数组，元素必须有非空字符串 `key`
+ * （`iconSrc` / `title` 缺失时由渲染侧兜底）。返回 `[]` 是「上游确实回报了 0 个应用」——
+ * 与 `null`（没有可用数据）在下游是两种不同的文案，不能混。
+ *
+ * 页面可控文本（`title` / `key` / `iconSrc`）**只经 textContent 渲染**，绝不做 HTML 拼接。
+ */
+export function appItemsFromReport(report) {
+  if (!report || typeof report !== 'object') return null;
+  if (APP_ITEM_REPORT_TYPES.indexOf(report.type) < 0) return null;
+  const payload = report.payload;
+  if (!payload || typeof payload !== 'object' || !Array.isArray(payload.items)) return null;
+  return payload.items.filter((item) => (
+    item && typeof item === 'object' && typeof item.key === 'string' && item.key.length > 0
+  ));
+}
+
+/** 某个应用项当前的处置：`'off'` / `'scale'` / `'mask'` / `'redraw:<path>'`。 */
+export function iconSelectionFor(mods, key) {
+  const m = mods && typeof mods === 'object' ? mods : {};
+  const map = m.launchpadIconRedrawMap && typeof m.launchpadIconRedrawMap === 'object'
+    ? m.launchpadIconRedrawMap
+    : {};
+  const path = typeof map[key] === 'string' ? map[key] : '';
+  const list = (v) => (Array.isArray(v) ? v : []);
+  if (path && list(m.launchpadIconRedrawKeys).indexOf(key) >= 0) return `redraw:${path}`;
+  if (list(m.launchpadIconMaskOnlyKeys).indexOf(key) >= 0) return 'mask';
+  if (list(m.launchpadIconScaleSelectedKeys).indexOf(key) >= 0) return 'scale';
+  return 'off';
+}
+
+/**
+ * 把一个应用项的处置换算成四个键的**下一个值**（互斥规则见上面的文件级注释）。
+ *
+ * 返回的对象用配置键名做字段（可以直接 `set_config`）；`config` 只读不改。
+ */
+export function applyIconSelection(mods, key, choice) {
+  const m = mods && typeof mods === 'object' ? mods : {};
+  const scale = new Set(Array.isArray(m.launchpadIconScaleSelectedKeys) ? m.launchpadIconScaleSelectedKeys : []);
+  const mask = new Set(Array.isArray(m.launchpadIconMaskOnlyKeys) ? m.launchpadIconMaskOnlyKeys : []);
+  const redraw = new Set(Array.isArray(m.launchpadIconRedrawKeys) ? m.launchpadIconRedrawKeys : []);
+  const map = m.launchpadIconRedrawMap && typeof m.launchpadIconRedrawMap === 'object'
+    ? { ...m.launchpadIconRedrawMap }
+    : {};
+
+  // 先把这一项的三种处置全清掉，再按需要加回唯一的一种（上游也是「互斥」语义）
+  scale.delete(key);
+  mask.delete(key);
+  redraw.delete(key);
+  delete map[key];
+
+  if (choice === 'scale') {
+    scale.add(key);
+  } else if (choice === 'mask') {
+    mask.add(key);
+  } else if (typeof choice === 'string' && choice.indexOf('redraw:') === 0) {
+    const path = choice.slice('redraw:'.length);
+    if (PREFECT_ICONS.some((name) => prefectIconPath(name) === path)) {
+      redraw.add(key);
+      map[key] = path;
+    }
+  }
+
+  return {
+    launchpadIconScaleSelectedKeys: Array.from(scale),
+    launchpadIconMaskOnlyKeys: Array.from(mask),
+    launchpadIconRedrawKeys: Array.from(redraw),
+    launchpadIconRedrawMap: map,
+  };
+}
+
+/** 「重绘」下拉里的一项：[值, 显示文本]（显示文本只用内置名，不含任何页面可控文本）。 */
+function redrawOption(name) {
+  return [`redraw:${prefectIconPath(name)}`, `重绘：${name}`];
+}
+
+/** 逐项处置的下拉选项（顺序：不处理 → 缩放 → 仅遮罩 → 14 个重绘目标）。 */
+export function iconChoiceOptions() {
+  return [['off', '不处理'], ['scale', '缩放'], ['mask', '仅遮罩']]
+    .concat(PREFECT_ICONS.map(redrawOption));
+}
+
+/** 壁纸大小上限（与 `config::MAX_WALLPAPER_BYTES` / 宿主命令同一个数，这里早退一次省一次 IPC）。 */
+export const MAX_WALLPAPER_BYTES = 8 * 1024 * 1024;
+
+/**
+ * 「没有可用应用项列表」时的**如实**说明。
+ *
+ * 四种情形必须说四种话（`null` 与 `[]` 是不同的事实）：
+ * - 没有任何应用项上报 → 「还没收到」，并说明它什么时候才会有（启动台渲染出应用图标时）；
+ * - 只是 shim 自己发出的**请求**（`dir === 'out'`）→ 「已经问过，但还没有可用的应答」；
+ * - 有应答但形状不对 → 「已按拒绝处理」，不画任何项；
+ * - 别种 type → 把 type 说出来（只回显形如 `FNOS_XXX` 的串，页面可控文本不原样进 UI）。
+ */
+export function appListEmptyText(report, items) {
+  if (items && items.length === 0) {
+    return '上游回报了 0 个应用项：启动台的图标还没渲染出来时只能收集到空列表。'
+      + '请回到主窗口打开一次启动台，再切回本窗口（会自动刷新）。';
+  }
+  const isObject = !!report && typeof report === 'object';
+  const type = isObject ? report.type : null;
+  // 只回显形如 `FNOS_XXX` 的串：页面上报的 type 已经过宿主白名单，这里再收一次口，
+  // 免得任何奇怪形状的字符串被画进界面（它只用于**说明**，不进任何判据）。
+  const known = typeof type === 'string' && /^FNOS_[A-Z_]{2,40}$/.test(type) ? type : '';
+  if (!isObject) {
+    return '尚未收到应用项列表：它由主窗口页面经上报通道回报，而上游只能在启动台渲染出应用图标时'
+      + '收集到（content-script.js:595-610）。请回到主窗口打开一次启动台，再切回本窗口（会自动刷新）；'
+      + '也可以点下面的「打开配置目录」手工编辑。';
+  }
+  if (APP_ITEM_REPORT_TYPES.indexOf(type) >= 0 && report.dir === 'out') {
+    // 这一条是 shim **自己发出的请求**（宿主原样存下来了）：说明请求已经送到页面，但上游还没有
+    // 答出一份非空的列表——空列表的应答由 shim 主动丢弃（否则会把上一次的真实列表覆盖成 0 项）。
+    return '已经向页面请求过应用项列表，但还没收到可用的应答：上游只在启动台渲染出应用图标时'
+      + '才能收集到（content-script.js:595-610）。请回到主窗口打开一次启动台，再切回本窗口'
+      + '（会自动刷新）；也可以点下面的「打开配置目录」手工编辑。';
+  }
+  if (APP_ITEM_REPORT_TYPES.indexOf(type) >= 0) {
+    // 声称是应用项列表，却没有可用的 items（形状不对 / 上报被组装后被拒）
+    return '最近一次上报声称是应用项列表，但形状不可用，已按拒绝处理（不画任何项）。'
+      + '请回到主窗口打开一次启动台让它重新回报；也可以点下面的「打开配置目录」手工编辑。';
+  }
+  if (known) {
+    return `最近一次上报是 ${known}，不含应用项列表（可能是主窗口刚加载完，或启动台还没打开）。`
+      + '请回到主窗口打开一次启动台，再切回本窗口；也可以点下面的「打开配置目录」手工编辑。';
+  }
+  return '最近一次上报不含应用项列表。请回到主窗口打开一次启动台，再切回本窗口；'
+    + '也可以点下面的「打开配置目录」手工编辑。';
+}
+
+/**
+ * 一组「打开配置目录」的入口（应用项列表取不到时的手工编辑指引）。
+ *
+ * 用的还是既有的 `open_config_dir` 命令（关于页也有同一个按钮）——**不新增任何命令**，
+ * 因此设置窗的授权面在这一轮只多了 `import_wallpaper` 一条。
+ */
+function configDirRow(idPrefix) {
+  const row = el('div', { className: 'app-actions' });
+  row.appendChild(el('span', {
+    className: 'hint',
+    text: '手工编辑入口（mods.launchpadIconRedrawMap / launchpadIconRedrawKeys）：'
+  }));
+  const open = button('打开配置目录');
+  open.id = `${idPrefix}_open`;
+  open.addEventListener('click', async () => {
+    try {
+      await api.openConfigDir();
+      state.error = null;
+    } catch (e) {
+      state.error = `打开配置目录失败：${message(e)}`;
+      render();
+    }
+  });
+  row.appendChild(open);
+  return row;
+}
+
+/** 把选中的文件读成 base64（`data:` 头去掉，只把载荷交给 IPC）。 */
+function readFileBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error('FileReader 读取失败'));
+    reader.onload = () => {
+      const text = String(reader.result || '');
+      const comma = text.indexOf(',');
+      resolve(comma >= 0 ? text.slice(comma + 1) : text);
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
 // ---------- 控件 ----------
+
+/**
+ * 一次提交**多个** `mods.*` 键（完美图标的逐项处置要同时改四个键，不能分四次提交）。
+ *
+ * 与 `commit` 同一套纪律：值先在 JS 侧过一遍 `normalizeModsEntry`（归一化的唯一入口，
+ * 作用在「用户刚输入的值」上），回包再原样采纳（`adoptConfig`）；`needsReload` 时重建主窗口
+ * ——逐项键本身经 `apply_to_page` 即时生效，但「第一次把某个键从默认值改成非默认」会改变
+ * `injector::perfect_icon_enabled`（要不要嵌图标），那时必须重建。
+ */
+async function commitMods(patch, node) {
+  if (node) node.classList.add('pending');
+  try {
+    const normalized = {};
+    for (const [k, v] of Object.entries(patch)) normalized[k] = normalizeModsEntry(k, v);
+    const res = await api.setConfig({ mods: normalized });
+    adoptConfig(res.config);
+    if (res.needsReload) {
+      await api.reloadMain(null);
+      await fetchPageSnapshot();
+    }
+    state.error = null;
+  } catch (e) {
+    state.error = `保存逐项设置失败：${message(e)}`;
+  } finally {
+    if (node && node.isConnected) node.classList.remove('pending');
+  }
+  render();
+  renderStatus();
+}
 
 function appendHint(wrap, item) {
   if (item.hint) wrap.appendChild(el('p', { className: 'hint', text: item.hint }));
@@ -291,6 +529,136 @@ function fieldEl(item) {
       wrap.appendChild(input);
       break;
     }
+    case 'appList': {
+      // 数据来源：主窗口页面经标题通道回报的应用项列表（`get_page_report` 信封的 `appItems`
+      // 槽位 → `state.appItemsReport`）。**不读** `state.report`——那是状态条的证据槽位，
+      // 里面永远是「最近一条非应用项上报」。没有可用数据时**不画空列表、不造项**，而是如实
+      // 说明 + 指向「打开配置目录」手工编辑（这一项的数据不在宿主侧，宿主无法代用户补出来）。
+      const box = el('div', { className: 'app-list' });
+      const items = appItemsFromReport(state.appItemsReport);
+      const mods = (state.config && state.config.mods) || {};
+
+      if (items === null || items.length === 0) {
+        box.appendChild(el('p', {
+          id: `${id}_empty`,
+          className: items === null ? 'hint warn' : 'hint',
+          text: appListEmptyText(state.appItemsReport, items),
+          attrs: { role: 'note' }
+        }));
+        box.appendChild(configDirRow(`${id}_dir`));
+        wrap.appendChild(box);
+        break;
+      }
+
+      // 逐项处置只在总开关打开时被上游采纳（cs:644-648），这一点必须写在界面上
+      if (!mods.launchpadIconScaleEnabled) {
+        box.appendChild(el('p', {
+          id: `${id}_gated`,
+          className: 'hint warn',
+          text: '「完美图标」总开关当前是关闭的：下面这些逐项处置已经写进配置，但页面上不会生效（上游只在总开关打开时处理逐项键）。',
+          attrs: { role: 'note' }
+        }));
+      }
+      const options = iconChoiceOptions();
+      items.forEach((item, index) => {
+        const row = el('div', { className: 'app-item' });
+        row.dataset.appKey = item.key;
+        const title = typeof item.title === 'string' && item.title ? item.title : item.key;
+        row.appendChild(el('span', { className: 'app-title', text: title }));
+        row.appendChild(el('code', { className: 'app-key', text: item.key }));
+        const select = el('select', { id: `${id}_sel_${index}` });
+        select.dataset.appKey = item.key;
+        const current = iconSelectionFor(mods, item.key);
+        for (const [v, text] of options) {
+          const o = el('option', { text });
+          o.value = v;
+          o.selected = v === current;
+          select.appendChild(o);
+        }
+        select.addEventListener('change', () => {
+          commitMods(applyIconSelection(state.config.mods, item.key, select.value), wrap);
+        });
+        row.appendChild(select);
+        box.appendChild(row);
+      });
+      box.appendChild(el('p', {
+        className: 'hint',
+        text: `共 ${items.length} 个应用项（来自页面回报；主窗口重新加载后需要再回报一次）`
+      }));
+      box.appendChild(configDirRow(`${id}_dir`));
+      wrap.appendChild(box);
+      break;
+    }
+    case 'imageFile': {
+      const box = el('div', { className: 'file-box' });
+      const input = el('input', { id });
+      input.type = 'file';
+      input.accept = 'image/png,image/jpeg,image/webp';
+      const stored = value == null ? '' : String(value);
+      const status = el('p', { id: `${id}_status`, className: 'hint' });
+      status.textContent = stored ? `当前：${stored}` : '当前：未设置';
+
+      const applyStoredName = async (name) => {
+        wrap.classList.add('pending');
+        try {
+          const res = await api.setConfig({ local: { loginWallpaperFileName: name } });
+          adoptConfig(res.config);
+          state.error = null;
+          // 壁纸是**载荷内容**（`injector` 建窗时把它嵌进 binaryAssets），所以 Rust 侧会把
+          // 它判成 needsReload；这里照既有流程重建主窗口，下一次加载就带上新图。
+          if (res.needsReload) {
+            await api.reloadMain(null);
+            await fetchPageSnapshot();
+          }
+        } catch (e) {
+          state.error = `保存「${key}」失败：${message(e)}`;
+        } finally {
+          if (wrap.isConnected) wrap.classList.remove('pending');
+        }
+        render();
+        renderStatus();
+      };
+
+      input.addEventListener('change', async () => {
+        const file = input.files && input.files[0];
+        if (!file) return;
+        if (file.size > MAX_WALLPAPER_BYTES) {
+          state.error = `图片 ${file.size} 字节，超过 ${MAX_WALLPAPER_BYTES / 1024 / 1024} MiB 上限，未导入`;
+          render();
+          return;
+        }
+        wrap.classList.add('pending');
+        let dataBase64;
+        try {
+          dataBase64 = await readFileBase64(file);
+        } catch (e) {
+          wrap.classList.remove('pending');
+          state.error = `读取文件失败：${message(e)}`;
+          render();
+          return;
+        }
+        try {
+          // 第一步：宿主校验 + 落盘到配置目录，返回它实际用的文件名
+          const imported = await api.importWallpaper(file.name, dataBase64);
+          state.error = null;
+          wrap.classList.remove('pending');
+          // 第二步：走既有的 set_config 路径写入配置（Rust 侧会判 needsReload 并重建主窗口）
+          await applyStoredName(imported);
+        } catch (e) {
+          wrap.classList.remove('pending');
+          state.error = `导入壁纸失败：${message(e)}`;
+          render();
+        }
+      });
+
+      const clear = button('清除', 'reset');
+      clear.id = `${id}_clear`;
+      clear.disabled = !stored;
+      clear.addEventListener('click', () => { applyStoredName(null); });
+      box.append(input, clear, status);
+      wrap.appendChild(box);
+      break;
+    }
     default: {
       const input = el('input', { id });
       input.type = 'text';
@@ -341,14 +709,19 @@ async function fetchPageReport() {
  * 一次性刷新「主窗口观测 + 页面上报」两份快照。
  *
  * 两者都属于**同一时刻的主窗口**：上报是页面文档的属性，主窗口导航/重建后旧上报会被
- * Rust 侧作废（`commands.rs::get_page_report` 按 origin 判定），所以任何取 `page` 的地方
- * 都必须**同时**重取 `report`，否则会出现「page 说是新页面、report 还是上一页的注入信号」
+ * Rust 侧作废（`commands.rs::get_page_report` 按文档身份判定），所以任何取 `page` 的地方
+ * 都必须**同时**重取两个上报槽位，否则会出现「page 说是新页面、report 还是上一页的注入信号」
  * 这种自相矛盾的状态条。
+ *
+ * Task 13b：回包是信封（`{report, appItems}`），两个槽位分别进 `state.report` 与
+ * `state.appItemsReport`——状态条只读前者，逐项 UI 只读后者。
  */
 async function fetchPageSnapshot() {
-  const [page, report] = await Promise.all([fetchPageState(), fetchPageReport()]);
+  const [page, envelope] = await Promise.all([fetchPageState(), fetchPageReport()]);
+  const slots = reportSlots(envelope);
   state.page = page;
-  state.report = report;
+  state.report = slots.report;
+  state.appItemsReport = slots.appItems;
 }
 
 /** 判据是否还停在「加载失败」这一态（重试后的轮询用于决定何时停）。 */
@@ -635,6 +1008,15 @@ function sameConfig(a, b) {
  * 是**同一时刻主窗口**的两个视图，必须在同一个快照里取（见 `fetchPageSnapshot`）。焦点刷新
  * 正好是「页面刚跑完注入链、用户切回设置窗」的时刻——状态条据实化主要靠这个钩子。
  *
+ * Task 13b：**应用项列表**（`state.appItemsReport`）和配置一样是「主窗口那边的事，本窗只读
+ * 快照」。用户的实际动线就是「切到主窗口打开启动台 → 切回设置窗」，所以焦点刷新必须让
+ * **正在显示它的那一组**重画一次，否则界面会一直停在「尚未收到应用项列表」——而那句文案
+ * 又写着「会自动刷新」，就成了一句假话。
+ *
+ * 重画的条件刻意收得很窄：**只有**当前分组是「完美图标」（该组只有总开关与应用项下拉，
+ * 没有用户可能正在输入却尚未提交的文本框）**且**应用项槽位的内容真的变了。其余情形一律
+ * 沿用「配置没变就不重渲染 #pane」的既有纪律（见上一段）。
+ *
  * `render()` 会保留 `state.active`（当前分组）与 `pane.scrollTop`（滚动位置），
  * 所以刷新不会把用户弹回第一组。
  */
@@ -648,7 +1030,9 @@ export async function refresh() {
   } catch (e) {
     failure = e;
   }
+  const beforeAppItems = JSON.stringify(state.appItemsReport);
   await fetchPageSnapshot();
+  const appItemsChanged = JSON.stringify(state.appItemsReport) !== beforeAppItems;
   refreshing = false;
   if (failure) {
     state.error = `刷新配置失败：${message(failure)}`;
@@ -662,7 +1046,7 @@ export async function refresh() {
     state.error = null;
   }
   renderStatus();
-  if (changed) render();
+  if (changed || (appItemsChanged && state.active === 'perfectIcon')) render();
 }
 
 /** 取一次配置并渲染。导出以便单测；无 DOM 时模块加载不会自动执行（见文件末尾）。 */

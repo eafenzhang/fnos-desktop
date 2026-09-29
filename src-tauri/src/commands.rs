@@ -1,6 +1,6 @@
 //! IPC 契约（spec §8.3）与 Rust 侧内部操作。
 
-use crate::{config, config::Config, injector, paths, report, tray, MAIN_WINDOW};
+use crate::{base64, config, config::Config, injector, paths, report, tray, MAIN_WINDOW};
 use serde::Serialize;
 use serde_json::Value;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -102,6 +102,20 @@ pub struct AppState {
     /// （见 [`begin_load`] / [`set_error_state`] / [`on_page_event`]）——旧页面的上报绝不能
     /// 拿来描述新页面。
     pub page_report: Mutex<Option<report::ReportEntry>>,
+    /// 最近一次**通过校验**的「应用项列表」上报（Task 13b；见 [`report::is_app_items_report`]）。
+    ///
+    /// 与 [`Self::page_report`] 完全同构（只在内存里、绑定一个文档、同一套清理点），但**分开
+    /// 存**：状态条的强态判据是「最近一次上报是 `FNOS_INJECTION_TRIGGERED`」，而 T13b 主动
+    /// 拉取应用项列表会在页面加载之后不断产生新的上报——同槽会让 T13a 的强态在「完美图标」
+    /// 打开时永远读不到（功能回归）。分流规则见 [`store_report`]。
+    pub app_items_report: Mutex<Option<report::ReportEntry>>,
+    /// 进行中的**分片**上报（Task 13b；见 [`crate::report::ChunkAssembly`]）。
+    ///
+    /// 只在内存里，且**绑定一个文档**（origin + URL）：新的一次加载、切错误页、或文档与它
+    /// 对不上时都会清空（见 [`begin_load`] / [`set_error_state`] /
+    /// [`drop_report_if_document_changed`] / [`get_page_report`]）。分片本身还有片数、单片字节、
+    /// 累计字节与时间窗口四道硬上限——半截载荷永远不会被当成一条完整上报。
+    pub chunk_report: Mutex<Option<report::ChunkAssembly>>,
 }
 
 /// 主窗口一次加载所处的阶段（Task 11）。
@@ -476,12 +490,23 @@ pub fn set_config<R: Runtime>(
         merge(&mut merged, patch);
         let mut next: Config = serde_json::from_value(merged).map_err(|e| e.to_string())?;
         next.normalize();
-        // gap (a)：**只有** `injectEnabled` / `homeUrl` 需要重建主窗口（换载荷 / 换地址），
+        // gap (a)：**只有**「会改变初始化载荷内容」的键需要重建主窗口（换载荷 / 换地址），
         // 其余字段一律经 `__FNOS_APPLY_CONFIG__` 免刷新生效。
         // 判定放在 `normalize()` 之后：非法 `homeUrl` 被夹成默认值时若与旧值相同，
         // 就不该白重建一次窗口。
+        //
+        // Task 13b 补上第三、四类**载荷内容**键（同样是建窗时注册的 initialization_script 的
+        // 一部分，活窗口上换不掉）：
+        // - 完美图标的**开关状态**（`injector::perfect_icon_enabled`）：它决定 14 个 PNG
+        //   要不要进载荷（约 +1.0 MiB）；逐项键（scaleSelected/redrawKeys/redrawMap 的**具体
+        //   取值**）不进这个判据——它们经 `apply_to_page` 即时生效，不必重建；
+        // - 登录壁纸的**文件名**：它决定从配置目录读哪个文件、以什么键嵌进 `binaryAssets`。
+        //   导入路径落盘的名字带内容指纹（`config::stored_wallpaper_name`），所以「换了图」
+        //   必然表现为「名字变了」，这里比较文件名就够了。
         let needs_reload = next.shell.inject_enabled != prev.shell.inject_enabled
-            || next.shell.home_url != prev.shell.home_url;
+            || next.shell.home_url != prev.shell.home_url
+            || injector::perfect_icon_enabled(&next) != injector::perfect_icon_enabled(&prev)
+            || next.local.login_wallpaper_file_name != prev.local.login_wallpaper_file_name;
         *guard = next.clone();
         (next, needs_reload)
     };
@@ -671,7 +696,10 @@ fn begin_load<R: Runtime>(app: &AppHandle<R>, url: &str) -> u64 {
         load.generation
     };
     // Task 13a：新的一次加载 = 换了一张窗口/文档，旧上报不再属于当前页面（绝不沿用）。
-    *state.page_report.lock().unwrap() = None;
+    // Task 13b：应用项槽位一并作废（两个槽位共享同一套文档身份门）。
+    clear_report_slots(&state);
+    // Task 13b：分片上报同样绑定文档，换文档必然作废（半截的更不能留）。
+    *state.chunk_report.lock().unwrap() = None;
     generation
 }
 
@@ -689,8 +717,10 @@ fn set_error_state<R: Runtime>(app: &AppHandle<R>, info: &ErrorInfo) -> u64 {
         load.next_retry_seconds = info.next_retry_seconds;
         load.generation
     };
-    // 错误页上永远不注册 mods 载荷，因此也不该留着任何页面上报（Task 13a）。
-    *state.page_report.lock().unwrap() = None;
+    // 错误页上永远不注册 mods 载荷，因此也不该留着任何页面上报（Task 13a；Task 13b 的应用项
+    // 槽位同一时刻作废）。
+    clear_report_slots(&state);
+    *state.chunk_report.lock().unwrap() = None;
     generation
 }
 
@@ -703,6 +733,10 @@ pub fn handle_title<R: Runtime>(window: &WebviewWindow<R>, title: &str) {
     if let Some(payload) = title.strip_prefix(PROBE_TITLE_PREFIX) {
         // 探针标题是「页面 → 宿主」的回传通道，不是给用户看的标题：不镜像、只处理。
         on_load_probe(window.app_handle(), payload);
+        return;
+    }
+    if let Some(payload) = title.strip_prefix(report::CHUNK_TITLE_PREFIX) {
+        on_page_chunk(window, payload);
         return;
     }
     if let Some(payload) = title.strip_prefix(report::REPORT_TITLE_PREFIX) {
@@ -743,27 +777,120 @@ fn on_page_report<R: Runtime>(window: &WebviewWindow<R>, payload: &str) {
             // 否则后来的人会去追一个并不存在的语法 bug（T13b 的大载荷上报正是高风险场景）。
             if reason == report::Reject::NotJson && report::truncation_suspected(payload.len()) {
                 eprintln!(
-                    "[fnos]   ↑ 长度已够到 document.title 的 {} 字节上限，疑似被通道截断（而不是 JSON 语法错）",
+                    "[fnos]   ↑ 长度已够到 document.title 的 {} 字节上限，疑似被通道截断（而不是 JSON 语法错）+ 见 FNOSCHUNK: 分片通道",
                     report::TITLE_CHANNEL_MAX_BYTES
                 );
             }
             return;
         }
     };
-    // 类型与方向只用于日志；两个都过允许表（`accepted_log_line` 内部再查一次，
-    // 白名单外 → 固定串），因此这个日志行**不可能**被页面写成两行（Important 1）。
-    let ty = value.get("type").and_then(Value::as_str).unwrap_or("");
-    let dir = value.get("dir").and_then(Value::as_str);
+    let (origin, url) = document_identity(window);
+    store_report(window, value, origin, url, payload.len());
+}
+
+/// 主窗口当前的**文档身份**：`origin`（`config::origin_of`）与 URL 序列化文本。
+///
+/// 两者一起构成「这条上报属于哪个文档」的判据（`report::ReportEntry::matches_document`）。
+/// 取不到时 `None`——判据是「任一侧取不到一律不认」，所以宁可退回弱文案。
+fn document_identity<R: Runtime>(window: &WebviewWindow<R>) -> (Option<String>, Option<String>) {
     let url = window.url().ok();
     let origin = url.as_ref().and_then(|u| config::origin_of(u.as_str()));
-    let url = url.map(|u| u.to_string());
-    // 日志先打（`origin` / `url` 随后就随 entry 一起进内存了：不 clone、不留第二份）
+    (origin, url.map(|u| u.to_string()))
+}
+
+/// 把一条**通过校验**的上报存进 `AppState`（内存）并打一行日志。
+///
+/// 单条上报（[`on_page_report`]）、到齐的分片上报（[`on_page_chunk`]）以及两条通道的
+/// 任何 `type` 都共用这一段：两条通道的「接受」语义必须完全一样，否则设置窗读到的证据会
+/// 因来源而异。
+///
+/// ## 分流（T13b；见 [`report::is_app_items_report`]）
+///
+/// 「应用项列表」那一种 `type` 进 [`AppState::app_items_report`]，**其余**进
+/// [`AppState::page_report`]。这样 T13a 的强态判据（最近一次状态槽上报是不是
+/// `FNOS_INJECTION_TRIGGERED`）不会被 T13b 自己发起的列表拉取冲掉。两个槽位在
+/// [`document_identity`] 上的门完全一致，读取口 [`get_page_report`] 一并返回。
+///
+/// 日志只能打印白名单里的字段：`type` / `dir` 不在允许表里时渲染成固定串
+/// （[`report::accepted_log_line`]），`origin` 由宿主解析、再折成一行（`log_safe`）。
+fn store_report<R: Runtime>(
+    window: &WebviewWindow<R>,
+    value: Value,
+    origin: Option<String>,
+    url: Option<String>,
+    bytes: usize,
+) {
+    let ty = value.get("type").and_then(Value::as_str).unwrap_or("");
+    let dir = value.get("dir").and_then(Value::as_str);
     eprintln!(
         "{}",
-        report::accepted_log_line(ty, dir, origin.as_deref(), payload.len())
+        report::accepted_log_line(ty, dir, origin.as_deref(), bytes)
     );
     let state = window.state::<AppState>();
-    *state.page_report.lock().unwrap() = Some(report::ReportEntry { value, origin, url });
+    let entry = report::ReportEntry { value, origin, url };
+    let slot = if report::is_app_items_report(&entry.value) {
+        &state.app_items_report
+    } else {
+        &state.page_report
+    };
+    *slot.lock().unwrap() = Some(entry);
+}
+
+/// 清空两个上报槽位（状态槽 + 应用项槽）——它们共享同一套「换文档就作废」的时机。
+fn clear_report_slots(state: &AppState) {
+    *state.page_report.lock().unwrap() = None;
+    *state.app_items_report.lock().unwrap() = None;
+}
+
+/// 收到**一片**分片上报（`document.title` 的 `FNOSCHUNK:` 通道；Task 13b）。
+///
+/// 三道处理顺序刻意固定：先在锁内做「喂一片」（它会做全部边界判定，并在拒绝/完成时清空
+/// 半截状态），再在锁外决定日志与存储——锁不跨越任何可能变慢的动作。
+///
+/// 到齐后**仍然**走 [`report::validate`]：分片通道不是绕过单条通道校验的后门
+/// （字节上限、必须是 JSON 对象、`type` 必须在允许表内）。
+fn on_page_chunk<R: Runtime>(window: &WebviewWindow<R>, payload: &str) {
+    let (origin, url) = document_identity(window);
+    let step = {
+        let state = window.state::<AppState>();
+        let mut slot = state.chunk_report.lock().unwrap();
+        report::accept_chunk(
+            &mut slot,
+            origin.as_deref(),
+            url.as_deref(),
+            payload,
+            std::time::Instant::now(),
+        )
+    };
+    match step {
+        report::ChunkStep::Accepted { seq, total } => {
+            // `seq` / `total` 都是宿主自己解析出来的数字（不是页面可控文本），可以作为日志字段
+            eprintln!("[fnos] 分片上报已接受：seq={seq} total={total}");
+        }
+        report::ChunkStep::Rejected(reason) => {
+            eprintln!(
+                "[fnos] 分片上报被拒（{}；这一片 {} 字节）",
+                reason.as_str(),
+                payload.len()
+            );
+        }
+        report::ChunkStep::Complete(assembled) => {
+            match report::validate(&assembled) {
+                Ok(value) => {
+                    eprintln!("[fnos] 分片上报已到齐（{} 字节）", assembled.len());
+                    store_report(window, value, origin, url, assembled.len());
+                }
+                Err(reason) => {
+                    // 组装完成但内容不合法：同样只留固定短语（不打印正文）
+                    eprintln!(
+                        "[fnos] 分片上报组装后被拒（{}；{} 字节）",
+                        reason.as_str(),
+                        assembled.len()
+                    );
+                }
+            }
+        }
+    }
 }
 
 /// 新文档与最近一次上报**不是同一个文档**（origin 或 URL 不同）→ 丢掉旧上报。
@@ -776,30 +903,78 @@ fn on_page_report<R: Runtime>(window: &WebviewWindow<R>, payload: &str) {
 /// fix round 1 / Minor 3：判据从「只看 origin」收紧为「origin **与文档 URL** 都对得上」
 /// （[`report::ReportEntry::matches_document`]）。同源换文档时第二个文档完全可能没注入
 /// （缺 fnOS 签名），旧证据留在设置窗上就是拿上一张页面描述这一张。
+///
+/// Task 13b：两个上报槽位（状态槽 + 应用项槽）用的是**同一个**文档身份门，所以一起判、一起清。
 fn drop_report_if_document_changed<R: Runtime>(app: &AppHandle<R>, url: &str) {
     let current_origin = config::origin_of(url);
     let state = app.state::<AppState>();
-    let mut slot = state.page_report.lock().unwrap();
-    let stale = match slot.as_ref() {
-        Some(entry) => !entry.matches_document(current_origin.as_deref(), Some(url)),
+    for slot in [&state.page_report, &state.app_items_report] {
+        let mut guard = slot.lock().unwrap();
+        let stale = match guard.as_ref() {
+            Some(entry) => !entry.matches_document(current_origin.as_deref(), Some(url)),
+            None => false,
+        };
+        if stale {
+            *guard = None;
+        }
+    }
+    // Task 13b：分片通道有同样的「文档身份」判据，但它**自己**也判一次（`accept_chunk`
+    // 在文档对不上时拒绝续传）。这里顺手清掉，让「换了文档之后内存里立刻没有半截载荷」
+    // 成为与读取路径无关的性质。
+    let mut chunk = state.chunk_report.lock().unwrap();
+    let chunk_stale = match chunk.as_ref() {
+        Some(assembly) => !assembly.belongs_to(current_origin.as_deref(), Some(url)),
         None => false,
     };
-    if stale {
-        *slot = None;
+    if chunk_stale {
+        *chunk = None;
     }
 }
 
-/// 读最近一次页面上报（`get_page_report` 的返回体；`None` = 没有可用的上报）。
+/// 一个上报槽位在当前文档下的可读副本：文档对不上就**就地清掉**并返回 `None`。
+///
+/// 「及时丢掉」的第二层：页内导航不走 [`begin_load`]，`on_page_event` 也可能因为世代闸门
+/// 而迟到，所以读取路径自己再判一次——判到就清，绝不把旧证据给设置窗。
+fn read_slot_for_current_document(
+    slot: &Mutex<Option<report::ReportEntry>>,
+    origin: Option<&str>,
+    url: Option<&str>,
+) -> Option<Value> {
+    let mut guard = slot.lock().unwrap();
+    let stale = match guard.as_ref() {
+        Some(entry) => !entry.matches_document(origin, url),
+        None => false,
+    };
+    if stale {
+        *guard = None;
+        return None;
+    }
+    guard.as_ref().map(|entry| entry.value.clone())
+}
+
+/// 读页面上报（`get_page_report` 的返回体）。
 ///
 /// **只授予设置窗**（`capabilities/default.json`），与 `get_page_state` 同一档：主窗口
-/// （含内置错误页）拿不到任何命令授权，所以页面永远无法自己读取或改写这条证据。
+/// （含内置错误页）拿不到任何命令授权，所以页面永远无法自己读取或改写这些证据。
 ///
-/// 只有「上报来源 origin == 主窗口当前 origin」**且「上报时的文档 URL == 当前文档 URL」**时
-/// 才返回内容（[`report::ReportEntry::matches_document`]）：取不到当前 URL/origin（窗口已销毁
-/// / 导航还没完成）或文档已换，一律清掉并返回 `None`，设置窗于是退回 Task 11 的弱文案
-/// ——宁可不说，也不谎称已注入。
+/// ## 返回体（Task 13b 起是**信封**，不再是单条上报）
+///
+/// ```json
+/// { "report": <最近一条状态相关上报 | null>, "appItems": <最近一条应用项列表上报 | null> }
+/// ```
+///
+/// 为什么要拆两个槽位而不是「最近一条」：T13b 让 shim 在完美图标启用时主动拉取应用项列表，
+/// 那条上报会晚于上游的 `FNOS_INJECTION_TRIGGERED`——同槽会把 T13a 的强态判据冲掉（功能
+/// 回归）。分流规则的完整论证见 [`report::is_app_items_report`]。
+///
+/// 两个字段各自独立地受「上报来源 origin == 主窗口当前 origin」**且**「上报时的文档 URL ==
+/// 当前文档 URL」的门约束（[`report::ReportEntry::matches_document`]）：取不到当前 URL/origin
+/// （窗口已销毁 / 导航还没完成）或文档已换，对应槽位一律清掉并返回 `null`，设置窗于是退回
+/// Task 11 的弱文案——宁可不说，也不谎称已注入。
+///
+/// 返回体**永远是对象**（两个字段都可以是 `null`），调用方不需要再判「回包是不是 null」。
 #[tauri::command]
-pub fn get_page_report<R: Runtime>(app: AppHandle<R>) -> Option<Value> {
+pub fn get_page_report<R: Runtime>(app: AppHandle<R>) -> Value {
     let current_url = app
         .get_webview_window(MAIN_WINDOW)
         .and_then(|w| w.url().ok());
@@ -808,18 +983,17 @@ pub fn get_page_report<R: Runtime>(app: AppHandle<R>) -> Option<Value> {
         .and_then(|u| config::origin_of(u.as_str()));
     let current_url = current_url.map(|u| u.to_string());
     let state = app.state::<AppState>();
-    let mut slot = state.page_report.lock().unwrap();
-    let stale = match slot.as_ref() {
-        Some(entry) => !entry.matches_document(current_origin.as_deref(), current_url.as_deref()),
-        None => false,
-    };
-    if stale {
-        // 「及时丢掉」的第二层：页内导航不走 `begin_load`，`on_page_event` 也可能因为
-        // 世代闸门而迟到，所以读取路径自己再判一次——判到就清，绝不把旧证据给设置窗。
-        *slot = None;
-        return None;
-    }
-    Some(slot.as_ref()?.value.clone())
+    let report = read_slot_for_current_document(
+        &state.page_report,
+        current_origin.as_deref(),
+        current_url.as_deref(),
+    );
+    let app_items = read_slot_for_current_document(
+        &state.app_items_report,
+        current_origin.as_deref(),
+        current_url.as_deref(),
+    );
+    serde_json::json!({ "report": report, "appItems": app_items })
 }
 
 /// 主窗口页面加载事件。
@@ -1315,6 +1489,81 @@ pub fn reset_config<R: Runtime>(app: AppHandle<R>, scope: String) -> Result<Conf
     ))
 }
 
+// ---------- Task 13b：登录壁纸导入 ----------
+
+/// 校验并落盘一份登录壁纸，返回 `(落盘用的文件名, 字节数)`。
+///
+/// 拆成独立函数是为了能在**临时目录**上单测全部拒绝路径（不必碰真实配置目录）。
+/// 五道闸门按「先便宜后昂贵」排序，任何一步失败都**不落盘**，且错误信息里不回显用户输入的
+/// 文件名（它是设置窗来的文本；回显只会把它带进 UI/日志）：
+///
+/// 1. [`config::wallpaper_mime`]：形状（无分隔符/无 `..`/非隐藏文件）+ 扩展名允许表
+///    （`png` / `jpg` / `jpeg` / `webp`）——与设置窗 `<input accept>` 同一张表；
+/// 2. base64 字符串长度上限（先卡长度，避免给一个几百 MB 的串做无谓解码）；
+/// 3. [`crate::base64::decode`] 严格解码；
+/// 4. 解码后的字节数上限（[`config::MAX_WALLPAPER_BYTES`]，与注入侧同一个常量）；
+/// 5. 落盘名 = [`config::stored_wallpaper_name`]（净化 + 内容指纹），写进 `dir`。
+fn store_wallpaper(
+    dir: &std::path::Path,
+    name: &str,
+    data_base64: &str,
+) -> Result<(String, usize), String> {
+    if !config::is_wallpaper_name(name) {
+        return Err("只支持 png / jpg / jpeg / webp，且文件名不能含路径分隔符".to_string());
+    }
+    // 上面已经保证扩展名在允许表内；这里再取一次是为了做「扩展名与内容一致」的检查
+    let ext = config::wallpaper_ext(name).ok_or_else(|| "扩展名不在允许表内".to_string())?;
+    let max_b64 = (config::MAX_WALLPAPER_BYTES + 2) / 3 * 4;
+    if data_base64.len() > max_b64 {
+        return Err(format!(
+            "图片超过 {} MiB 上限",
+            config::MAX_WALLPAPER_BYTES / 1024 / 1024
+        ));
+    }
+    let bytes =
+        base64::decode(data_base64).map_err(|e| format!("图片数据不是合法的 base64：{e}"))?;
+    if bytes.is_empty() {
+        return Err("图片内容为空".to_string());
+    }
+    if bytes.len() > config::MAX_WALLPAPER_BYTES {
+        return Err(format!(
+            "图片超过 {} MiB 上限",
+            config::MAX_WALLPAPER_BYTES / 1024 / 1024
+        ));
+    }
+    // 扩展名与内容的一致性只做「够用」的检查：PNG 要求魔数，其余的交给 WebView2 解码失败时
+    // 表现为「壁纸没生效」（不额外拒绝，避免把正常的 JPEG 变体挡在门外）。
+    if ext == "png" && !bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
+        return Err("文件内容不是 PNG（扩展名与内容不符）".to_string());
+    }
+    let stored = config::stored_wallpaper_name(name, &bytes);
+    std::fs::create_dir_all(dir).map_err(|e| format!("配置目录不可写：{e}"))?;
+    std::fs::write(dir.join(&stored), &bytes).map_err(|e| format!("写入配置目录失败：{e}"))?;
+    Ok((stored, bytes.len()))
+}
+
+/// 导入登录壁纸（Task 13b）：本项目**唯一**会按 UI 请求写文件的 IPC 命令，只授予设置窗。
+///
+/// 为什么要宿主代写：设置窗是普通 webview，没有（也不该有）文件系统权限；而壁纸必须落在
+/// **配置目录**里——`injector::load_wallpaper` 只从那里按 `local.loginWallpaperFileName` 读。
+/// 于是设置窗把选中的文件读成 base64 交给这里，宿主校验后写盘，并返回**落盘用的名字**；
+/// UI 再走既有的 `set_config` 写 `local.loginWallpaperFileName`（导入本身不改任何配置，
+/// 两步都由设置窗发起，用户看得见）。
+///
+/// 落盘名由内容指纹决定（`config::stored_wallpaper_name`），于是「换了图」必然表现为
+/// 「配置里的名字变了」——`set_config` 的 `needsReload` 判据因此能发现它，下一次建窗
+/// 载荷里嵌的就是新图（需求 A 的壁纸那一半）。
+///
+/// 参数名走 tauri 的默认 camelCase 约定：JS 侧传 `{ name, dataBase64 }`
+/// （`ui/settings/bridge.js::importWallpaper`）。
+#[tauri::command]
+pub fn import_wallpaper(name: String, data_base64: String) -> Result<String, String> {
+    let (stored, bytes) = store_wallpaper(&paths::config_dir(), &name, &data_base64)?;
+    // `stored` 是宿主自己算出来的 ASCII 名字（`[a-z0-9-_]` + 扩展名），不含换行、可以直接进日志
+    eprintln!("[fnos] 登录壁纸已导入：{stored}（{bytes} 字节）");
+    Ok(stored)
+}
+
 // ---------- Rust 内部（非 IPC） ----------
 
 pub fn open_settings<R: Runtime>(app: &AppHandle<R>) {
@@ -1396,6 +1645,8 @@ pub fn save_and_install_state<R: Runtime>(
         recreate_error: Mutex::new(None),
         recovered_from_backup: AtomicBool::new(recovered_from_backup),
         page_report: Mutex::new(None),
+        app_items_report: Mutex::new(None),
+        chunk_report: Mutex::new(None),
     });
 }
 
@@ -1788,5 +2039,259 @@ mod tests {
                 "tests/normalize.test.mjs 的输入表缺少/改动了这一行（两侧必须同步）：{needle}"
             );
         }
+    }
+
+    // ---------- Task 13b：登录壁纸导入 ----------
+
+    /// 每个测试一个独立临时目录（按 tag + pid 命名），与 config.rs 同一套做法。
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("fnos-cmd-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// PNG 魔数 + 一点点数据（够 `store_wallpaper` 的魔数检查）。
+    fn png_bytes() -> Vec<u8> {
+        let mut v = vec![0x89u8, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+        v.extend_from_slice(&[1, 2, 3, 4, 5]);
+        v
+    }
+
+    /// 愉快路径：落盘名是宿主自己算的（净化 + 内容指纹）、内容逐字节相等、幂等。
+    #[test]
+    fn import_wallpaper_writes_the_bytes_under_a_derived_name() {
+        let dir = temp_dir("wallpaper-import");
+        let bytes = png_bytes();
+        let b64 = base64::encode(&bytes);
+
+        let (stored, len) = store_wallpaper(&dir, "我的壁纸 (1).png", &b64).expect("应当成功");
+        assert_eq!(len, bytes.len());
+        assert!(
+            stored.starts_with("wallpaper-1-") || stored.starts_with("1-"),
+            "stem 里的非 ASCII 被净化成连字符：{stored}"
+        );
+        assert!(stored.ends_with(".png"), "{stored}");
+        assert!(
+            config::is_wallpaper_name(&stored),
+            "落盘名必须是安全形状：{stored}"
+        );
+        let written = std::fs::read(dir.join(&stored)).expect("文件必须真的落盘");
+        assert_eq!(written, bytes, "落盘内容必须逐字节相等");
+
+        // 幂等：同一份内容 + 同一个原始名 → 同一个落盘名（不重复堆文件）
+        let again = store_wallpaper(&dir, "我的壁纸 (1).png", &b64).expect("应当成功");
+        assert_eq!(again.0, stored);
+        let count = std::fs::read_dir(&dir).unwrap().count();
+        assert_eq!(count, 1, "同一份内容不该留下两个文件");
+
+        // 内容变了 → 名字变了（这是 `needsReload` 能发现「换了图」的前提）
+        let mut other = bytes.clone();
+        other.push(9);
+        let (stored2, _) =
+            store_wallpaper(&dir, "我的壁纸 (1).png", &base64::encode(&other)).unwrap();
+        assert_ne!(stored2, stored);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2);
+
+        // 目录不存在时自己建（配置目录可能被用户删掉）
+        let nested = dir.join("nested/deeper");
+        let (inner, _) = store_wallpaper(&nested, "a.png", &b64).expect("应当自己建目录");
+        assert!(nested.join(&inner).exists(), "嵌套目录里的文件必须真的存在");
+
+        // 扩展名按原样保留
+        for (name, ext) in [
+            ("a.jpg", "jpg"),
+            ("a.jpeg", "jpeg"),
+            ("a.webp", "webp"),
+            ("a.PNG", "png"),
+        ] {
+            let body = if ext == "png" {
+                bytes.clone()
+            } else {
+                vec![0xff, 0xd8, 0xff]
+            };
+            let (n, _) = store_wallpaper(&dir, name, &base64::encode(&body)).unwrap();
+            assert!(n.ends_with(&format!(".{ext}")), "{name} -> {n}");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 拒绝路径：每一条都**不落盘**，且错误信息里不回显用户输入的文件名。
+    #[test]
+    fn import_wallpaper_rejects_every_bad_shape_without_writing() {
+        let dir = temp_dir("wallpaper-reject");
+        let b64 = base64::encode(&png_bytes());
+
+        // ① 扩展名 / 形状
+        for bad in [
+            "anim.gif",
+            "wallpaper",
+            "wallpaper.svg",
+            "../evil.png",
+            "sub/evil.png",
+            "sub\\evil.png",
+            "C:\\evil.png",
+            "evil\nname.png",
+            ".png",
+        ] {
+            assert!(
+                store_wallpaper(&dir, bad, &b64).is_err(),
+                "bad={bad:?} 必须被拒"
+            );
+        }
+        // 错误信息不得回显用户输入（它会直接进设置窗的界面）
+        let err = store_wallpaper(&dir, "CANARY-canary.png\n", &b64).expect_err("必须拒绝");
+        assert!(!err.contains("CANARY"), "错误信息不得回显用户输入：{err}");
+        assert_eq!(err.lines().count(), 1, "错误信息必须只有一行：{err}");
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            0,
+            "被拒的导入不得留下任何文件"
+        );
+
+        // ② base64 本身不合法（长度 / 字母表 / padding）
+        for bad in ["!!!", "AAAAA", "AA=A", "AAA", "AA==AAA"] {
+            assert!(
+                store_wallpaper(&dir, "a.png", bad).is_err(),
+                "bad={bad:?} 必须被拒"
+            );
+        }
+        // ③ 空内容
+        assert!(store_wallpaper(&dir, "a.png", "").is_err());
+        // ④ 扩展名与内容不符（声明 png 但不是 PNG 魔数）
+        let jpeg = base64::encode(&[0xffu8, 0xd8, 0xff, 0xe0, 0x00]);
+        assert!(store_wallpaper(&dir, "a.png", &jpeg).is_err());
+        // ⑤ 超过 8 MiB：先被 base64 长度闸门挡下（不进入解码，也就不会分配几十 MB）
+        let max_b64 = (config::MAX_WALLPAPER_BYTES + 2) / 3 * 4;
+        let huge = "A".repeat(max_b64 + 1);
+        let err = store_wallpaper(&dir, "a.png", &huge).expect_err("超限必须被拒");
+        assert!(err.contains("8 MiB"), "{err}");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Task 13b 的注册不变式：每个 IPC 命令都必须在**四**个地方出现，且授权面没有扩大。
+    ///
+    /// 这四条正好是「漏一个」的四种表现：漏 `build.rs` = **构建失败**；漏 `main.rs` = 命令不
+    /// 存在；漏 `default.json` = 设置窗调用被 ACL 拒绝（运行期静默失败）；漏 `remote-deny.json`
+    /// = 少一层纵深防御。Task 13a 的静态检查脚本（`_t13a-capcheck.ps1`）做的是同一件事，
+    /// 这里把它固化成一个每次 `cargo test` 都会跑的机械锁。
+    #[test]
+    fn every_ipc_command_is_registered_in_all_four_places() {
+        const CMDS: [&str; 9] = [
+            "get_config",
+            "set_config",
+            "reload_main",
+            "open_config_dir",
+            "open_url",
+            "reset_config",
+            "get_page_state",
+            "get_page_report",
+            "import_wallpaper",
+        ];
+        let build = include_str!("../build.rs");
+        let main_rs = include_str!("main.rs");
+        let default_json = include_str!("../capabilities/default.json");
+        let remote_deny = include_str!("../capabilities/remote-deny.json");
+        for cmd in CMDS {
+            assert!(
+                build.contains(&format!("\"{cmd}\"")),
+                "build.rs 的 AppManifest::commands 缺少 {cmd}（漏了会构建失败）"
+            );
+            assert!(
+                main_rs.contains(&format!("commands::{cmd}")),
+                "main.rs 的 invoke_handler 缺少 {cmd}"
+            );
+            let kebab = cmd.replace('_', "-");
+            assert!(
+                default_json.contains(&format!("\"allow-{kebab}\"")),
+                "capabilities/default.json 缺少 allow-{kebab}（设置窗会被 ACL 拒绝）"
+            );
+            if cmd == "open_url" {
+                // **既有的、已知的**覆盖缺口（T9 的评审已记录，T13a 的描述里也写明「留待整支
+                // 评审 triage，本轮不扩大范围」）：`open_url` 同样没有对远程的授权，所以少一条
+                // deny 不构成授权面。本轮不顺手改它——那会把「谁决定的、为什么」变得含糊。
+                // 这里显式钉住「只有它是例外」，将来补上 deny 时这条断言会失败并提醒更新描述。
+                assert!(
+                    !remote_deny.contains("\"deny-open-url\""),
+                    "open_url 的 deny 缺口是已知项；若要补上，请同时更新 remote-deny.json 的描述与本断言"
+                );
+                continue;
+            }
+            assert!(
+                remote_deny.contains(&format!("\"deny-{kebab}\"")),
+                "capabilities/remote-deny.json 缺少 deny-{kebab}"
+            );
+        }
+        // 授权面：设置窗有 9 个 allow-*，远程那份**一个授权都没有**
+        assert_eq!(
+            default_json.matches("\"allow-").count(),
+            CMDS.len(),
+            "default.json 的 allow-* 条数必须与命令数一致"
+        );
+        assert_eq!(
+            remote_deny.matches("\"allow-").count(),
+            0,
+            "remote-deny.json 不得包含任何 allow-*（它只做拒绝）"
+        );
+        assert!(
+            !default_json.contains("\"remote\""),
+            "设置窗的 capability 不得有 remote 块"
+        );
+        assert!(
+            default_json.contains("\"windows\": [\"settings\"]"),
+            "命令只授予设置窗（label = settings）"
+        );
+        assert!(
+            remote_deny.contains("\"remote\""),
+            "远程拒绝必须显式针对 remote 执行上下文"
+        );
+    }
+
+    /// 分片前缀必须与 `shim.js` 里的字面量同源（Task 13b）——与 `REPORT_TITLE_PREFIX`
+    /// 同一手法：不一致的表现是**静默丢数据**（页面写了 `FNOSCHUNK:`，宿主当成普通标题
+    /// 镜像到窗口上，分片永远拼不起来）。
+    #[test]
+    fn chunk_prefix_and_shim_agree() {
+        let shim = include_str!("../inject/shim.js");
+        assert!(
+            !report::CHUNK_TITLE_PREFIX.is_empty()
+                && report::CHUNK_TITLE_PREFIX
+                    .chars()
+                    .all(|c| c.is_ascii_graphic()),
+            "分片前缀必须是可打印 ASCII（WebView2 会吃掉控制字符）"
+        );
+        assert!(
+            !report::CHUNK_TITLE_PREFIX.starts_with(report::REPORT_TITLE_PREFIX)
+                && !report::REPORT_TITLE_PREFIX.starts_with(report::CHUNK_TITLE_PREFIX),
+            "两个控制前缀不得互相包含，否则分支顺序会决定谁被吃掉"
+        );
+        assert!(
+            shim.contains(&format!("'{}'", report::CHUNK_TITLE_PREFIX)),
+            "shim.js 里的分片前缀必须由 report::CHUNK_TITLE_PREFIX 逐字而来"
+        );
+        // 页面侧的分片上限必须与宿主侧**同量级**（页面少切 = 宿主拒收；页面多切 = 白跑）
+        assert!(
+            shim.contains("REPORT_CHUNK_MAX = 8"),
+            "shim 的分片数上限必须与 report::MAX_CHUNKS 一致"
+        );
+        assert!(
+            shim.contains("REPORT_CHUNK_BODY_MAX_BYTES = 3000"),
+            "shim 的单片字节上限必须与 report::MAX_CHUNK_BODY_BYTES 一致"
+        );
+    }
+
+    /// 分片通道不得退化成 IPC：页面侧仍然一个命令都调不动（R70 的不变式）。
+    #[test]
+    fn chunk_channel_stays_on_the_title_transport() {
+        let shim = include_str!("../inject/shim.js");
+        assert!(
+            !shim.contains("invoke("),
+            "分片上报也只能写 document.title，不得改用 IPC"
+        );
+        assert!(
+            shim.contains("setTimeout"),
+            "分片必须跨 task 发送（同帧连写会被合并）"
+        );
     }
 }

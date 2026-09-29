@@ -390,6 +390,139 @@ fn strip_suffix_ascii_ci<'a>(v: &'a str, suffix: &str) -> Option<&'a str> {
     v.get(..start)
 }
 
+// ---------- 登录壁纸（Task 13b）：`local.loginWallpaperFileName` 的取值约束 ----------
+//
+// 与 `is_valid_prefect_icon_path` 同一个立场：**配置文件里的值是用户文本**（`open_config_dir`
+// 明示了路径，手改是预期用法），所以任何要*使用*它的地方——`injector` 读文件、
+// `commands::import_wallpaper` 写文件——都必须先过下面这几个纯函数。
+//
+// 这与 `shell.nasUrl` 的处理方式一致：**不**在 `Config::normalize` 里删掉不合法的值
+// （用户要能在 config.json 里看到自己的错字），而是让所有消费方一致地表现为「没有可用壁纸」，
+// 并在 stderr 留一行说明。
+
+/// 登录壁纸的文件名长度上限（放宽后的形状判定用）。本壳自己生成的名字最长约 56 字符。
+const MAX_WALLPAPER_NAME_LEN: usize = 256;
+
+/// 登录壁纸的**大小上限**（8 MiB）。
+///
+/// 为什么有上限：壁纸要 base64 后塞进初始化脚本（`binaryAssets`），WebView2 每次建窗都要
+/// 解析这段文本。10 MiB 的图 → ~13.4 MiB 的脚本，建窗会明显变慢；8 MiB 足够覆盖 4K JPEG。
+/// 超限时 `injector` 打一行日志并**跳过**这一项（不 panic、不截断）。
+pub const MAX_WALLPAPER_BYTES: usize = 8 * 1024 * 1024;
+
+/// 登录壁纸允许的扩展名（小写规范形式）：`png` / `jpg` / `jpeg` / `webp`。
+///
+/// 与设置窗文件输入的 `accept` 一致（`ui/settings/schema.js` 的 `imageFile` 项）：
+/// 上游只把壁纸当 CSS `background-image` 用，这三种格式是 WebView2 一定能解码的。
+pub fn wallpaper_ext(name: &str) -> Option<&'static str> {
+    let lower = name.to_ascii_lowercase();
+    for ext in ["png", "jpg", "jpeg", "webp"] {
+        if lower.len() > ext.len() + 1 && lower.ends_with(&format!(".{ext}")) {
+            return Some(match ext {
+                "png" => "png",
+                "jpg" => "jpg",
+                "jpeg" => "jpeg",
+                _ => "webp",
+            });
+        }
+    }
+    None
+}
+
+/// 文件名是否是一个**可用的登录壁纸名**。
+///
+/// 两个入口共用这一份判定：① `import_wallpaper` 收到的用户文件名；②
+/// `local.loginWallpaperFileName` 这个**配置值**（`injector::load_wallpaper_from` 要拿它
+/// `Path::join` 去读文件）。因此规则是「形状安全 + 扩展名在允许表内」，而**不**要求纯 ASCII：
+/// 用户把文件叫「登录壁纸.png」是再正常不过的事，而 R30 的教训正是「带点非 ASCII 就把用户的
+/// 配置静默丢掉，比拒绝更难排障」。
+///
+/// 明确拒绝（每一条都有理由，不是洁癖）：
+/// - 空 / 超过 256 字节 / 首尾有空白（Windows 会静默吃掉路径末尾的空格与点 → 配置值与实际
+///   打开的文件不是一个东西）；
+/// - 路径分隔符 `/` `\`、盘符 `:`、Windows 保留字符 `*?"<>|`、`..`、以 `.` 开头 → 穿越与
+///   意外路径（`Path::join` 遇到分隔符会真的换目录）；
+/// - 任何控制字符（含 `\n`：日志是本项目的评审证据，绝不允许页面/用户可控文本换行）；
+/// - 没有扩展名或扩展名不在 `png/jpg/jpeg/webp` 内（mime 由扩展名推导，见 [`wallpaper_mime`]）。
+pub fn is_wallpaper_name(name: &str) -> bool {
+    if name.is_empty() || name.len() > MAX_WALLPAPER_NAME_LEN {
+        return false;
+    }
+    if name.trim() != name || name.starts_with('.') || name.contains("..") {
+        return false;
+    }
+    if name.chars().any(|c| {
+        c.is_control()
+            || matches!(
+                c,
+                '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '\u{0}'
+            )
+    }) {
+        return false;
+    }
+    wallpaper_ext(name).is_some()
+}
+
+/// 登录壁纸的 mime（由扩展名推导）；名字形状不合法或扩展名不在允许表内 → `None`。
+///
+/// 与 shim 的 `mimeFor(path)` 同源（那边也要认 `jpg`/`jpeg`/`webp`，否则 data URL 会被
+/// 标成 `text/plain`），两处都从这份允许表出发。
+pub fn wallpaper_mime(name: &str) -> Option<&'static str> {
+    if !is_wallpaper_name(name) {
+        return None;
+    }
+    match wallpaper_ext(name)? {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        _ => Some("image/webp"),
+    }
+}
+
+/// FNV-1a 64 位散列（内容指纹）。
+///
+/// 只为「同一份文件导入两次得到同一个名字」这一件事服务：导入的落盘名 = `<stem>-<指纹>.png`
+/// （见 [`stored_wallpaper_name`]），于是**内容变了名字才变**，`set_config` 的
+/// `needsReload` 判据（比较文件名）与「载荷里嵌的是哪张图」天然一致——不会出现
+/// 「重新导入同名文件但页面还是旧图」。不是密码学散列，也不当校验和用。
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in bytes {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// 把用户选中的文件名净化成 `<stem>-<16 位指纹>.<ext>`（小写）。
+///
+/// 为什么不直接用用户给的名字：① 用户的文件名可能含中文/空格/路径片段，直接落盘既可能穿越、
+/// 也可能与配置目录里的既有文件（含 `config.json`）撞名；② 覆盖同名文件会让「文件内容变了但
+/// 配置里的名字没变」——主窗口就不会重建，页面继续用旧图。指纹让它**由内容决定**。
+///
+/// `original` 的扩展名必须先过 [`wallpaper_ext`]（调用方已经判过），这里只负责 stem。
+pub fn stored_wallpaper_name(original: &str, bytes: &[u8]) -> String {
+    let stem_raw = original
+        .rsplit_once('.')
+        .map(|(s, _)| s)
+        .unwrap_or(original);
+    let mut stem = String::with_capacity(stem_raw.len());
+    for c in stem_raw.chars() {
+        let c = c.to_ascii_lowercase();
+        if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+            stem.push(c);
+        } else if !stem.ends_with('-') {
+            stem.push('-');
+        }
+        if stem.len() >= 32 {
+            break;
+        }
+    }
+    let stem = stem.trim_matches('-');
+    let stem = if stem.is_empty() { "wallpaper" } else { stem };
+    let ext = wallpaper_ext(original).unwrap_or("png");
+    format!("{stem}-{:016x}.{ext}", fnv1a64(bytes))
+}
+
 /// `<path>.bak`（追加式命名：对 `config.json` 得 `config.json.bak`）。
 fn bak_path(path: &Path) -> PathBuf {
     let mut name = path.as_os_str().to_os_string();
@@ -1807,5 +1940,168 @@ mod tests {
         c.normalize();
         c.normalize();
         assert_eq!(c.mods.enabled_origins, vec!["http://nas.local:8000"]);
+    }
+
+    // ---------- 登录壁纸（Task 13b）：`local.loginWallpaperFileName` 的取值约束 ----------
+
+    /// 允许表：`png` / `jpg` / `jpeg` / `webp`（大小写不敏感）；其余一律拒绝。
+    ///
+    /// 「拒绝」是**形状**层面的，所以 `svg` / `gif` / `bmp` / `ico` / 没有扩展名 / 只有点
+    /// 都在这里被挡掉——它们永远不会走到读文件或写文件那一步。
+    #[test]
+    fn wallpaper_extension_allow_list_is_exact() {
+        for (name, mime) in [
+            ("wallpaper.png", "image/png"),
+            ("WALLPAPER.PNG", "image/png"),
+            ("a.jpg", "image/jpeg"),
+            ("a.jpeg", "image/jpeg"),
+            ("a.JPEG", "image/jpeg"),
+            ("a.webp", "image/webp"),
+            ("my-photo_2024.09.jpg", "image/jpeg"),
+            ("wallpaper-0a1b2c3d4e5f6071.png", "image/png"),
+            // 中文文件名与**内部空格**都要放行：用户把文件叫「登录壁纸.png」很常见，
+            // 而落盘名由 `stored_wallpaper_name` 重新生成（与这里的名字无关）。
+            ("登录壁纸.png", "image/png"),
+            ("my wallpaper.png", "image/png"),
+            ("壁纸 1.jpeg", "image/jpeg"),
+        ] {
+            assert_eq!(wallpaper_mime(name), Some(mime), "{name}");
+            assert!(is_wallpaper_name(name), "{name}");
+        }
+        for name in [
+            "",
+            "wallpaper",     // 没有扩展名
+            "wallpaper.svg", // 设置窗的 accept 之外
+            "wallpaper.gif",
+            "wallpaper.bmp",
+            "wallpaper.ico",
+            "wallpaper.avif",
+            "wallpaper.", // 只有点
+            ".png",       // 隐藏文件 / 没有 stem
+            ".hidden.png",
+            "中文", // 没有扩展名
+            "a/b.png",
+            "a\\b.png",
+            "..png",
+            "../x.png",
+            "C:x.png",   // 盘符（冒号被拒）
+            "a\nb.png",  // 换行（日志注入的载体）
+            "a\tb.png",  // 制表符
+            " lead.png", // 首尾空白（Windows 会吃掉路径末尾的空白/点）
+            "trail.png ",
+            "a*b.png", // Windows 保留字符
+            "a?b.png",
+            "a\"b.png",
+            "a<b.png",
+            "a>b.png",
+            "a|b.png",
+        ] {
+            assert_eq!(wallpaper_mime(name), None, "{name:?} 必须被拒");
+            assert!(!is_wallpaper_name(name), "{name:?} 必须被拒");
+        }
+        // `wallpaper.png.png` 的具体结论：字符集允许、扩展名判定看**最后**一段，于是它是
+        // 「合法形状」——这不是漏洞（名字里没有分隔符就不能穿越，落盘名还会被重新生成），
+        // 这里显式钉住真实语义，免得将来有人照着错误的期望去改实现。
+        assert!(is_wallpaper_name("wallpaper.png.png"));
+        assert_eq!(wallpaper_mime("wallpaper.png.png"), Some("image/png"));
+
+        // 超长名字（>256 字节）拒绝
+        assert!(!is_wallpaper_name(&format!("{}.png", "a".repeat(300))));
+        // 正好在长度上限内则放行（上限是「含」上限）
+        let ok = format!("{}.png", "a".repeat(MAX_WALLPAPER_NAME_LEN - 4));
+        assert_eq!(ok.len(), MAX_WALLPAPER_NAME_LEN);
+        assert!(is_wallpaper_name(&ok));
+    }
+
+    /// 扩展名推导本身（`import_wallpaper` 用它做「扩展名与内容一致」的那一条检查）。
+    #[test]
+    fn wallpaper_ext_is_ascii_case_insensitive() {
+        assert_eq!(wallpaper_ext("a.PNG"), Some("png"));
+        assert_eq!(wallpaper_ext("a.JpEg"), Some("jpeg"));
+        assert_eq!(wallpaper_ext("a.WebP"), Some("webp"));
+        assert_eq!(wallpaper_ext("登录壁纸.PNG"), Some("png"));
+        assert_eq!(wallpaper_ext("png"), None);
+        assert_eq!(wallpaper_ext(".png"), None);
+        assert_eq!(wallpaper_ext("a.pngs"), None);
+    }
+
+    /// 落盘名由「净化后的 stem + 内容指纹」组成：
+    /// ① 用户文件的路径/空格/中文不会带进来；② 同一份内容永远得到同一个名字；
+    /// ③ 内容变了名字就变（这是 `set_config` 的 `needsReload` 判据能发现换图的前提）。
+    #[test]
+    fn stored_wallpaper_name_is_content_addressed_and_sanitized() {
+        let png = [0x89u8, 0x50, 0x4e, 0x47];
+        let jpeg = [0xffu8, 0xd8, 0xff, 0xe0];
+
+        let a = stored_wallpaper_name("my photo.png", &png);
+        assert_eq!(a, stored_wallpaper_name("my photo.png", &png), "同内容同名");
+        assert_eq!(a, stored_wallpaper_name("MY PHOTO.PNG", &png), "大小写归一");
+        assert!(a.starts_with("my-photo-"), "{a}");
+        assert!(a.ends_with(".png"), "{a}");
+        assert_eq!(a.len(), "my-photo-".len() + 16 + 4, "{a}");
+        assert!(is_wallpaper_name(&a), "{a}");
+        assert_eq!(wallpaper_mime(&a), Some("image/png"));
+
+        // 内容不同 → 名字不同（换图必然触发一次主窗口重建）
+        assert_ne!(a, stored_wallpaper_name("my photo.png", &jpeg));
+
+        // 危险/奇怪的用户输入不会渗进落盘名
+        for (raw, ext) in [
+            (r"C:\Users\x\壁纸 1.png", "png"),
+            ("../../etc/passwd.png", "png"),
+            ("\n[fnos] 注入.png", "png"),
+            ("...png", "png"),
+            ("中文名字.jpeg", "jpeg"),
+        ] {
+            let n = stored_wallpaper_name(raw, &png);
+            assert!(is_wallpaper_name(&n), "raw={raw:?} -> {n}");
+            assert!(n.ends_with(&format!(".{ext}")), "raw={raw:?} -> {n}");
+            assert!(
+                !n.contains('/') && !n.contains('\\') && !n.contains('\n') && !n.contains(':'),
+                "raw={raw:?} -> {n}"
+            );
+        }
+        // stem 全是非法字符 → 回落固定词，且不是空名字
+        let fallback = stored_wallpaper_name("///.png", &png);
+        assert!(fallback.starts_with("wallpaper-"), "{fallback}");
+        // 超长 stem 被截到 32 字符以内
+        let long = stored_wallpaper_name(&format!("{}.png", "z".repeat(200)), &png);
+        assert!(long.len() <= 32 + 1 + 16 + 4, "{long}");
+        // 扩展名按原样保留（jpg / jpeg 各自成一种）
+        assert!(stored_wallpaper_name("x.jpg", &png).ends_with(".jpg"));
+        assert!(stored_wallpaper_name("x.jpeg", &png).ends_with(".jpeg"));
+        assert!(stored_wallpaper_name("x.webp", &png).ends_with(".webp"));
+    }
+
+    /// `local.loginWallpaperFileName` **不进** `normalize` 的过滤：用户手改的错名字要留在
+    /// 配置文件里可见可改（与 `nasUrl` 的「保留原文但禁用」同一条纪律），
+    /// 只是消费方（`injector` / `import_wallpaper`）一律不采用它。
+    #[test]
+    fn wallpapers_name_is_kept_verbatim_in_config() {
+        let dir = temp_dir("wallpaper-keep");
+        let p = dir.join("config.json");
+        std::fs::write(
+            &p,
+            br#"{"local":{"loginWallpaperFileName":"../../etc/passwd.png"}}"#,
+        )
+        .unwrap();
+        let c = load(&p);
+        assert_eq!(
+            c.local.login_wallpaper_file_name.as_deref(),
+            Some("../../etc/passwd.png"),
+            "不合法的名字必须留在配置里（用户要能看到自己的错字）"
+        );
+        assert_eq!(wallpaper_mime("../../etc/passwd.png"), None);
+        c.save(&p).unwrap();
+        assert!(std::fs::read_to_string(&p)
+            .unwrap()
+            .contains("../../etc/passwd.png"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 大小上限是公开常量：注入侧与导入侧必须用同一个数（8 MiB）。
+    #[test]
+    fn wallpaper_size_cap_is_eight_mib() {
+        assert_eq!(MAX_WALLPAPER_BYTES, 8 * 1024 * 1024);
     }
 }

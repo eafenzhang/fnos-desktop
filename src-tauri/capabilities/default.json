@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "settings-only",
-  "description": "只允许设置窗调用应用命令；远程页面无任何授权（Task 11 的 get_page_state 与 Task 13a 的 get_page_report 同样只授设置窗；页面→宿主上报走 document.title，不占任何权限）",
+  "description": "只允许设置窗调用应用命令；远程页面无任何授权（Task 11 的 get_page_state 与 Task 13a 的 get_page_report 同样只授设置窗；页面→宿主上报走 document.title，不占任何权限。Task 13b 的 import_wallpaper 是唯一会写文件的命令——它也只授设置窗，远程页面对它同样没有授权）",
   "windows": ["settings"],
   "permissions": [
     "core:default",
@@ -12,6 +12,7 @@
     "allow-open-url",
     "allow-reset-config",
     "allow-get-page-state",
-    "allow-get-page-report"
+    "allow-get-page-report",
+    "allow-import-wallpaper"
   ]
 }
