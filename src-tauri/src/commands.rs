@@ -677,30 +677,47 @@ fn new_window_verdict<R: Runtime>(
     }
 }
 
-/// 为一个 `window.open` 请求建窗口。
+/// 为一个 `window.open` 请求建窗口（T14c 修复轮 13：**无边框 + 本壳自绘标题栏**）。
 ///
-/// 三条纪律：
-/// - **不注入任何脚本**：本壳的桌面注入（mods / dock / keepalive）只属于主窗口，
-///   应用页面按原样跑——注入桌面样式会改掉别人的界面，不是「开窗口」该做的事；
+/// 四条纪律：
+/// - **无边框 + 自绘标题栏**：原先带的是 Windows 原生标题栏，与桌面里的窗口（上游 mod 的
+///   mac / windows 风格）**长得不一样**；用户要求统一。标题栏画在**应用自己的页面里**
+///   （`inject/appchrome.js`），因此不受「应用会跳出 iframe」的限制；
+/// - **不注入桌面脚本**：mods / dock / keepalive 只属于主窗口；这里注入的只是标题栏规格
+///   （`window.__FNOS_APP_CHROME__`）与那一个脚本；
 /// - 标签唯一（`app-1`、`app-2`…）：tauri 要求标签唯一，进程内计数即可；
-/// - 标题先取主机名，之后跟随页面标题；**不**走 [`handle_title`]——那是主窗口的探针/上报
-///   通道，应用页面的标题不该写进主窗口的上报槽位。
+/// - 标题先取主机名；**不**走 [`handle_title`]——那是主窗口的探针/上报通道，
+///   应用页面的标题不该写进主窗口的上报槽位。
 fn open_app_window<R: Runtime>(
     app: &AppHandle<R>,
     url: tauri::Url,
 ) -> tauri::Result<WebviewWindow<R>> {
     static NEXT_APP_WINDOW: AtomicUsize = AtomicUsize::new(1);
     let label = format!("app-{}", NEXT_APP_WINDOW.fetch_add(1, Ordering::Relaxed));
-    let title = url.host_str().unwrap_or("fnOS 应用").to_string();
+    // 标题取主机名的第一段（`hermes-studio.ea121314.fnos.net` → `hermes-studio`）
+    let host = url.host_str().unwrap_or("");
+    let title = host
+        .split('.')
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("fnOS 应用")
+        .to_string();
+    // 标题栏样式跟随配置（`mods.titlebarStyle`）：桌面里的窗口长什么样，应用窗口就长什么样
+    let style = current(app).mods.titlebar_style.clone();
+    let spec = serde_json::json!({ "style": style, "label": label, "title": title });
     // 嵌套弹窗（应用自己再开小窗）同样走这条裁定
     let app_for_nested = app.clone();
     WebviewWindowBuilder::new(app, &label, WebviewUrl::External(url))
         .title(title)
         .inner_size(1100.0, 700.0)
         .center()
-        .on_document_title_changed(|window, title| {
-            let _ = window.set_title(&title);
-        })
+        // 无边框：标题栏由 `inject/appchrome.js` 自绘（Windows 保留可缩放边框，拖边缘仍能改大小）
+        .decorations(false)
+        .initialization_script(format!(
+            "window.__FNOS_APP_CHROME__ = {spec};\n{script}\n",
+            spec = spec,
+            script = injector::APP_CHROME_JS
+        ))
         .on_new_window(move |url, _features| new_window_verdict(&app_for_nested, url))
         .build()
 }
@@ -2765,14 +2782,55 @@ mod tests {
             .find("/// 建**内置错误页**窗口")
             .expect("错误页建窗函数必须紧随其后");
         let body = &src[open_at..end];
+        // 注入的只能是**标题栏**规格与脚本：桌面载荷（mods / dock / keepalive）不得进应用窗口
         assert!(
-            !body.contains("initialization_script"),
+            body.contains("__FNOS_APP_CHROME__") && body.contains("injector::APP_CHROME_JS"),
+            "应用窗口必须注入自绘标题栏（规格 + 脚本）"
+        );
+        assert!(
+            !body.contains("build_init_script") && !body.contains("__FNOS_SHELL__"),
             "应用窗口不得注入桌面脚本（mods/dock/keepalive 只属于主窗口）"
+        );
+        assert!(
+            body.contains(".decorations(false)"),
+            "应用窗口必须无边框（否则原生标题栏与桌面窗口样式不统一）"
+        );
+        assert!(
+            body.contains("mods.titlebar_style"),
+            "标题栏样式必须跟随配置（桌面窗口长什么样，应用窗口就长什么样）"
         );
         assert!(
             !body.contains("handle_title"),
             "应用窗口标题不得走主窗口的上报通道"
         );
         assert!(body.contains("AtomicUsize"), "标签必须唯一（进程内计数）");
+        // 自绘标题栏的按钮/拖拽要 IPC，权限只授 app-* 窗口的窗口操作
+        let cap = include_str!("../capabilities/app-windows.json");
+        assert!(cap.contains("\"app-*\""), "能力必须只授 app-* 窗口");
+        for perm in [
+            "core:window:allow-start-dragging",
+            "core:window:allow-minimize",
+            "core:window:allow-toggle-maximize",
+            "core:window:allow-close",
+        ] {
+            assert!(cap.contains(perm), "自绘标题栏缺少权限：{perm}");
+        }
+        assert!(
+            !cap.contains("\"allow-get-config\"") && !cap.contains("\"allow-open-url\""),
+            "应用窗口不得得到任何应用命令授权"
+        );
+        // 标题栏脚本本身：拖拽区 + 四个窗口命令 + 不碰页面内容
+        let chrome = include_str!("../inject/appchrome.js");
+        for needle in [
+            "data-tauri-drag-region",
+            "plugin:window|", // 命令名是拼的（'plugin:window|' + name），逐字只到这里
+            "'close'",
+            "'minimize'",
+            "'toggle_maximize'",
+            "__FNOS_APP_CHROME__",
+        ] {
+            assert!(chrome.contains(needle), "标题栏脚本缺少：{needle}");
+        }
+        assert!(!chrome.contains("innerHTML"), "标题栏脚本不得用 innerHTML");
     }
 }

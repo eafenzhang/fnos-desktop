@@ -1,0 +1,12 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "app-windows-chrome",
+  "description": "应用窗口（window.open 开出来的那些，label 形如 app-N）只授「本壳自绘标题栏」需要的最小窗口权限：拖拽移动 + 最小化 + 最大化切换 + 关闭。用途只有一条——`inject/appchrome.js` 画的那条标题栏（它的按钮与拖拽区）。授权对象是那个窗口本身，因此窗口里承载的第三方应用页面在理论上也能调用这四个命令，但它能操作的**只有自己那个窗口**：不能碰主窗口、不授任何应用命令（没有 allow-get-config / allow-set-config / allow-open-url 之类）。",
+  "windows": ["app-*"],
+  "permissions": [
+    "core:window:allow-start-dragging",
+    "core:window:allow-minimize",
+    "core:window:allow-toggle-maximize",
+    "core:window:allow-close"
+  ]
+}

@@ -26,6 +26,9 @@ const SHIM_JS: &str = include_str!("../inject/shim.js");
 const BOOTSTRAP_JS: &str = include_str!("../inject/bootstrap.js");
 const DOCK_JS: &str = include_str!("../inject/dock.js");
 const KEEPALIVE_JS: &str = include_str!("../inject/keepalive.js");
+/// 应用窗口的自绘标题栏脚本（T14c）。**不**属于主窗口的注入载荷，由
+/// `commands::open_app_window` 单独注入到 `app-*` 窗口（那里注的是应用页面本身）。
+pub(crate) const APP_CHROME_JS: &str = include_str!("../inject/appchrome.js");
 const CONTENT_SCRIPT_JS: &str = include_str!("../assets/fnos-mods/content-script.js");
 
 struct Assets {
