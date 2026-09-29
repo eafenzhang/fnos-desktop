@@ -88,21 +88,30 @@
   // ---------- 本壳自己的样式覆盖（与上游 mod 无关，永远装） ----------
 
   /**
-   * 唯一一条覆盖规则：**「绝对定位的整屏覆盖层」必须不透明**。
+   * 覆盖规则：**「整屏覆盖层」必须不透明**（应用详情看不到背景底色的实测修复）。
    *
-   * 上游 mod 把 `.bg-[var(--semi-color-app-container)]` 统一改成 50% 透明的玻璃效果
-   * （`basic_mod.css` 的 `background-color: color-mix(… 50%, transparent) !important`）。
-   * 它在普通窗口上好看，但应用中心的**应用详情**正是用这个类的整屏覆盖层
-   * （`absolute inset-0 z-10 …`，实测），半透明会让底下的应用列表穿透上来、与详情文字重叠
-   * ——用户实测反馈的「应用详情没有背景底色」。
+   * 上游 mod 里有两处会把覆盖层弄成透明：
+   * 1. `basic_mod.css` 的 `.bg-[var(--semi-color-app-container)]`（一条类，0,1,0）——
+   *    统一改成 50% 玻璃效果：`color-mix(… 50%, transparent) !important`；
+   * 2. `basic_mod.css:424` 的应用中心**专用**规则（约 0,4,1，同样 `!important`）——
+   *    把 `.fnos-app-center-route-detail`（= 详情覆盖层本体）直接设成
+   *    `background-color: transparent !important`，而「激活态」那条只改 opacity/transform、
+   *    **没有**把背景改回来。于是详情透出底下的应用列表，与详情文字重叠。
    *
-   * 修法是**在同一属性上用更高特异性压回去**（三条类 0,3,0 > 一条类 0,1,0，两边都是
-   * `!important` 时由特异性决出胜负）：只命中「绝对定位 + 铺满父容器」的覆盖层，
-   * 普通窗口/内容区的玻璃效果原样保留。
+   * 所以这里给两条规则，且**特异性都压过上游**（两边都是 `!important` 时由特异性决出胜负）：
+   * - 通用一条（0,3,0）盖住第 1 类（任何「绝对定位整屏覆盖层」都恢复不透明）；
+   * - 应用中心一条（0,4,1 起）盖住第 2 类——同时带上 `.fnos-app-center-route-active` 与
+   *   `.absolute.inset-0` 两个变体，前者保证「激活态」赢、后者连「离场动画态」也一并压过。
+   * 普通窗口/内容区的玻璃效果不受影响（那两处选择器都不命中它们）。
    */
   var SHELL_CSS_ID = 'fnos-shell-overrides';
   var SHELL_CSS =
     '.bg-\\[var\\(--semi-color-app-container\\)\\].absolute.inset-0' +
+    '{background-color:var(--semi-color-app-container) !important;}' +
+    '.trim-ui__app-layout--window:has(.trim-ui__app-layout--header-title img[alt="应用中心"]) ' +
+    '.fnos-app-center-route-detail.fnos-app-center-route-active,' +
+    '.trim-ui__app-layout--window:has(.trim-ui__app-layout--header-title img[alt="应用中心"]) ' +
+    '.fnos-app-center-route-detail.absolute.inset-0' +
     '{background-color:var(--semi-color-app-container) !important;}';
   var shellCssInstalled = false;
 

@@ -100,9 +100,19 @@ test('本壳样式覆盖：绝对定位的整屏覆盖层恢复不透明（应�
   // 覆盖表必须装（与上游 CSS 是否被拦无关）
   const css = (w.__installedSheets || []).map((s) => s.cssText).join(String.fromCharCode(10));
   const marker = 'bg-\\[var\\(--semi-color-app-container\\)\\].absolute.inset-0';
-  assert.ok(css.indexOf(marker) >= 0, '必须有针对「绝对定位整屏覆盖层」的规则选择器');
+  assert.ok(css.indexOf(marker) >= 0, '必须有针对「绝对定位整屏覆盖层」的通用规则');
   assert.ok(css.indexOf(marker + '{background-color:var(--semi-color-app-container) !important;}') >= 0,
     '用主题自己的容器底色恢复不透明，并带 !important');
+  // 应用中心专用一条：上游 basic_mod.css:424 把 .fnos-app-center-route-detail 设成
+  // transparent !important（约 0,4,1），通用三条类（0,3,0）压不过它 —— 必须同形态 + 更高特异性。
+  assert.ok(css.indexOf('.fnos-app-center-route-detail.fnos-app-center-route-active') >= 0,
+    '必须有针对应用中心详情（激活态）的规则');
+  assert.ok(css.indexOf('.fnos-app-center-route-detail.absolute.inset-0') >= 0,
+    '离场动画态同样要覆盖（上游那条也是 transparent !important）');
+  assert.ok(css.indexOf('img[alt="应用中心"]') >= 0, '必须锚定上游自己的应用中心窗口选择器');
+  const appCenterRule = css.slice(css.indexOf('fnos-app-center-route-detail'));
+  assert.ok(appCenterRule.indexOf('background-color:var(--semi-color-app-container) !important;') >= 0,
+    '应用中心那条也要用主题容器底色恢复不透明');
 });
 
 test('link 未生效时用 adoptedStyleSheets 补装 CSS', () => {
