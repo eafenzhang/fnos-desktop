@@ -1029,7 +1029,6 @@ mod tests {
         assert_eq!(c.shell.keep_alive_minutes, 10, "保活心跳默认 10 分钟");
     }
 
-    #[test]
     /// T14c：保活心跳间隔的夹取（手改配置写成天文数字没有意义）。
     #[test]
     fn keep_alive_minutes_is_clamped_to_a_day() {

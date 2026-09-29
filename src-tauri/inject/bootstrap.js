@@ -130,6 +130,13 @@
     // `inject/dock.js` 的 `reclaimLayoutPadding` 兜（它按「满尺寸容器 + 预留值落在
     // 24–200px」判定，覆盖别的 fnOS 版本）。
     '.pl-\\[66px\\]' +
+    '{padding-left:0 !important;}' +
+    // 同一条预留的**与取值无关**的兜底：内容区容器是 `.desktop` 的**直接子元素**
+    // （实测 `#root > div > .desktop > div.relative.box-border.h-full.pl-[66px]`）。
+    // 万一别的 fnOS 版本/别的启动台样式用的是另一个数值（`pl-[72px]`…），这条一样命中；
+    // 作用域只到 `.desktop` 的直接子元素，**不会**波及应用窗口内部那些有意的
+    // Tailwind 内边距（它们在更深的层级）。
+    '#root .desktop > [class*="pl-["]' +
     '{padding-left:0 !important;}';
   var shellCssInstalled = false;
 

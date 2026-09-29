@@ -26,6 +26,9 @@ const SHIM_JS: &str = include_str!("../inject/shim.js");
 const BOOTSTRAP_JS: &str = include_str!("../inject/bootstrap.js");
 const DOCK_JS: &str = include_str!("../inject/dock.js");
 const KEEPALIVE_JS: &str = include_str!("../inject/keepalive.js");
+/// 桌面内窗口默认居中（T14c 修复轮 15）：fnOS 自己的应用窗口是桌面文档里的 DOM 元素，
+/// 它的窗口管理器默认级联摆位；本段让新窗口落在内容区正中（只写一次，不干预后续拖动）。
+const WINDOWPOS_JS: &str = include_str!("../inject/windowpos.js");
 /// 应用窗口的自绘标题栏脚本（T14c）。**不**属于主窗口的注入载荷，由
 /// `commands::open_app_window` 单独注入到 `app-*` 窗口（那里注的是应用页面本身）。
 pub(crate) const APP_CHROME_JS: &str = include_str!("../inject/appchrome.js");
@@ -508,6 +511,7 @@ pub fn build_init_script_with(cfg: &Config, wallpaper: Option<WallpaperAsset>) -
          {boot}\n\
          {dock}\n\
          {keepalive}\n\
+         {windowpos}\n\
          {content}\n",
         ver = SHELL_VERSION,
         commit = MODS_COMMIT,
@@ -517,6 +521,7 @@ pub fn build_init_script_with(cfg: &Config, wallpaper: Option<WallpaperAsset>) -
         boot = BOOTSTRAP_JS,
         dock = DOCK_JS,
         keepalive = KEEPALIVE_JS,
+        windowpos = WINDOWPOS_JS,
         content = wrap_upstream(CONTENT_SCRIPT_JS),
     )
 }
@@ -568,15 +573,52 @@ mod tests {
         let i_keep = s
             .find("__FNOS_KEEPALIVE_TICK__")
             .expect("keepalive section");
+        // windowpos 段用它的诊断口名
+        let i_pos = s
+            .find("__FNOS_WINDOWPOS_STATE__")
+            .expect("windowpos section");
         let i_cs = s.find("hasFnOSSignature").expect("upstream content-script");
         assert!(
             i_cfg < i_shim
                 && i_shim < i_boot
                 && i_boot < i_dock
                 && i_dock < i_keep
-                && i_keep < i_cs,
-            "段落顺序必须是 配置→shim→bootstrap→dock→keepalive→上游"
+                && i_keep < i_pos
+                && i_pos < i_cs,
+            "段落顺序必须是 配置→shim→bootstrap→dock→keepalive→windowpos→上游"
         );
+    }
+
+    /// T14c：桌面内窗口默认居中，且**只对新窗口动手一次**（不干预用户拖动）。
+    #[test]
+    fn window_positions_are_centered_once() {
+        let js = include_str!("../inject/windowpos.js");
+        assert!(
+            js.contains("trim-ui__app-layout--window"),
+            "只认 fnOS 自己的窗口类，不碰别的元素"
+        );
+        assert!(
+            js.contains("el.style.left =") && js.contains("el.style.top ="),
+            "居中用普通内联赋值（不加 !important：用户拖动/窗口管理器仍然优先）"
+        );
+        assert!(
+            js.contains("WeakSet"),
+            "必须记下已处理过的窗口（只居中一次）"
+        );
+        assert!(
+            !js.contains("setProperty"),
+            "不得用 setProperty 抢优先级（那会盖掉窗口管理器的定位）"
+        );
+        assert!(
+            js.contains("availW - w") && js.contains("availH - h"),
+            "居中按内容区与窗口的实测尺寸算"
+        );
+        assert!(
+            js.contains("w >= availW - 4"),
+            "铺满内容区的最大化窗口不得被改动"
+        );
+        assert!(js.contains("W.top === W.self"), "只在顶层文档工作");
+        assert!(!js.contains("innerHTML"), "不写页面内容");
     }
 
     #[test]

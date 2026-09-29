@@ -120,6 +120,12 @@ test('本壳样式覆盖：绝对定位的整屏覆盖层恢复不透明（应�
   // 桌面壁纸顶行的亮蓝线：裁掉壁纸顶部 1px
   assert.ok(css.indexOf('#root .absolute.inset-0.z-0.object-contain{clip-path:inset(1px 0 0 0) !important;}') >= 0,
     '必须有「裁掉壁纸顶部 1px」的规则');
+  // Dock 宽度预留：具体值 + 与取值无关的兜底（都在样式层，元素一出现就是 0）
+  // 注：CSS 文本里类名带转义（`.pl-\[66px\]{…}`），断言用 `\\]` 匹配那一个反斜杠。
+  assert.ok(css.includes('66px\\]{padding-left:0 !important;}'),
+    '必须有「预留类置 0」的样式层规则');
+  assert.ok(css.includes('#root .desktop > [class*="pl-["]{padding-left:0 !important;}'),
+    '必须有与取值无关的兜底规则（作用域到 .desktop 的直接子元素）');
 });
 
 test('link 未生效时用 adoptedStyleSheets 补装 CSS', () => {
