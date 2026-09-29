@@ -261,6 +261,16 @@
     } catch (e) { /* 不支持就算了 */ }
   }
 
+  /**
+   * Dock 离场/回归都会改变「可用工作区」，而 fnOS 的窗口管理器通常只在 resize 时重排
+   * 窗口位置（修复轮 5：已打开的窗口不会跟着回收 Dock 让出的那条宽度）。Dock 真正
+   * 离场（display:none）或恢复布局的当下派发一次 resize，让最大化/已铺开的窗口按
+   * 新工作区重排。
+   */
+  function notifyResize() {
+    try { W.dispatchEvent(new W.Event('resize')); } catch (e) { /* 老内核缺 Event 构造器就算了 */ }
+  }
+
   /** 把 `shown` 的意图落到当前 Dock 上（幂等；接管后无条件调一次以防换元素后状态漂移）。 */
   function renderState() {
     if (!dock) return;
@@ -269,6 +279,7 @@
       try { dock.style.display = ''; } catch (e) { /* 已被上游藏起来就算了 */ }
       void dock.offsetWidth; // 强制重排：display:none 刚恢复时要有动画起点，否则直接跳到位
       dock.classList.remove(HIDDEN_CLASS);
+      notifyResize(); // Dock 回到布局：工作区变小，窗口管理器按旧几何收回去
       return;
     }
     syncTransform();
@@ -278,6 +289,7 @@
       displayTimer = null;
       if (dock && !shown) {
         try { dock.style.display = 'none'; } catch (e) { /* 不支持就算了 */ }
+        notifyResize(); // Dock 离场：工作区变大，已开的窗口借 resize 重排（修复轮 5）
       }
     }, TRANSITION_MS);
   }

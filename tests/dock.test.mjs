@@ -112,6 +112,9 @@ function fakeDom(opts = {}) {
     innerWidth: opts.vw ?? 1200,
     innerHeight: opts.vh ?? 800,
     _winListeners: {},
+    _resized: 0,
+    Event: function (type) { this.type = type; },
+    dispatchEvent(e) { if (e && e.type === 'resize') this._resized += 1; return true; },
     addEventListener(ev, fn) { this._winListeners[ev] = fn; },
     removeEventListener(ev) { delete this._winListeners[ev]; },
     _timers: new Map(),
@@ -291,6 +294,21 @@ test('开启：观察 document、接管即藏且到点真正离场（display:non
   doc._listeners.pointermove({ clientX: 3, clientY: 400 });
   assert.ok(!dock._classes.has('fnos-shell-dock-hidden'), '边缘热区必须唤回');
   assert.equal(dock.style.display, '', '唤回必须先恢复布局');
+});
+
+test('Dock 离场/回归时派发 resize（窗口管理器借它重排已开窗口）', () => {
+  const doc = fakeDom();
+  const win = doc._win;
+  load(doc, { dockAutoHide: true });
+  const dock = fakeDock({ left: 0, top: 0, right: 68, bottom: 800 }, { hasList: true, icons: 5 });
+  doc._candidates = [dock];
+  settle(doc);
+  doc._win.drainTimers(); // display:none 的延迟到点（离场落地）
+  const resizedAfterHide = win._resized;
+  assert.ok(resizedAfterHide >= 1, 'Dock 离场（display:none 落地）必须派发一次 resize');
+
+  doc._listeners.pointermove({ clientX: 3, clientY: 400 }); // 唤回
+  assert.ok(win._resized > resizedAfterHide, 'Dock 回到布局同样派发 resize');
 });
 
 test('迟滞唤出：藏在 Dock 脚印下的应用按钮可以直接点（只有顶到边缘才唤出）', () => {
