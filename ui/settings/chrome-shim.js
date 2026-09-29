@@ -220,77 +220,54 @@
     else entry.reject(new Error(String(data.error || '宿主命令失败')));
   });
 
-  // ---------- 可见的「外壳说明」（本层自己的 DOM，不动上游 UI 的一个字节） ----------
+  // ---------- 临时气泡提示（本层自己的 DOM，不动上游 UI 的一个字节） ----------
 
   const NOTICE_ID = 'fnosShellNotice';
-  let noticeBody = null;
+  let noticeTimer = null;
 
   /**
-   * 把一句说明挂进可见的说明框（追加在 `<body>` 末尾，**不覆盖**上游任何节点）。
+   * 一条**临时气泡**（底部居中，5 秒自动消失；T14c 修复轮 6：常驻的「外壳说明」底栏
+   * 按用户要求删除——说明只在真有事时出现，不再常驻占位）。
    *
    * 为什么要有它：上游 popup.js 对本地存储写入失败只有两句固定文案
    * （popup.js:2176-2178 的「存储空间不足 / 本地存储写入失败」），它说不出**本壳为什么**
-   * 拒绝。诚实要求「失败要看得见且说得出原因」，所以原因由本层直接画在界面上。
+   * 拒绝。诚实要求「失败要看得见且说得出原因」，所以原因由本层以气泡呈现，
+   * 「fnOS壳：」前缀标注来源（与注入进上游界面的 Dock 行同一条诚实边界）。
    */
   function notice(text) {
-    if (!ensureNoticeBox()) return;
-    if (text) appendNotice(text);
-  }
-
-  /** 建好说明框（幂等）。返回框里的正文节点是否可用。 */
-  function ensureNoticeBox() {
+    if (!text) return;
     try {
-      if (noticeBody) return true;
-      if (typeof document === 'undefined' || !document.body) return false;
-      const box = document.createElement('div');
-      box.id = NOTICE_ID;
-      box.dataset.fnosShell = '1';
-      // 内联样式，且颜色只用**上游自己**的两个变量（`:root` 的 `--card-bg` / `--text`，
-      // 明暗两套都有定义），取不到时回落到系统色 `Canvas` / `CanvasText`：本层不猜上游的
-      // 类名、也不改它的样式表，但**必须**读出它当前的主题。
-      //
-      // **固定在 iframe 视口底部**（fix round 1 / Minor 3）：说明框原来是追加在 `<body>` 末尾
-      // 的普通流内元素，而上游 popup 的 body 比 iframe 那 522 px 视口高得多、滚动条又被上游
-      // 自己的 CSS 藏掉（`popup.html:44-72` 的 `scrollbar-width:none` + `::-webkit-scrollbar`）
-      // ——于是「拒绝了字体数据写入」这类说明默认落在**屏幕之外**，用户根本看不到。
-      // 拒绝提示不可见等于没有提示，所以改成常驻横幅：高度封顶 42% 并允许自己滚动，
-      // 不随上游内容长短漂移。z-index 高于上游 `.blur-effect` 的 998。
-      box.setAttribute('style',
-        'position:fixed;left:0;right:0;bottom:0;z-index:1000;box-sizing:border-box;' +
-        'max-height:42%;overflow:auto;margin:0;padding:8px 10px;' +
-        'border-top:1px dashed var(--card-border,currentColor);' +
-        'background:var(--card-bg,Canvas);color:var(--text,CanvasText);' +
-        'font:12px/1.6 system-ui,"Segoe UI",sans-serif;white-space:pre-wrap;');
-      const title = document.createElement('div');
-      title.textContent = '外壳说明（本应用，非上游界面）';
-      title.setAttribute('style', 'font-weight:600;margin-bottom:4px;');
-      box.appendChild(title);
-      noticeBody = document.createElement('div');
-      box.appendChild(noticeBody);
-      document.body.appendChild(box);
-      // 固定的两条：本壳对上游 UI 的两处**有意差异**（D4 与离线更新检查）。
-      appendNotice('字体文件导入：本外壳不提供（用户决策 D4）。请改用「网络字体 URL」或本机已安装的字体名。');
-      appendNotice('更新检查：本外壳离线运行（已内置 vendored commit），不会发起任何网络请求。');
-      return true;
+      if (typeof document === 'undefined' || !document.body) return;
+      let box = document.getElementById(NOTICE_ID);
+      if (!box) {
+        box = document.createElement('div');
+        box.id = NOTICE_ID;
+        box.dataset.fnosShell = '1';
+        // 颜色只用**上游自己**的两个变量（`:root` 的 `--card-bg` / `--text`，明暗两套都
+        // 有定义），取不到时回落系统色 `Canvas` / `CanvasText`：本层不猜上游的类名、
+        // 也不改它的样式表，但**必须**读出它当前的主题。z-index 高于上游 `.blur-effect`
+        // 的 998。
+        box.setAttribute('style',
+          'position:fixed;left:50%;bottom:12px;transform:translateX(-50%);z-index:1001;' +
+          'box-sizing:border-box;max-width:92%;padding:8px 12px;border-radius:8px;' +
+          'background:var(--card-bg,Canvas);color:var(--text,CanvasText);' +
+          'border:1px dashed var(--card-border,currentColor);' +
+          'box-shadow:0 2px 10px rgba(0,0,0,.25);' +
+          'font:12px/1.6 system-ui,"Segoe UI",sans-serif;white-space:pre-wrap;');
+        document.body.appendChild(box);
+      }
+      // 页面可控文本一律 textContent（本层没有任何 innerHTML 拼接）
+      box.textContent = 'fnOS壳：' + String(text == null ? '' : text);
+      box.setAttribute('role', 'alert');
+      if (noticeTimer) clearTimeout(noticeTimer);
+      noticeTimer = setTimeout(function () {
+        noticeTimer = null;
+        const el = document.getElementById(NOTICE_ID);
+        if (el) el.remove();
+      }, 5000);
     } catch (_error) {
-      // 连说明框都画不出来（无 DOM）时也不能让上游的逻辑挂掉：错误仍会照常抛出。
-      return false;
+      // 连气泡都画不出来（无 DOM）时也不能让上游的逻辑挂掉：错误仍会照常抛出。
     }
-  }
-
-  function appendNotice(text) {
-    if (!noticeBody) return;
-    const line = '· ' + String(text == null ? '' : text);
-    // 去重：上游会在初始化与每次刷新时都问一次列表，同一条拒绝说明只该出现一次——
-    // 一墙重复的告警只会让人以为出了很多事。
-    for (const child of noticeBody.children) {
-      if (child.textContent === line) return;
-    }
-    const node = document.createElement('div');
-    // 页面可控文本一律 textContent（本层没有任何 innerHTML 拼接）
-    node.textContent = line;
-    node.setAttribute('role', 'alert');
-    noticeBody.appendChild(node);
   }
 
   // ---------- 配置缓存（sync.get 的回包 + 每次写回都刷新） ----------
@@ -851,8 +828,7 @@
     notice('设置窗宿主桥未就绪：界面会渲染，但读写配置、读取主窗口状态都会明确失败。');
   }
 
-  // 说明框要在 popup.js 之前就准备好（它是 append 到 body 末尾的，不挡任何控件）。
-  notice('');
   // 本壳设置行：脚本在 body 末尾加载，上游的静态行（#siteToggle 所在 .row）此时已解析。
+  // （T14c 修复轮 6：常驻说明底栏已删——notice 只在错误/关键提示时以临时气泡出现。）
   injectDockRow();
 })();
