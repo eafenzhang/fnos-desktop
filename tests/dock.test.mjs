@@ -293,77 +293,50 @@ test('机制①的闸门：非满尺寸容器、过小/过大的预留一律不�
   assert.equal(huge.style.getPropertyValue('padding-left'), '', '过大的内边距不是 Dock 预留');
 });
 
-test('机制②：窗口的 !left-[66px] / !right-0 / !w-[calc(100%-66px)] → left/width 被拉回满宽', () => {
+test('机制②由**样式表**声明式实现：三条类同时命中才归位（类一加上就生效，无 JS 回合）', () => {
+  // 为什么必须是样式层（修复轮 9 实测）：fnOS 在悬浮唤出时动态增删窗口的定位类；靠 JS 事后
+  // 改内联样式，中间必然有一帧回到 66px —— 实测 winLeftMax = 66，即用户看到的「左缘闪一下」。
   const doc = fakeDom();
   load(doc, { dockAutoHide: true });
-  const dock = fakeEl({ w: 66, h: 800, left: 0, top: 0, hasList: true, icons: 5 });
-  doc._candidates = [dock];
-  const win = fakeEl({ w: 1134, h: 800, left: 66, top: 0 });
-  win.className = 'trim-ui__app-layout--window !inset-y-0 !left-[66px] !right-0 !w-[calc(100%-66px)]';
-  doc._queryAll['[class*="app-layout--window"]'] = [win];
-  settle(doc);
-  assert.equal(win.style.getPropertyValue('left'), '0px', '窗口左偏移必须归零');
-  assert.equal(win.style.getPropertyValue('width'), '100%', '窗口宽度必须补回满宽');
-  assert.equal(win._inline.left.priority, 'important', '必须带 !important（压过 Tailwind 类）');
+  const css = doc.adoptedStyleSheets[0].cssText;
+  const rule = css.match(/\[class\*="!left-\["\][^{]*\{[^}]*\}/);
+  assert.ok(rule, '必须有针对「窗口工具类」的属性子串规则');
+  const selector = rule[0].split('{')[0];
+  const body = rule[0].split('{')[1];
+  assert.equal((selector.match(/\[class\*=/g) || []).length, 3,
+    '三条类（!left-[ / !right-0 / !w-[calc(100%-）必须同时命中才算最大化形态');
+  assert.match(selector, /!right-0/);
+  assert.match(selector, /!w-\[calc\(100%-/);
+  assert.match(body, /left:0 !important/);
+  assert.match(body, /width:100% !important/);
+  // 特异性：三条属性选择器（0,3,0）胜过 Tailwind 的一条类选择器（0,1,0），所以能压过它的 !important
+  assert.match(selector, /^\[class\*="!left-\["\]\[class\*="!right-0"\]\[class\*="!w-\[calc\(100%-"\]$/);
+  // 不得再留 JS 侧窗口覆盖机制（那是一帧闪烁的来源）
+  for (const gone of ['windowFixes', 'reclaimWorkspaceWindows', 'maximizedSignature']) {
+    assert.ok(!DOCK.includes(gone), `窗口定位必须走样式层，不得再有 JS 机制：${gone}`);
+  }
 });
 
-test('机制②：签名不完整/数字不一致时不动手；签名消失后覆盖被撤回（用户改回自由尺寸）', () => {
-  const doc = fakeDom();
-  const w = load(doc, { dockAutoHide: true });
-  const dock = fakeEl({ w: 66, h: 800, left: 0, top: 0, hasList: true, icons: 5 });
-  doc._candidates = [dock];
-  // ① 缺 !right-0 → 不是最大化签名
-  const partial = fakeEl({ w: 1134, h: 800, left: 66 });
-  partial.className = 'trim-ui__app-layout--window !left-[66px] !w-[calc(100%-66px)]';
-  // ② 三处数字不一致 → 不动手
-  const mixed = fakeEl({ w: 1134, h: 800, left: 66 });
-  mixed.className = 'trim-ui__app-layout--window !left-[66px] !right-0 !w-[calc(100%-80px)]';
-  // ③ 正常签名 → 覆盖
-  const win = fakeEl({ w: 1134, h: 800, left: 66 });
-  win.className = 'trim-ui__app-layout--window !left-[66px] !right-0 !w-[calc(100%-66px)]';
-  doc._queryAll['[class*="app-layout--window"]'] = [partial, mixed, win];
-  settle(doc);
-  assert.equal(partial.style.getPropertyValue('left'), '', '缺 !right-0 不得动手');
-  assert.equal(mixed.style.getPropertyValue('width'), '', '三处数字不一致不得动手');
-  assert.equal(win.style.getPropertyValue('left'), '0px', '完整签名必须覆盖');
-
-  // 用户把窗口改回自由尺寸：类消失 → 下一轮把定位权还给窗口管理器
-  win.className = 'trim-ui__app-layout--window';
-  win._inline.left = { value: '240px', priority: '' }; // 窗口管理器随后写入的自由位置
-  doc._moCallback();
-  doc._win.drainTimers();
-  assert.ok(!win.style.getPropertyValue('left') || win.style.getPropertyValue('left') === '240px',
-    '签名消失后本壳必须撤回覆盖（定位权还给窗口管理器）');
-  assert.equal(win.style.getPropertyValue('width'), '', 'width 覆盖同样撤回');
-  assert.equal(w.__FNOS_DOCK_STATE__().windowsFixed, 0, '诊断口必须如实');
-});
-
-test('免刷新关闭：接管、内边距中和与窗口覆盖全部还原（含还原原本就存在的内联值）', () => {
+test('免刷新关闭：接管与内边距中和全部还原（含还原原本就存在的内联值）', () => {
   const doc = fakeDom();
   const w = load(doc, { dockAutoHide: true });
   const root = fakeEl({ w: 1200, h: 800, left: 0 });
   const dock = fakeEl({ w: 66, h: 800, left: 0, top: 0, parent: root, hasList: true, icons: 5 });
   const content = fakeEl({ w: 1200, h: 800, left: 0, parent: root, computed: { paddingLeft: '66px' } });
   content._inline['padding-left'] = { value: '40px', priority: '' }; // 上游原本就有内联值
-  const win = fakeEl({ w: 1134, h: 800, left: 66 });
-  win.className = 'trim-ui__app-layout--window !left-[66px] !right-0 !w-[calc(100%-66px)]';
   root.children = [dock, content];
   doc._candidates = [dock];
-  doc._queryAll['[class*="app-layout--window"]'] = [win];
   settle(doc);
   assert.equal(content.style.getPropertyValue('padding-left'), '0px', '先中和');
-  assert.equal(win.style.getPropertyValue('left'), '0px', '先覆盖');
 
   w.__FNOS_APPLY_SHELL__({ dockAutoHide: false });
   assert.equal(content.style.getPropertyValue('padding-left'), '40px', '必须还原上游原本的内联值');
-  assert.equal(win.style.getPropertyValue('left'), '', '窗口覆盖必须撤回');
-  assert.equal(win.style.getPropertyValue('width'), '', '窗口宽覆盖必须撤回');
   assert.equal(dock._classes.size, 0, 'Dock 的 class 必须清干净');
   assert.equal(dock.style.display, '', 'display 必须还原');
   assert.ok(doc._moDisconnected, '观察器必须断开');
   assert.deepEqual(w.__FNOS_DOCK_STATE__(), {
     enabled: false, found: false, targets: 0, axis: 'x', edgeMin: true, shown: false,
-    reclaimed: [], windowsFixed: 0, lastMiss: '',
+    reclaimed: [], lastMiss: '',
   }, '诊断口必须如实');
 });
 

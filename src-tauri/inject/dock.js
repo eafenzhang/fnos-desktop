@@ -96,7 +96,17 @@
   var CSS =
     '.' + HOST_CLASS + '{transition:transform .28s cubic-bezier(.4,0,.2,1);}' +
     '.' + HOST_CLASS + '.' + HIDDEN_CLASS + '{transform:var(--fnos-dock-hide-tf,translateX(-105%));}' +
-    '@media (prefers-reduced-motion: reduce){.' + HOST_CLASS + '{transition:none;}}';
+    '@media (prefers-reduced-motion: reduce){.' + HOST_CLASS + '{transition:none;}}' +
+    // 机制②：应用窗口的工作区偏移 —— fnOS 把 Dock 宽写死在 Tailwind 工具类里
+    // （`!left-[66px]` + `!right-0` + `!w-[calc(100%-66px)]`，三处都带 `!important`）。
+    // 这里用**属性子串选择器**在样式层直接压回去：三条属性选择器（0,3,0）胜过一条类选择器
+    // （0,1,0），且类一加上就生效 —— **不需要 JS 回合**。
+    //
+    // 为什么必须放样式层（修复轮 9 实测）：fnOS 在悬浮唤出时会动态给窗口增删这三条类；
+    // 若靠 JS 事后改内联样式，中间必然有一帧回到 66px，用户看到的就是「窗口左缘闪一下」。
+    // 只在三处类同时在（= 「最大化到工作区」形态）时命中；窗口改回自由尺寸时类消失，
+    // 规则自动失效，定位权完整还给窗口管理器。
+    '[class*="!left-["][class*="!right-0"][class*="!w-[calc(100%-"]{left:0 !important;width:100% !important;}';
 
   /** 样式只装一次；优先可构造样式表（CSP 对 inline <style> 收紧时仍然可用），否则 <style>。 */
   function ensureStyle() {
@@ -371,73 +381,6 @@
     }
   }
 
-  // ---------- 机制②：应用窗口的工作区偏移（fnOS 把 Dock 宽写死在工具类里） ----------
-
-  /**
-   * fnOS 的窗口管理器用 Tailwind 工具类把「工作区 = 视口 − Dock 宽」写死，三处**同数**且都带
-   * `!important`：`!left-[66px]` / `!right-0` / `!w-[calc(100%-66px)]`。绝对定位元素不吃父级
-   * padding，所以机制①动不了窗口——必须按同一签名覆盖 `left`/`width`。签名里三处的数字必须
-   * 一致，否则不动手（宁可不动，也不误伤别的定位）。
-   */
-  var MAXIMIZED_LEFT = /(?:^|\s)!left-\[(\d+)px\](?:\s|$)/;
-  var MAXIMIZED_WIDTH = /(?:^|\s)!w-\[calc\(100%-(\d+)px\)\](?:\s|$)/;
-
-  /** 返回预留宽度（px）——只有「三处同数 + `!right-0`」齐备时才算「最大化到工作区」的窗口。 */
-  function maximizedSignature(el) {
-    var cls = '';
-    try { cls = String(el.className || ''); } catch (e) { return null; }
-    if (cls.indexOf('!right-0') < 0) return null;
-    var left = MAXIMIZED_LEFT.exec(cls);
-    var width = MAXIMIZED_WIDTH.exec(cls);
-    if (!left || !width || left[1] !== width[1]) return null;
-    var n = parseInt(left[1], 10);
-    return isFinite(n) && n >= STRIP_MIN && n <= STRIP_MAX ? n : null;
-  }
-
-  var windowFixes = [];   // 被覆盖过定位的窗口（签名消失时逐条撤回）
-
-  /** 撤回签名已消失的窗口覆盖（用户把窗口改回自由尺寸时，定位权还给窗口管理器）。 */
-  function revertWindowFixes() {
-    for (var i = windowFixes.length - 1; i >= 0; i--) {
-      var el = windowFixes[i];
-      if (maximizedSignature(el)) continue; // 仍是最大化形态：保持覆盖
-      try {
-        el.style.removeProperty('left');
-        el.style.removeProperty('width');
-      } catch (e) { /* 元素没了就算了 */ }
-      windowFixes.splice(i, 1);
-    }
-  }
-
-  /** 把「最大化到工作区」的窗口拉回满宽（Dock 已让位；覆盖只到签名消失为止）。 */
-  function reclaimWorkspaceWindows() {
-    revertWindowFixes();
-    if (!(axis === 'x' && edgeMin)) return;
-    var nodes;
-    // 候选用 fnOS 自己的窗口类（语义明确、数量少）；签名仍是最终判据
-    try { nodes = D.querySelectorAll('[class*="app-layout--window"]'); } catch (e) { return; }
-    for (var i = 0; nodes && i < nodes.length; i++) {
-      var el = nodes[i];
-      if (!maximizedSignature(el)) continue;
-      try {
-        el.style.setProperty('left', '0px', 'important');
-        el.style.setProperty('width', '100%', 'important');
-      } catch (e) { /* 不支持就算了 */ }
-      if (windowFixes.indexOf(el) < 0) windowFixes.push(el);
-    }
-  }
-
-  /** teardown 用：撤回全部窗口覆盖（无条件）。 */
-  function releaseWindowFixes() {
-    for (var i = 0; i < windowFixes.length; i++) {
-      try {
-        windowFixes[i].style.removeProperty('left');
-        windowFixes[i].style.removeProperty('width');
-      } catch (e) { /* 元素没了就算了 */ }
-    }
-    windowFixes = [];
-  }
-
   function restoreReclaimed() {
     for (var i = 0; i < reclaimed.length; i++) {
       var item = reclaimed[i];
@@ -478,7 +421,6 @@
   /** 完全还原：接管元素 + 空间回收 + 窗口覆盖（**只在功能关闭时**调用）。 */
   function releaseAll() {
     releaseTargets();
-    releaseWindowFixes();
     restoreReclaimed();
   }
 
@@ -549,10 +491,9 @@
       renderState();
     }
     if (!dock) return;
-    // 空间回收每一批变更都重跑（窗口会动态开关/最大化）：机制①（内边距）幂等，
-    // 机制②（窗口工具类）自带「签名消失即撤回」。
+    // 空间回收：机制①（内边距）需要 JS 跑（容器稳定、幂等、带节流）；
+    // 机制②（窗口工具类）由样式表声明式实现，这里不需要任何动作。
     reclaimLayoutPadding();
-    reclaimWorkspaceWindows();
   }
 
   /** observer 回调的合并入口：SPA 一批变更只安排一次重找。 */
@@ -642,7 +583,7 @@
     }
     return {
       enabled: enabled, found: !!dock, targets: targets.length, axis: axis, edgeMin: edgeMin,
-      shown: shown, reclaimed: props, windowsFixed: windowFixes.length, lastMiss: lastMiss,
+      shown: shown, reclaimed: props, lastMiss: lastMiss,
     };
   };
 
