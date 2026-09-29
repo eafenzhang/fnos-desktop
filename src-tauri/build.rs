@@ -10,6 +10,9 @@
 /// 加进来的第 6 条，Task 11 的状态条数据源 `get_page_state` 是第 7 条，
 /// Task 13a 的页面上报读取口 `get_page_report` 是第 8 条，Task 13b 的登录壁纸导入
 /// `import_wallpaper` 是第 9 条（**唯一会写文件的命令**；只授设置窗、并进 remote-deny）。
+/// Task 14b 再加三条（设置窗托管上游 popup UI 所需）：`get_local_store` / `set_local_store`
+/// （设置窗本地状态，`local-store.json`，只存字符串且有大小上限）与 `request_app_items`
+/// （**无参数**，请主窗口页面重新汇报一次启动台应用项；只授设置窗、并进 remote-deny）。
 fn main() {
     tauri_build::try_build(tauri_build::Attributes::new().app_manifest(
         tauri_build::AppManifest::new().commands(&[
@@ -22,6 +25,9 @@ fn main() {
             "get_page_state",
             "get_page_report",
             "import_wallpaper",
+            "get_local_store",
+            "set_local_store",
+            "request_app_items",
         ]),
     ))
     .expect("failed to run tauri-build");

@@ -574,6 +574,18 @@
   var appItemsSeen = false;
   /** 最近一次「列表大到装不下」的项数（0 = 没发生过）；只用于把原因带进上报与页面 console。 */
   var appItemsTooLarge = 0;
+  /** 同一份文档里，本轮重试是否还在跑（避免宿主反复触发时叠出多层循环）。 */
+  var appItemsLoopRunning = false;
+  /**
+   * 同一份文档里最多被外部（宿主的 `request_app_items` 命令）触发几次（T14b）。
+   *
+   * 为什么要数：`window.__FNOS_REQUEST_APP_ITEMS__` 落在**页面自己的 JS 世界**里（初始化
+   * 脚本的必然结果），页面理论上可以自己反复调它——那只会让我们多发几条
+   * `chrome.runtime.sendMessage` 探测，没有新的权限，但没必要给它一个「无限重试」的把手。
+   * 上限 3 次足够覆盖「用户切回设置窗时列表还没就绪」的真实动线。
+   */
+  var APP_ITEMS_MANUAL_LIMIT = 3;
+  var appItemsManualCalls = 0;
 
   function perfectIconConfigured() {
     var mods = SHELL.mods || {};
@@ -584,19 +596,55 @@
     return !!(Array.isArray(keys) && keys.length > 0);
   }
 
+  /**
+   * 立刻向上游要一次应用项列表（只发请求、不改页面；应答由上游自己的监听器给出，
+   * 本层只转发原文）。**不依赖重试循环的滴答**——宿主的 `request_app_items` 用的就是它。
+   */
+  function askForAppItemsNow() {
+    if (!HOST || !perfectIconConfigured()) return false;
+    try {
+      W.chrome.runtime.sendMessage({ type: 'FNOS_GET_LAUNCHPAD_APP_ITEMS' });
+      return true;
+    } catch (e) {
+      return false;
+    }
+  }
+
   function requestAppItems() {
     if (!HOST || !perfectIconConfigured()) return;
+    if (appItemsLoopRunning || appItemsSeen) return;
+    appItemsLoopRunning = true;
     var tries = 0;
     function ask() {
-      if (appItemsSeen) return;
+      if (appItemsSeen) { appItemsLoopRunning = false; return; }
       tries += 1;
-      try {
-        W.chrome.runtime.sendMessage({ type: 'FNOS_GET_LAUNCHPAD_APP_ITEMS' });
-      } catch (e) { return; }
-      if (tries < APP_ITEMS_TRIES) later(ask, APP_ITEMS_INTERVAL_MS);
+      var sent = askForAppItemsNow();
+      if (!sent) { appItemsLoopRunning = false; return; }
+      if (tries < APP_ITEMS_TRIES) {
+        later(ask, APP_ITEMS_INTERVAL_MS);
+      } else {
+        appItemsLoopRunning = false;
+      }
     }
     later(ask, 2500);
   }
+
+  /**
+   * 宿主（Rust `commands::request_app_items`）通过 `webview.eval` 调用的**重汇报钩子**（Task 14b）。
+   *
+   * 背景：上游 popup 的逐项 UI 会主动要一次列表，而本壳没有「把请求送进页面」的命令；
+   * 上面那句 `requestAppItems()` 只在页面加载时跑一轮有限重试。设置窗开得晚就拿不到列表，
+   * 用户会一直看到「未读取到应用，先打开启动台再试」——一句兑现不了的话。于是把**同一个
+   * 探测**暴露出来（不是新逻辑、不是新权限）：宿主调它 → 页面**当场**再问上游一次 →
+   * 应答照旧经标题通道回报。
+   *
+   * 仍然是「只发请求、不改页面」；仍是同一个有限次的上限（[`APP_ITEMS_MANUAL_LIMIT`]）。
+   */
+  W.__FNOS_REQUEST_APP_ITEMS__ = function () {
+    if (appItemsManualCalls >= APP_ITEMS_MANUAL_LIMIT) return;
+    appItemsManualCalls += 1;
+    askForAppItemsNow();
+  };
 
   requestAppItems();
   syncLoginWallpaperDataUrl();

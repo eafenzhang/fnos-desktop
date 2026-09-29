@@ -5,8 +5,9 @@
 // （`tauri-2.12.0/scripts/core.js:81` 用 `Object.defineProperty` 定义 `invoke`，
 // 与 `withGlobalTauri` 无关）。两条路径都试，取先可用的那条。
 //
-// 命令授权不在这里：`capabilities/default.json` 只把 8 个 `allow-*` 授予
-// label 为 `settings` 的窗口，其它窗口（含远程页面）调同一命令会被 ACL 拒绝。
+// 命令授权不在这里：`capabilities/default.json` 只把 12 个 `allow-*` 授予
+// label 为 `settings` 的窗口（T14b 起，含设置窗本地存储与 request_app_items），
+// 其它窗口（含远程页面）调同一命令会被 ACL 拒绝。
 
 /** 当前可用的 invoke 实现；都不可用时抛错（由调用方 catch 并显示到界面上）。 */
 function resolveInvoke() {
@@ -85,3 +86,27 @@ export function getPageReport() { return invoke('get_page_report'); }
 export function importWallpaper(name, dataBase64) {
   return invoke('import_wallpaper', { name, dataBase64 });
 }
+
+/**
+ * 设置窗本地存储（Task 14b）：上游 `chrome.storage.local` 里**本壳配置模型没有对应字段**的
+ * 那部分扩展本地状态（目前只有更新检查状态 `updateCheckState`）。
+ *
+ * 宿主侧落在配置目录的 `local-store.json`，值是**字符串**（上游存的是对象，由
+ * `ui/settings/chrome-shim.js` 自己 JSON 编码），并且有键名形状 / 单值 64 KiB / 总量 256 KiB /
+ * 最多 32 键四道上限——所以「几 MB 的字体数据」在任何组合下都放不进来。
+ *
+ * 两个命令都只授设置窗（`capabilities/default.json`），并在 `remote-deny.json` 里显式 deny。
+ */
+export function getLocalStore() { return invoke('get_local_store'); }
+/** `patch` 形如 `{updateCheckState: "{\"…\"}"}`；值为 `null` 表示删除该键。 */
+export function setLocalStore(patch) { return invoke('set_local_store', { patch }); }
+
+/**
+ * 请主窗口页面**重新**汇报一次「启动台应用项列表」（Task 14b）。
+ *
+ * 上游 popup 的逐项 UI 会主动 `chrome.tabs.sendMessage({type:'FNOS_GET_LAUNCHPAD_APP_ITEMS'})`
+ * 要列表；本壳里那份列表只能由页面侧的 shim 主动向上游请求（`inject/shim.js::requestAppItems`，
+ * 页面加载时跑一轮有限重试）。设置窗开得晚就错过了那一轮，于是需要这条**无参数**的命令把它
+ * 再叫一次。宿主 eval 的是本壳注入的那一行固定代码，不接受任何参数文本（不是注入面）。
+ */
+export function requestAppItems() { return invoke('request_app_items'); }

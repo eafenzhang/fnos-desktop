@@ -125,9 +125,9 @@ pub const APP_ITEMS_TYPES: [&str; 2] = [APP_ITEMS_TYPE, APP_ITEMS_TITLES_TYPE];
 /// 覆盖），应用项槽只收 [`APP_ITEMS_TYPES`] 里的两种。两个槽位都仍然受文档身份门约束
 /// （[`ReportEntry::matches_document`]），都由 `commands::get_page_report` 一并返回。
 ///
-/// 注意 `dir` **不**参与分流：请求与应答都属于「应用项列表」这件事，UI 自己按 `dir` 区分
-/// 「已经问过、还没有可用应答」与「拿到了应答但形状不对」两种文案（见
-/// `ui/settings/app.js::appListEmptyText`）。
+/// 注意 `dir` **不**参与分流：请求与应答都属于「应用项列表」这件事，设置窗按 `dir` 区分
+/// 「已经问过、还没有可用应答」与「拿到了应答但形状不对」（T14b 起这份文案的判据在
+/// `ui/settings/app.js::appItemsAnswer`；说明文字由 `chrome-shim.js` 的可见说明框给出）。
 ///
 /// ## 为什么 `FNOS_GET_LAUNCHPAD_APP_TITLES` 也算（fix round 1 / Minor 4）
 ///

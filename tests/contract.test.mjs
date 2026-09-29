@@ -13,7 +13,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { MAX_WALLPAPER_BYTES } from '../ui/settings/app.js';
 
 const read = (rel) => readFileSync(new URL(rel, import.meta.url), 'utf8');
 const CONFIG_RS = read('../src-tauri/src/config.rs');
@@ -21,6 +20,9 @@ const INJECTOR_RS = read('../src-tauri/src/injector.rs');
 const REPORT_RS = read('../src-tauri/src/report.rs');
 const APP_JS = read('../ui/settings/app.js');
 const SHIM_JS = read('../src-tauri/inject/shim.js');
+// Task 14b：壁纸导入的界面搬到了**设置窗的 chrome.* 兼容层**里（上游 popup 提供文件控件，
+// shim 负责把 data URL 交给宿主命令），所以那份「JS 副本」的上限也在那里。
+const CHROME_SHIM_JS = read('../ui/settings/chrome-shim.js');
 
 /** 上游 `content-script.js:2853-2855` 同一个分支里的两个请求类型（这份清单是事实来源）。 */
 const APP_ITEM_TYPES = [
@@ -44,7 +46,7 @@ function rustConstList(src, listRaw) {
     .map((name) => rustStrConst(src, name));
 }
 
-test('跨语言：壁纸大小上限（config.rs 的常量 == 设置窗 JS 的副本）', () => {
+test('跨语言：壁纸大小上限（config.rs 的常量 == chrome-shim.js 的源文本）', () => {
   const m = CONFIG_RS.match(/pub const MAX_WALLPAPER_BYTES: usize = ([^;]+);/);
   assert.ok(m, 'config.rs 必须有 `pub const MAX_WALLPAPER_BYTES: usize = …;`');
   const expr = m[1].trim().replace(/_/g, '');
@@ -52,11 +54,13 @@ test('跨语言：壁纸大小上限（config.rs 的常量 == 设置窗 JS 的�
   assert.match(expr, /^[0-9*\s]+$/, `只接受字面量乘法表达式，实为 ${expr}`);
   const rustValue = Function(`"use strict";return (${expr});`)();
   assert.equal(rustValue, 8 * 1024 * 1024, 'Rust 常量本身必须是 8 MiB');
-  assert.equal(
-    MAX_WALLPAPER_BYTES,
-    rustValue,
-    'app.js 的 MAX_WALLPAPER_BYTES 必须与 config.rs 逐位相等（改一边忘另一边 = 界面与宿主互相矛盾）'
-  );
+  // JS 侧那一份（`ui/settings/chrome-shim.js`）是**经典脚本**，不能 import（它一加载就要
+  // 定义 window.chrome），所以这里解析源码文本——与 Rust 常量那份用同一种手法。
+  const js = CHROME_SHIM_JS.match(/const MAX_WALLPAPER_BYTES = ([^;]+);/);
+  assert.ok(js, 'chrome-shim.js 必须有 `const MAX_WALLPAPER_BYTES = …;`（壁纸早退闸门）');
+  const jsValue = Function(`"use strict";return (${js[1].trim()});`)();
+  assert.equal(jsValue, rustValue,
+    'chrome-shim.js 的 MAX_WALLPAPER_BYTES 必须与 config.rs 逐位相等（改一边忘另一边 = 界面与宿主互相矛盾）');
   // injector.rs 不许再写一个独立的数值：它只能是 config 常量的别名（同一份事实只有一个来源）
   assert.match(
     INJECTOR_RS,

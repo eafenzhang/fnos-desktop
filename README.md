@@ -9,7 +9,7 @@
 
 ## 它是什么 / 不是什么
 
-- **是**：一个 Tauri 2 的 Windows 桌面壳。主窗口打开 `https://fnos.net/`（或你配置的 NAS 地址）；命中 fnOS WebUI 的页面才会被注入；托盘常驻；设置窗改配置免刷新生效。
+- **是**：一个 Tauri 2 的 Windows 桌面壳。主窗口打开 `https://fnos.net/`（或你配置的 NAS 地址）；命中 fnOS WebUI 的页面才会被注入；托盘常驻；设置窗（界面就是上游自己的 popup UI，见下）改配置免刷新生效。
 - **不是**：官方客户端；不是 fnOS 系统的一部分；不含任何 NAS 服务端代码；**不含字体文件**（见「已知限制」）。
 
 ## 环境前置（Windows）
@@ -122,11 +122,48 @@ cargo tauri build --bundles nsis
 |---|---|
 | 配置 | `%APPDATA%\com.fnos.desktop\config.json` |
 | 配置损坏时的备份 | `%APPDATA%\com.fnos.desktop\config.json.bak` |
+| 设置窗本地状态（T14b，上游 `chrome.storage.local` 里本壳配置模型没有对应字段的那部分） | `%APPDATA%\com.fnos.desktop\local-store.json`（损坏时改名为 `local-store.json.bak`） |
+| 登录壁纸落盘文件（T13b；名字带内容指纹） | `%APPDATA%\com.fnos.desktop\<stem>-<指纹>.<ext>` |
 | 配置目录覆盖 | 环境变量 `FNOS_DESKTOP_CONFIG_DIR`（用于隔离测试/便携） |
 | WebView2 用户数据（缓存；见「安装 / 卸载」：静默卸载不删） | `%LOCALAPPDATA%\com.fnos.desktop\EBWebView` |
 
 配置路径由 `src-tauri/src/paths.rs` 的 `config_dir()` 决定（`%APPDATA%\<identifier>`），
 `config.rs::config_path()` 在其下取 `config.json`；设置窗「关于」页显示的 `配置文件` 就是它。
+
+## 设置窗：托管上游自己的设置界面（Task 14b）
+
+设置窗的**主界面就是上游的 `popup.html` + `popup.js`**（不是本壳仿写的一套分组表单）：
+
+- 两个文件经 `tools/vendor-mods.ps1` 逐字节 vendor 进 `src-tauri/assets/fnos-mods/`（SHA-256 记在
+  NOTICE），再逐字节复制到 `ui/settings/`（设置窗资产根 = `tauri.conf.json` 的 `frontendDist`）。
+  **上游 `popup.js` 一个字节都没改**；`ui/settings/popup.html` 与 vendored 副本的唯一差别是插入
+  一行 `<script src="./chrome-shim.js"></script>`（必须在 popup.js 之前定义 `window.chrome`）。
+  这一处适配在 NOTICE 的包装性改动第 7 条里写明。`popup.ts`/`popup.html` 需要的 PNG
+  （`prefect_icon/*.png` 14 张 + `icons/*.png` 4 张）与 `icon-map.json` 也在同一目录下，
+  因为 `chrome.runtime.getURL()` 必须**同步**返回一个真实可取的 URL（上游拿它喂 `fetch` 与 `<img src>`）。
+- `ui/settings/chrome-shim.js` 是**本壳自己的** `chrome.*` 兼容层（上行 `chrome.*` 面已逐条枚举，
+  没有一条落进「静默忽略」）：
+
+  | 上游调用 | 本壳实现 |
+  |---|---|
+  | `storage.sync.get/set` | `get_config` / `set_config {mods}`（回包是唯一权威值；`needsReload` 为真时跟随 `reload_main`） |
+  | `storage.local.get/set/remove` | 四类键四种归宿：`customCssCode`/`customJsCode` → `local` 段；`loginWallpaperDataUrl`/`…FileName` → 宿主 `import_wallpaper` 落盘 + `local.loginWallpaperFileName`；`updateCheckState` → 上面的 `local-store.json`；`customFont*` → **如实拒绝**（见「已知限制」的字体一条） |
+  | `tabs.query` | `get_page_state`（主窗口那一页，不是设置窗自己） |
+  | `tabs.sendMessage` | 三个 type 逐一映射：`FNOS_CHECK` → `get_page_state`/上报的判据；`FNOS_GET_LAUNCHPAD_APP_ITEMS`（含上游别称 `…TITLES`）→ 应用项槽位，槽位空时请宿主 `request_app_items` 让页面当场再问一次并在 6s 内有界轮询；`FNOS_APPLY` → `set_config`（宿主当场 `eval` 给活页面） |
+  | `runtime.getURL` | **同步**返回设置窗资产根下的真实 URL（只放行相对路径；`..`/绝对 URL 一律空串，上游对空串的语义正是「资源不存在」） |
+  | `runtime.getManifest` | 同步读父窗口事先写好的配置快照（`meta.modsVersion`，与注入载荷同源） |
+  | `tabs.create` / `action.*` | `open_url`（系统默认浏览器）/ 空操作 |
+  | 更新检查（`fetch` GitHub API） | **不发任何网络请求**：返回一份合成应答，sha 就是本壳内置的 vendored commit，于是上游自己算出「已记录当前最新提交 / 暂无更新」 |
+
+- 本壳只额外提供三块自己的区域（**不覆盖上游任何一个节点**）：顶部的**状态条**（Task 11/13a 的
+  诚实判定）、**外壳开关**（`shell.injectEnabled` 注入总开关与 `shell.nasUrl`——上游是「扩展」，
+  它假设注入总开永远是开、也没有 NAS 地址这个概念，而这两个键在本壳里有真实语义；托盘精简后
+  注入总开关只剩这一个入口）、以及**关于/合规**页（版本 / mods commit / mods 版本 / WebView2
+  版本 / 配置路径 / 随包 LICENSE+NOTICE 路径 / 非官方与非商业声明 / 上游链接）。
+- 上游 UI 装在一个 372×522 的 iframe 里（那正是上游 popup 自己写死的 body 尺寸），因此它的样式
+  与本壳的区域互不影响。帧在**配置快照就位之后**才创建——上游在脚本开头就同步读版本号。
+- 上游 UI 里没有、也不该有的东西，本壳不会假装有：字体文件导入被如实拒绝（见「已知限制」），
+  更新检查不会联网。
 
 ## 托盘菜单（4 个动作项 + 1 条分隔线）
 
@@ -176,7 +213,7 @@ cargo tauri icon .ref\fnOS_UI_Mods\icons\icon128.png
 | 打开的是 `https://fnos.net/` 官网根域 | 按上游正则（要求前导点）**永不注入**，状态条如实说明是「fnOS 官网」 |
 | 外链 CSS 被 CSP 拦截 | 兜底 B：`adoptedStyleSheets` 接管 |
 | `mod.js` 的 data URL 被拦 | 兜底执行未修改的原始脚本 |
-| 主窗口加载失败 / 离线 | 切到内置错误页 `ui/settings/error.html`（显示失败地址、原因、退避计划）；**错误页不注册任何 mods 初始化脚本**。重试有三个入口：设置窗状态条的「重试」、托盘「重新加载主窗口」、错误页自动退避重试（**15s → 30s → 60s → 120s**，第 5 次失败后停止自动重试） |
+| 主窗口加载失败 / 离线 | 切到内置错误页 `ui/settings/error.html`（显示失败地址、原因、退避计划）；**错误页不注册任何 mods 初始化脚本**。重试有三个入口：设置窗状态条的「重试」、托盘「重新加载」、错误页自动退避重试（**15s → 30s → 60s → 120s**，第 5 次失败后停止自动重试） |
 | 能从网络连上但页面永不完成 | 20 秒看门狗兜底判失败 |
 | WebView2 版本 < 139 | 「关于」页提示 `corner-shape`（squircle 圆角）效果退化为普通圆角；取不到版本时**不提示**、也不谎报 |
 | `config.json` 损坏 | 回退默认值 + 原名改名保留为 `config.json.bak`，设置窗状态条**回显**这次回退 |
@@ -189,7 +226,10 @@ cargo tauri icon .ref\fnOS_UI_Mods\icons\icon128.png
 - 因此：`src-tauri/assets/fnos-mods/` 内保留上游 `LICENSE` 原文，并新增 `NOTICE`
   （来源仓库 + 锁定 commit `483c3e2` + 各文件 SHA-256 + **本壳的包装性改动清单**：chrome shim、
   `getURL` 改写为 data URL、`mod.js` 兜底执行、配置改由宿主提供、`content-script.js` 的包装执行、
-  **T14a 起把上游品牌图标 `icons/icon{16,32,48,128}.png` 用作本应用自身图标**）。
+  **T14a 起把上游品牌图标 `icons/icon{16,32,48,128}.png` 用作本应用自身图标**（`cargo tauri icon`
+  从 128 px 源生成的多尺寸 `.ico`/`.png` 里，**大于 128 px 的尺寸都是那一份 128 px 源的放大**，
+  上游只提供到 128 px）、**T14b 起设置窗托管上游 `popup.html` + `popup.js`**（前者只多一行
+  chrome.* 兼容层标签，后者逐字节原样；`ui/settings/` 下另有一份逐字节相同的资产副本）。
 - 这两个文件通过 `bundle.resources` **随安装包分发**到安装目录的 `fnos-mods\`
   （`LICENSE` → `<安装目录>\fnos-mods\LICENSE`，`NOTICE` → `<安装目录>\fnos-mods\NOTICE`，卸载时一并删除）。
   普通 `cargo build` 也会在 `src-tauri\target\<profile>\fnos-mods\` 放一份（`tauri-build` 的 `copy_resources`），
@@ -201,15 +241,23 @@ cargo tauri icon .ref\fnOS_UI_Mods\icons\icon128.png
 
 ## 已知限制
 
-- **字体不随包**：仓库和安装包里都**没有**任何字体文件。设置窗只提供
+- **字体不随包，也不做字体文件导入**（设计文档 D4）：仓库和安装包里都**没有**任何字体文件。
+  设置窗主界面是上游 popup，它确实带一个「导入字体文件」控件——但那个控件在**上游自己的
+  `popup.html` 里就是注释掉的**（`popup.html:1180-1188`），所以界面上根本没有它；而 `popup.js`
+  里那条代码路径依然存在（`popup.js:2161-2196`，`#fontFile` 为 null 时整段跳过）。本壳的
+  `chrome-shim.js` 仍然把写入 `customFontDataUrl` / `customFontFileName` / `customFontFormat`
+  的请求**如实拒绝**（可见的「外壳说明」框里写明原因，并抛错让上游走进它自己的失败分支），
+  而不是假装成功：将来上游把那一段注释解开，界面也不会说谎。可用的字段只有
   `fontOverrideEnabled` / `fontFamily` / `fontMonospaceFamily` / `fontUrl` / `fontWeight` /
-  `fontFeatureSettings` 这些**字段**，字体得是你本机已装的，或由 `fontUrl` 指向网络字体。
-- **P1 项未实现**（设计文档 §8.2 标注可后置）：
-  - 完美图标的**逐项三态**设置（按需 PNG）。上游的 `prefect_icon/icon-map.json` 与 14 张 PNG
-    已 vendored 进载荷，但没有让用户逐项挑选的界面。
-  - **登录壁纸**（lockscreen 壁纸）没有实现，登录页组目前只有「默认用户名」一项。
+  `fontFeatureSettings` / `fontFaceName`——字体得是你本机已装的，或由 `fontUrl` 指向网络字体。
+- **更新检查不联网**：上游 popup 的「检查」按钮在本壳里不会发起任何请求（`fetch` 被接管），
+  它报告的是「本壳内置的 vendored commit」。升级由本仓发版决定，不是让用户去比对 GitHub HEAD。
 - **载荷约 423KB / 每次导航**（7 个 CSS + `mod.js` + `content-script.js`），且每次导航都会重新注入解析；
   实测受管元素与 CSS 变量在 DOMContentLoaded 之前生效（约 180ms）。数字与口径见验收记录 §4。
+- **设置窗资产重复一份**：上游的 `popup.html` / `popup.js` / 19 张 PNG + `icon-map.json`
+  既在 `src-tauri/assets/fnos-mods/`（provenance + NOTICE 的 SHA 表）又在 `ui/settings/`
+  （资产协议只能服务 `frontendDist`，而 `chrome.runtime.getURL` 必须同步给出真实 URL）。
+  代价是 `frontendDist` 大约 +1.0 MB（`generate_context!` 会把它嵌进二进制）。
 - **失败判定只覆盖首次导航**：页面**内**跳转失败不会切错误页（状态条仍会给出「把当前页加入白名单」）。
 - **release 版没有控制台**（`windows_subsystem = "windows"`），`[fnos]` 日志不可见；排障请用 debug 版。
 - **安装包未签名**：仓库里没有任何签名证书配置，`Get-AuthenticodeSignature` 对安装包与主程序实测都是
@@ -235,9 +283,9 @@ cargo tauri icon .ref\fnOS_UI_Mods\icons\icon128.png
 | 路径 | 内容 |
 |---|---|
 | `src-tauri/src/` | Rust 侧：`paths`（配置/资源路径）、`config`（配置与归一化）、`injector`（注入载荷）、`tray`（托盘）、`commands`（IPC + 窗口/错误页/加载观测） |
-| `src-tauri/assets/fnos-mods/` | 上游 vendored 资源 + `LICENSE` + `NOTICE` |
-| `src-tauri/inject/` | `shim.js`（chrome.* 兼容层）、`bootstrap.js`（配置装配与注入闸门） |
-| `ui/settings/` | 设置窗前端（零依赖、零构建链；含内置错误页 `error.html`） |
+| `src-tauri/assets/fnos-mods/` | 上游 vendored 资源 + `LICENSE` + `NOTICE`（含上游 popup 的 `popup.html` / `popup.js`） |
+| `src-tauri/inject/` | `shim.js`（页面侧 chrome.* 兼容层 + 上报通道）、`bootstrap.js`（配置装配与注入闸门） |
+| `ui/settings/` | 设置窗前端（零依赖、零构建链）：`settings.html` + `app.js`（本壳区域与宿主桥）、`chrome-shim.js`（iframe 里的 chrome.* 兼容层）、`popup.html`/`popup.js`（上游 UI 的逐字节副本 + 一行标签）、内置错误页 `error.html` |
 | `tests/` | Node 契约测试 |
 | `docs/superpowers/specs/` | 设计文档 |
 | `docs/acceptance/` | 端到端验收记录 |

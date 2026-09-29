@@ -2,5 +2,16 @@
 .ref/** -text
 src-tauri/assets/** -text
 
+# Task 14b：设置窗里托管的上游 UI 是 vendored 副本的**逐字节副本**
+# （popup.js 原样、popup.html 只多一行 shim 标签），PNG 也是逐字节拷过来的。
+# `ui/` 不在上面那条 vendored 规则里，但同样不能被 EOL 转换碰到：core.autocrlf=true 的
+# 机器上，不钉住的话 checkout 会把它们换成 CRLF，于是
+# ① `tests/chrome-shim.test.mjs` 的逐字节比对、② `tools/vendor-mods.ps1` 的派生自检
+# ③ 与上游 GitHub 字节/NOTICE 里那份 SHA-256 的一致性 三者都会被破坏。
+ui/settings/popup.html -text
+ui/settings/popup.js -text
+ui/settings/icons/** -text
+ui/settings/prefect_icon/** -text
+
 # 其余文本文件按仓库默认处理
 *.md text

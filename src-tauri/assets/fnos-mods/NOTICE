@@ -19,11 +19,25 @@ Packaging changes made by this project (upstream files themselves are UNMODIFIED
      (multi-size) and src-tauri/icons/icon.png, and icons/icon32.png is embedded with
      include_bytes! as the tray icon. No upstream pixel is altered; tool-generated sizes above
      128 px are upscales of that same 128 px source (the largest size upstream ships).
+  7. T14b: the settings window hosts the upstream popup UI (popup.html + popup.js) instead of
+     this project's own hand-written settings groups. ui/settings/popup.js and every PNG it
+     can name (prefect_icon/*.png, icons/*.png) are byte-identical copies; ui/settings/popup.html
+     differs from the vendored popup.html by exactly ONE inserted line,
+     `<script src="./chrome-shim.js"></script>` placed immediately before the popup.js script
+     tag, because a chrome.* compatibility layer must define window.chrome before the popup
+     runs. That shim (ui/settings/chrome-shim.js) is this project's own code: it reimplements
+     chrome.storage.{sync,local} / chrome.tabs.* / chrome.runtime.* / chrome.action.* on top of
+     the host application (get_config / set_config / get_page_state / get_page_report / the
+     settings-only local store), neutralises the upstream update check (no network requests;
+     this application pins the vendored commit) and refuses local font-file import, which this
+     project does not implement (upstream popup.js itself is unmodified).
 
 File SHA-256:
   0b2783e045934f8b71bb2419ad45c04afb610c7f291cc1e5086df346029b867f       1390  LICENSE
   776a453a2bbe75be26eb7a03952fe3750280ee1bc3225c468efae723b7b311ad     112921  content-script.js
   cd88ff5c5413b49698cbb4fc524250a59c3a48dbe93cc6d13f558999f2e213a3      62913  mod.js
+  676c9c0becc5c7de3193467b371fcceeb48c401aa421148744cf62f73df7711b      64642  popup.html
+  271c25fd125c443fcdb325bd08734a47260774e47ecb526bdb7133a03ddce728      76833  popup.js
   cedf9f007a64f10ea9160772af376f545d7dd7a752b3c68f224169386ed2be73     195500  basic_mod.css
   72e0aac727d329022b72f684e4f3c2cc3eaf775ab9d171912b2b541ac32b164f       2422  windows_titlebar_mod.css
   53a7b2f2ea34e2800683995373a3db7426021d81ee252aeb9536f26e75a1eb80       6111  mac_titlebar_mod.css

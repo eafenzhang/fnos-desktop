@@ -415,7 +415,8 @@ pub const MAX_WALLPAPER_BYTES: usize = 8 * 1024 * 1024;
 
 /// 登录壁纸允许的扩展名（小写规范形式）：`png` / `jpg` / `jpeg` / `webp`。
 ///
-/// 与设置窗文件输入的 `accept` 一致（`ui/settings/schema.js` 的 `imageFile` 项）：
+/// 与设置窗的壁纸文件输入一致（T14b 起是**上游** popup.html 的
+/// `#loginWallpaperFile` 的 `accept`，以及 `chrome-shim.js` 的 `WALLPAPER_EXTS` 早退表）：
 /// 上游只把壁纸当 CSS `background-image` 用，这三种格式是 WebView2 一定能解码的。
 pub fn wallpaper_ext(name: &str) -> Option<&'static str> {
     let lower = name.to_ascii_lowercase();

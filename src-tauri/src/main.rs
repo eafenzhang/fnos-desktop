@@ -89,6 +89,16 @@ fn main() {
             // Task 13b：登录壁纸导入。设置窗自己写不了文件（只有这个命令有文件写入），
             // 同样只授设置窗，并且在 remote-deny.json 里显式 deny（见 build.rs 的注释）。
             commands::import_wallpaper,
+            // Task 14b：设置窗托管上游 popup UI 所需的三条。
+            // - get_local_store / set_local_store：上游 `chrome.storage.local` 里那些
+            //   **本壳配置模型没有对应字段**的扩展本地状态（目前只有更新检查状态），落在
+            //   配置目录的 local-store.json；只存字符串、有键名/单值/总量上限、不做路径解析。
+            // - request_app_items：**无参数**地请主窗口页面重新汇报一次启动台应用项
+            //   （上游 popup 的逐项 UI 会主动要列表，而本壳只有页面侧能发起那次请求）。
+            // 三条都只授设置窗，且都在 remote-deny.json 里显式 deny。
+            commands::get_local_store,
+            commands::set_local_store,
+            commands::request_app_items,
         ])
         .run(tauri::generate_context!())
         .expect("fnOS 启动失败");

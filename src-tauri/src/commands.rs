@@ -1555,6 +1555,179 @@ pub fn import_wallpaper(name: String, data_base64: String) -> Result<String, Str
     Ok(stored)
 }
 
+// ---------- Task 14b：设置窗本地存储 + 「请页面重新汇报应用项」 ----------
+
+/// 设置窗本地存储（`local-store.json`）的键名上限。
+pub const MAX_LOCAL_STORE_KEYS: usize = 32;
+/// 单值上限。上游唯一真正需要它的是「更新检查状态」（几百字节）；64 KiB 远大于它，
+/// 又远小于任何字体文件（本壳不提供字体导入，见 [`LOCAL_STORE_REFUSED_HINT`]）。
+pub const MAX_LOCAL_STORE_VALUE_BYTES: usize = 64 * 1024;
+/// 整份存储的上限（键 + 值字节数之和）。
+pub const MAX_LOCAL_STORE_TOTAL_BYTES: usize = 256 * 1024;
+
+/// 键名形状：一小撮 ASCII 字符，**不含任何路径分隔符、不以 `.` 开头、不含 `..`**。
+///
+/// 为什么单独一道闸门：这个存储的存在理由就是「上游 popup 需要一份扩展本地状态」，
+/// 它的键永远来自上游源码里的字符串常量（`updateCheckState` 等）。把键限成「不可能是
+/// 路径」的形状之后，「键 → 文件路径」这类用法在这一层根本表达不出来——宿主只按固定
+/// 文件名 [`local_store_path`] 落盘，键只当 JSON 对象的字段名。
+/// 前导点一并拒掉（与 `config::is_wallpaper_name` 拒隐藏文件同一种纪律）：`.` 与 `..`
+/// 都是目录项，不该出现在一个「键」的位置上。
+fn is_local_store_key(key: &str) -> bool {
+    if key.is_empty() || key.len() > 64 || key.starts_with('.') {
+        return false;
+    }
+    key.bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b':'))
+        && !key.contains("..")
+}
+
+/// 说明文案（拒绝字体数据时也走这里，保证「为什么拒」只有一处事实来源）。
+pub const LOCAL_STORE_REFUSED_HINT: &str =
+    "本外壳的设置窗本地存储只保存上游 popup 的扩展本地状态（字符串、有大小上限），不接受字体数据";
+
+fn local_store_path() -> std::path::PathBuf {
+    paths::config_dir().join("local-store.json")
+}
+
+/// 读本地存储：永远是「键 → 字符串」的映射（值由设置窗自己 JSON 编码，宿主不解释它）。
+///
+/// 文件不存在 / 读不动 / 不是 JSON 对象 → 空存储。**损坏的文件会被改名保留**为
+/// `local-store.json.bak`（与 `Config::load_with_report` 对 `config.json` 的做法一致）：
+/// 一次静默的重置会让人以为「设置自己丢过」，而留下 .bak 至少可查。
+fn load_local_store(path: &std::path::Path) -> std::collections::BTreeMap<String, String> {
+    let empty = std::collections::BTreeMap::new();
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return empty; // 还没有这份文件是**正常**状态（首次运行）
+    };
+    let parsed: Option<std::collections::BTreeMap<String, String>> =
+        serde_json::from_str(&raw).ok();
+    match parsed {
+        Some(map) => map,
+        None => {
+            let bak = path.with_extension("json.bak");
+            let _ = std::fs::rename(path, &bak);
+            eprintln!(
+                "[fnos] 设置窗本地存储损坏，已改名为 {} 并回到空存储",
+                bak.display()
+            );
+            empty
+        }
+    }
+}
+
+/// 落盘（临时文件 + 改名，避免半个文件）。
+fn save_local_store(
+    path: &std::path::Path,
+    store: &std::collections::BTreeMap<String, String>,
+) -> Result<(), String> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("配置目录不可写：{e}"))?;
+    }
+    let text = serde_json::to_string_pretty(store).map_err(|e| e.to_string())?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, text.as_bytes()).map_err(|e| format!("写入本地存储失败：{e}"))?;
+    std::fs::rename(&tmp, path).map_err(|e| format!("替换本地存储失败：{e}"))
+}
+
+/// 把一次 patch 套到 store 上（纯函数，便于单测）。
+///
+/// **先整份校验、再整份应用**：任何一条不合法都返回 `Err` 且**不改动** store
+/// ——「一半写入成功」比「整次失败」难排查得多，而上游每次都只发一个键。
+fn apply_local_store_patch(
+    store: &mut std::collections::BTreeMap<String, String>,
+    patch: &std::collections::BTreeMap<String, Option<String>>,
+) -> Result<(), String> {
+    for (key, value) in patch {
+        if !is_local_store_key(key) {
+            return Err(
+                "本地存储键名不合法（只允许 ASCII 字母/数字与 _ - . :，长度 ≤ 64，且不含路径分隔符）"
+                    .to_string(),
+            );
+        }
+        if let Some(text) = value {
+            if text.len() > MAX_LOCAL_STORE_VALUE_BYTES {
+                return Err(format!(
+                    "本地存储单个值超过 {} KiB 上限（{LOCAL_STORE_REFUSED_HINT}）",
+                    MAX_LOCAL_STORE_VALUE_BYTES / 1024
+                ));
+            }
+        }
+    }
+
+    let mut next = store.clone();
+    for (key, value) in patch {
+        match value {
+            None => {
+                next.remove(key);
+            }
+            Some(text) => {
+                next.insert(key.clone(), text.clone());
+            }
+        }
+    }
+    if next.len() > MAX_LOCAL_STORE_KEYS {
+        return Err(format!("本地存储最多 {MAX_LOCAL_STORE_KEYS} 个键"));
+    }
+    let total: usize = next.iter().map(|(k, v)| k.len() + v.len()).sum();
+    if total > MAX_LOCAL_STORE_TOTAL_BYTES {
+        return Err(format!(
+            "本地存储总量超过 {} KiB 上限（{LOCAL_STORE_REFUSED_HINT}）",
+            MAX_LOCAL_STORE_TOTAL_BYTES / 1024
+        ));
+    }
+    *store = next;
+    Ok(())
+}
+
+/// 读设置窗本地存储（Task 14b）。**只授设置窗**，且在 `remote-deny.json` 里显式 deny。
+///
+/// 返回 `{键: 字符串}`：值由设置窗自己 JSON 编码（上游的 `updateCheckState` 是个对象），
+/// 宿主不解释它——这样「宿主只存字符串」与「上游存的是对象」两个事实不会互相污染。
+#[tauri::command]
+pub fn get_local_store() -> Value {
+    let store = load_local_store(&local_store_path());
+    serde_json::to_value(store).unwrap_or_else(|_| Value::Object(serde_json::Map::new()))
+}
+
+/// 写设置窗本地存储（Task 14b）。`null` 值 = 删除该键（与 `commands::merge` 的语义一致）。
+///
+/// 返回**整份**存储，调用方据此把它当权威值（不猜、不合并自己那份缓存）。
+#[tauri::command]
+pub fn set_local_store(
+    patch: std::collections::BTreeMap<String, Option<String>>,
+) -> Result<Value, String> {
+    let path = local_store_path();
+    let mut store = load_local_store(&path);
+    apply_local_store_patch(&mut store, &patch)?;
+    save_local_store(&path, &store)?;
+    Ok(serde_json::to_value(store).unwrap_or_else(|_| Value::Object(serde_json::Map::new())))
+}
+
+/// 请主窗口页面**重新**汇报一次「启动台应用项列表」（Task 14b）。
+///
+/// 为什么需要它：上游 popup 的逐项 UI 会主动
+/// `chrome.tabs.sendMessage({type:'FNOS_GET_LAUNCHPAD_APP_ITEMS'})` 去要列表；而在本壳里，
+/// 那份列表只能由**页面侧**的 shim 主动向上游请求、再经标题通道回报
+///（`inject/shim.js::requestAppItems`，它只在页面加载时启动一轮有限重试）。设置窗开得比
+/// 那一轮晚就永远拿不到列表，用户会一直看到「未读取到应用，先打开启动台再试」——一句
+/// 无法兑现的话。这条命令把「再问一次」变成可能：设置窗先读已有的上报槽位，槽位是空的
+/// 才调它，然后在一个**有界**的窗口内轮询（`ui/settings/app.js::answerAppItems`）。
+///
+/// 安全性：**无参数**——不接受任何脚本文本，因此它不是注入面（eval 的是本壳自己注入的
+/// 那一行固定代码），也只授设置窗、并在 `remote-deny.json` 里显式 deny。
+#[tauri::command]
+pub fn request_app_items<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
+    let win = app
+        .get_webview_window(MAIN_WINDOW)
+        .ok_or_else(|| "主窗口未打开".to_string())?;
+    win.eval("window.__FNOS_REQUEST_APP_ITEMS__ && window.__FNOS_REQUEST_APP_ITEMS__();")
+        .map_err(|e| format!("请求页面汇报应用项失败：{e}"))?;
+    // 运行期证据（与建窗加载日志同风格）：一行证明设置窗的请求真的走到了页面。
+    eprintln!("[fnos] 已请主窗口页面重新汇报启动台应用项列表");
+    Ok(())
+}
+
 // ---------- Rust 内部（非 IPC） ----------
 
 pub fn open_settings<R: Runtime>(app: &AppHandle<R>) {
@@ -2133,7 +2306,7 @@ mod tests {
     /// 这里把它固化成一个每次 `cargo test` 都会跑的机械锁。
     #[test]
     fn every_ipc_command_is_registered_in_all_four_places() {
-        const CMDS: [&str; 9] = [
+        const CMDS: [&str; 12] = [
             "get_config",
             "set_config",
             "reload_main",
@@ -2143,6 +2316,9 @@ mod tests {
             "get_page_state",
             "get_page_report",
             "import_wallpaper",
+            "get_local_store",
+            "set_local_store",
+            "request_app_items",
         ];
         let build = include_str!("../build.rs");
         let main_rs = include_str!("main.rs");
@@ -2178,7 +2354,7 @@ mod tests {
                 "capabilities/remote-deny.json 缺少 deny-{kebab}"
             );
         }
-        // 授权面：设置窗有 9 个 allow-*，远程那份**一个授权都没有**
+        // 授权面：设置窗的 allow-* 条数恰好等于命令数，远程那份**一个授权都没有**
         assert_eq!(
             default_json.matches("\"allow-").count(),
             CMDS.len(),
@@ -2247,6 +2423,163 @@ mod tests {
         assert!(
             shim.contains("setTimeout"),
             "分片必须跨 task 发送（同帧连写会被合并）"
+        );
+    }
+
+    // ---------- Task 14b：设置窗本地存储 + 页面重汇报钩子 ----------
+
+    /// 键名形状：合法的照收，**任何可能被当成路径的写法一律拒绝**。
+    #[test]
+    fn local_store_keys_cannot_be_paths() {
+        for good in ["updateCheckState", "a.b:c-d_e", "A0"] {
+            assert!(is_local_store_key(good), "应当放行：{good}");
+        }
+        for bad in [
+            "",
+            ".",
+            "..",
+            "../x",
+            "a/b",
+            "a\\b",
+            "C:/x",
+            "a b",
+            "键",
+            "a\nb",
+            &"x".repeat(65),
+        ] {
+            assert!(!is_local_store_key(bad), "必须拒绝：{bad:?}");
+        }
+    }
+
+    /// patch 语义：`Some` 写入、`None` 删除；**整份校验在前**，坏键不产生半份写入。
+    #[test]
+    fn local_store_patch_is_all_or_nothing() {
+        let mut store = std::collections::BTreeMap::new();
+        let mut patch: std::collections::BTreeMap<String, Option<String>> =
+            std::collections::BTreeMap::new();
+        patch.insert(
+            "updateCheckState".to_string(),
+            Some("{\"a\":1}".to_string()),
+        );
+        assert!(apply_local_store_patch(&mut store, &patch).is_ok());
+        assert_eq!(
+            store.get("updateCheckState").map(String::as_str),
+            Some("{\"a\":1}")
+        );
+
+        // 同一次 patch 里既有合法键又有非法键 → 整次失败，合法的那个也不写入
+        let mut mixed: std::collections::BTreeMap<String, Option<String>> =
+            std::collections::BTreeMap::new();
+        mixed.insert("okKey".to_string(), Some("v".to_string()));
+        mixed.insert("../evil".to_string(), Some("v".to_string()));
+        assert!(apply_local_store_patch(&mut store, &mixed).is_err());
+        assert!(!store.contains_key("okKey"), "非法 patch 不得留下半份写入");
+
+        // None = 删除
+        let mut del: std::collections::BTreeMap<String, Option<String>> =
+            std::collections::BTreeMap::new();
+        del.insert("updateCheckState".to_string(), None);
+        assert!(apply_local_store_patch(&mut store, &del).is_ok());
+        assert!(store.is_empty());
+    }
+
+    /// 上限：单值 64 KiB、整份 256 KiB、键数 32 —— 字体数据（几 MB）在**任何**组合下都放不进来。
+    #[test]
+    fn local_store_bounds_reject_oversized_strings() {
+        let mut store = std::collections::BTreeMap::new();
+        let mut one: std::collections::BTreeMap<String, Option<String>> =
+            std::collections::BTreeMap::new();
+        one.insert(
+            "big".to_string(),
+            Some("x".repeat(MAX_LOCAL_STORE_VALUE_BYTES + 1)),
+        );
+        let err = apply_local_store_patch(&mut store, &one).expect_err("超限必须被拒");
+        assert!(err.contains("64 KiB"), "{err}");
+        assert!(store.is_empty());
+
+        // 恰好等于上限 → 通过（边界是「≤」而不是「<」）
+        let mut exact: std::collections::BTreeMap<String, Option<String>> =
+            std::collections::BTreeMap::new();
+        exact.insert(
+            "big".to_string(),
+            Some("x".repeat(MAX_LOCAL_STORE_VALUE_BYTES)),
+        );
+        assert!(apply_local_store_patch(&mut store, &exact).is_ok());
+        assert_eq!(store.len(), 1);
+
+        // 键数上限
+        let mut many: std::collections::BTreeMap<String, Option<String>> =
+            std::collections::BTreeMap::new();
+        for i in 0..(MAX_LOCAL_STORE_KEYS + 1) {
+            many.insert(format!("k{i}"), Some("v".to_string()));
+        }
+        let err = apply_local_store_patch(&mut std::collections::BTreeMap::new(), &many)
+            .expect_err("键数超限必须被拒");
+        assert!(err.contains("32"), "{err}");
+
+        // 总量上限（多个值合起来越界）
+        let mut total: std::collections::BTreeMap<String, Option<String>> =
+            std::collections::BTreeMap::new();
+        for i in 0..8 {
+            total.insert(
+                format!("k{i}"),
+                Some("y".repeat(MAX_LOCAL_STORE_VALUE_BYTES)),
+            );
+        }
+        let err = apply_local_store_patch(&mut std::collections::BTreeMap::new(), &total)
+            .expect_err("总量超限必须被拒");
+        assert!(err.contains("256 KiB"), "{err}");
+    }
+
+    /// 落盘往返 + 损坏文件的 `.bak` 保留（与 `config.json` 同一套纪律）。
+    #[test]
+    fn local_store_round_trips_and_keeps_a_broken_file() {
+        let dir = temp_dir("local-store");
+        let path = dir.join("local-store.json");
+        let mut store = std::collections::BTreeMap::new();
+        store.insert(
+            "updateCheckState".to_string(),
+            "{\"lastResult\":\"first\"}".to_string(),
+        );
+        save_local_store(&path, &store).unwrap();
+        let again = load_local_store(&path);
+        assert_eq!(again, store);
+        // 落盘内容是可读的 JSON 对象（排障时人能直接看）
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("updateCheckState"), "{raw}");
+        assert!(serde_json::from_str::<Value>(&raw).unwrap().is_object());
+
+        // 损坏 → 空存储 + 原名保留为 .bak
+        std::fs::write(&path, "{ not json").unwrap();
+        assert!(load_local_store(&path).is_empty());
+        assert!(!path.exists(), "损坏的文件必须被改名移走");
+        assert!(dir.join("local-store.json.bak").exists(), ".bak 必须保留");
+
+        // 不存在 → 空存储（首次运行是正常状态，不该留下任何文件）
+        let fresh = dir.join("never-written.json");
+        assert!(load_local_store(&fresh).is_empty());
+        assert!(!fresh.exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 页面侧的「重新汇报应用项」钩子必须存在且**不引入任何页面 → 宿主的命令通路**。
+    #[test]
+    fn app_items_refresh_hook_exists_on_the_page_side_only() {
+        let shim = include_str!("../inject/shim.js");
+        assert!(
+            shim.contains("__FNOS_REQUEST_APP_ITEMS__"),
+            "页面侧必须暴露重汇报钩子，宿主 request_app_items 才有的可调"
+        );
+        let commands = include_str!("commands.rs");
+        assert!(
+            commands.contains(
+                "window.__FNOS_REQUEST_APP_ITEMS__ && window.__FNOS_REQUEST_APP_ITEMS__();"
+            ),
+            "宿主 eval 的必须正是那一行固定代码（不拼接任何参数）"
+        );
+        assert!(
+            !shim.contains("invoke("),
+            "钩子仍然只能写 document.title，不得给页面开命令授权"
         );
     }
 }

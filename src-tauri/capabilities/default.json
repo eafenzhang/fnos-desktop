@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "settings-only",
-  "description": "只允许设置窗调用应用命令；远程页面无任何授权（Task 11 的 get_page_state 与 Task 13a 的 get_page_report 同样只授设置窗；页面→宿主上报走 document.title，不占任何权限。Task 13b 的 import_wallpaper 是唯一会写文件的命令——它也只授设置窗，远程页面对它同样没有授权）",
+  "description": "只允许设置窗调用应用命令；远程页面无任何授权（Task 11 的 get_page_state 与 Task 13a 的 get_page_report 同样只授设置窗；页面→宿主上报走 document.title，不占任何权限。Task 13b 的 import_wallpaper 是唯一会写文件的命令——它也只授设置窗，远程页面对它同样没有授权。Task 14b 起设置窗托管上游 popup UI，多出三条只授设置窗的命令：get_local_store / set_local_store（上游 chrome.storage.local 里本壳配置模型没有对应字段的那部分扩展本地状态，落在配置目录的 local-store.json，只存字符串且有上限）与 request_app_items（无参数，请主窗口页面重新汇报一次启动台应用项））",
   "windows": ["settings"],
   "permissions": [
     "core:default",
@@ -13,6 +13,9 @@
     "allow-reset-config",
     "allow-get-page-state",
     "allow-get-page-report",
-    "allow-import-wallpaper"
+    "allow-import-wallpaper",
+    "allow-get-local-store",
+    "allow-set-local-store",
+    "allow-request-app-items"
   ]
 }

@@ -9,20 +9,19 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readdirSync, readFileSync } from 'node:fs';
 import {
-  adoptConfig, appItemsFromReport, appListEmptyText, applyIconSelection, compliancePaths,
-  iconChoiceOptions, iconSelectionFor, isTooLargeReport, reportSlots, state,
+  adoptConfig, appItemsAnswer, appItemsFromReport, applyPatchFromPopup, compliancePaths,
+  isTooLargeReport, pageCheckAnswer, reportSlots, state,
 } from '../ui/settings/app.js';
 import * as bridge from '../ui/settings/bridge.js';
 import {
   clampLightness, normalizeMods, normalizeModsEntry, normalizeOrigin, parseHttpOrigin
 } from '../ui/settings/normalize.js';
-import { PREFECT_ICONS, VENDOR_DIR, prefectIconPath } from '../ui/settings/schema.js';
+import { VENDOR_DIR } from '../ui/settings/app.js';
 
 test('导入 app.js 不触发 boot（无 DOM 也能单测内部逻辑）', async () => {
-  // `boot()` 现在挂在 `window.addEventListener('focus')` 上并会 `render()`（要 #nav/#pane），
+  // `boot()` 只挂在「有 #upstreamHost 的真实页面」上（Task 14b 起判据是这个 id），
   // 若无守卫，仅 import 就会抛错。导入成功 + state 仍是初始值即是证明。
   assert.equal(state.config, null);
-  assert.equal(state.active, null);
   assert.equal(state.error, null);
 });
 
@@ -220,24 +219,27 @@ function reportWith(items) {
   return { type: 'FNOS_GET_LAUNCHPAD_APP_ITEMS', dir: 'response', payload: { items, titles: [] } };
 }
 
-test('F: 内置图标清单必须与 vendored 目录逐条一致（防清单漂移）', () => {
-  const dir = new URL('../src-tauri/assets/fnos-mods/prefect_icon/', import.meta.url);
-  const onDisk = readdirSync(dir)
-    .filter((n) => n.toLowerCase().endsWith('.png'))
-    .map((n) => n.slice(0, n.length - 4).toLowerCase())
-    .sort();
-  const listed = [...PREFECT_ICONS].sort();
-  assert.deepEqual(listed, onDisk, 'schema.js 的 PREFECT_ICONS 必须与 vendored 目录集合相等');
-  assert.equal(listed.length, 14);
+test('F: 内置图标清单必须与 vendored 目录逐条一致（Task 14b 起改为比对两份真实目录）', () => {
+  // T14b 之前这里守的是 `schema.js::PREFECT_ICONS` 这份手写清单；分组 UI 退休、schema.js
+  // 删除之后，清单的**唯一**事实来源是 vendored 目录本身。现在要守的是打包不变式：
+  // 上游 popup 能 `chrome.runtime.getURL('prefect_icon/<name>.png')` 命名的每一张图，
+  // 都必须在**设置窗资产根**下真的存在（否则上游的逐项重绘下拉会永远显示「未找到重绘图标」）。
+  const vendored = new URL('../src-tauri/assets/fnos-mods/prefect_icon/', import.meta.url);
+  const shipped = new URL('../ui/settings/prefect_icon/', import.meta.url);
+  const names = (dir) => readdirSync(dir).filter((n) => n.toLowerCase().endsWith('.png')).sort();
+  const vendoredPngs = names(vendored);
+  assert.equal(vendoredPngs.length, 14, `vendored 的完美图标必须有 14 张，实得 ${vendoredPngs.length}`);
+  assert.deepEqual(names(shipped), vendoredPngs, 'ui/settings/prefect_icon 必须与 vendored 目录逐文件一致');
+  // icon-map.json 也要在（上游 `loadPrefectIconMapConfig` 直接 fetch 它）
+  assert.ok(readdirSync(shipped).includes('icon-map.json'), 'ui/settings/prefect_icon 必须有 icon-map.json');
+  // 磁盘上的 camelCase 文件名（panIndex.png）与 icon-map.json 里的小写键并存
+  assert.ok(vendoredPngs.includes('panIndex.png'));
+  assert.ok(!vendoredPngs.includes('panindex.png'));
   // 逐项重绘写进配置的值必须过得了 normalize.js 的 `isPrefectIconPath`（R30 的大小写不敏感正则）
-  for (const name of PREFECT_ICONS) {
-    const path = prefectIconPath(name);
+  for (const name of vendoredPngs) {
+    const path = `prefect_icon/${name}`;
     assert.equal(normalizeModsEntry('launchpadIconRedrawMap', { k: path }).k, path, path);
-    assert.equal(path, path.toLowerCase(), `${path} 应当是小写（icon-map.json 的规范写法）`);
   }
-  // 磁盘上的 camelCase 文件名（panIndex.png）落在小写清单里
-  assert.ok(PREFECT_ICONS.includes('panindex'));
-  assert.ok(!PREFECT_ICONS.includes('panIndex'));
 });
 
 test('F: appItemsFromReport 只认形状（没有上报 / 别的 type / 形状不对 → null；空数组是 []）', () => {
@@ -258,136 +260,82 @@ test('F: appItemsFromReport 只认形状（没有上报 / 别的 type / 形状�
   assert.equal(appItemsFromReport({ type: 'FNOS_GET_LAUNCHPAD_APP_TITLES', payload: {} }), null);
 });
 
-test('F: 逐项处置的读写（上游只保证「重绘盖过另两种」，一个下拉是本壳的写入规范化）', () => {
-  // 订正（fix round 1 / Minor 6）：上游 cs:773-778 **只**把已在 `redrawSet` 里的 key 从
-  // `maskOnlyKeys` / `scaleSelectedKeys` 里剔除，并**没有**在缩放与仅遮罩之间做互斥
-  // （cs:633-652 两个判定各自独立）。所以本用例守的是「本壳写入时每项只留一种」，
-  // 不是「上游要求互斥」。
-  const key = '/app-center-static/serviceicon/emby/ui/images/icon_1.png';
-  const base = { launchpadIconScaleSelectedKeys: [], launchpadIconMaskOnlyKeys: [], launchpadIconRedrawKeys: [], launchpadIconRedrawMap: {} };
-  assert.equal(iconSelectionFor(base, key), 'off');
+test('F: appItemsAnswer 的三种结局（拿不到 → null；空列表 → null；可用 → 应答）', () => {
+  // 没有可用数据：没上报 / 形状不对 / 上游确实回报了 0 个 —— 都返回 null，
+  // 让调用方去「请页面重汇报一次」而不是凭空造一份列表。
+  assert.equal(appItemsAnswer(null), null);
+  assert.equal(appItemsAnswer({}), null);
+  assert.equal(appItemsAnswer({ type: 'FNOS_INJECTION_TRIGGERED', payload: {} }), null);
+  assert.equal(appItemsAnswer(reportWith([])), null, '空列表 = 还没有可用数据');
+  assert.equal(appItemsAnswer({ type: 'FNOS_GET_LAUNCHPAD_APP_ITEMS', payload: { items: 7 } }), null);
 
-  // 选「重绘：emby」→ redrawKeys 与 redrawMap 同时写（上游要求两者都在）
-  const red = applyIconSelection(base, key, `redraw:${prefectIconPath('emby')}`);
-  assert.deepEqual(red.launchpadIconRedrawKeys, [key]);
-  assert.deepEqual(red.launchpadIconRedrawMap, { [key]: 'prefect_icon/emby.png' });
-  assert.deepEqual(red.launchpadIconScaleSelectedKeys, []);
-  assert.deepEqual(red.launchpadIconMaskOnlyKeys, []);
-  assert.equal(iconSelectionFor(red, key), 'redraw:prefect_icon/emby.png');
-
-  // 改选「缩放」→ 必须从重绘里摘干净（上游会把 redrawSet 里的 key 从另两个列表剔除）
-  const scale = applyIconSelection(red, key, 'scale');
-  assert.deepEqual(scale.launchpadIconScaleSelectedKeys, [key]);
-  assert.deepEqual(scale.launchpadIconRedrawKeys, []);
-  assert.deepEqual(scale.launchpadIconRedrawMap, {});
-  assert.equal(iconSelectionFor(scale, key), 'scale');
-
-  // 改选「仅遮罩」→ 重绘同样被摘掉；「缩放」这一项也被本壳的写入规范化清掉
-  //（上游并不要求两者互斥，见上面的订正；清掉是为了让一个下拉的读数唯一）
-  const mask = applyIconSelection(scale, key, 'mask');
-  assert.deepEqual(mask.launchpadIconMaskOnlyKeys, [key]);
-  assert.deepEqual(mask.launchpadIconScaleSelectedKeys, []);
-  assert.equal(iconSelectionFor(mask, key), 'mask');
-
-  // 手工编辑配置让两种同时命中（上游真的允许这么写）→ 读数必须确定（本壳的优先级：遮罩先看）
-  const bothLists = {
-    launchpadIconScaleSelectedKeys: [key],
-    launchpadIconMaskOnlyKeys: [key],
-    launchpadIconRedrawKeys: [],
-    launchpadIconRedrawMap: {},
-  };
-  assert.equal(iconSelectionFor(bothLists, key), 'mask', '两个列表同时命中时读数必须确定');
-
-  // 回到「不处理」→ 四个键里都不留这一项
-  const off = applyIconSelection(mask, key, 'off');
-  assert.deepEqual(off.launchpadIconMaskOnlyKeys, []);
-  assert.deepEqual(off.launchpadIconScaleSelectedKeys, []);
-  assert.deepEqual(off.launchpadIconRedrawKeys, []);
-  assert.deepEqual(off.launchpadIconRedrawMap, {});
-  assert.equal(iconSelectionFor(off, key), 'off');
-
-  // 不认识的处置值 / 不在清单里的图标路径都不写任何东西（不给 junk 留缝）
-  for (const bad of ['redraw:../x', 'redraw:prefect_icon/not-bundled.png', 'redraw:', 'nope', 7, null]) {
-    const out = applyIconSelection(off, key, bad);
-    assert.deepEqual(out.launchpadIconRedrawKeys, [], `bad=${String(bad)}`);
-    assert.deepEqual(out.launchpadIconRedrawMap, {}, `bad=${String(bad)}`);
-  }
-
-  // 其它应用项不受影响（只动被改的那一个 key）
-  const other = '/app-center-static/serviceicon/xunlei/ui/images/icon_1.png';
-  const both = applyIconSelection(red, other, 'scale');
-  assert.deepEqual(both.launchpadIconRedrawKeys, [key], '另一个应用的重绘保留');
-  assert.deepEqual(both.launchpadIconScaleSelectedKeys, [other]);
-
-  // 入参不可变（applyIconSelection 不得改写 state.config 里的对象）
-  const frozen = { ...base };
-  applyIconSelection(frozen, key, 'scale');
-  assert.deepEqual(frozen, base, '入参对象不得被改写');
+  // 可用列表：items 逐项过形状闸门，titles 只收字符串
+  const two = [{ key: '/a', title: 'A' }, { key: '/b', title: 'B' }];
+  const answer = appItemsAnswer({
+    type: 'FNOS_GET_LAUNCHPAD_APP_ITEMS', dir: 'response',
+    payload: { items: two, titles: ['A', 'B', 7, null] },
+  });
+  assert.deepEqual(answer.items, two);
+  assert.deepEqual(answer.titles, ['A', 'B'], 'titles 里的非字符串一律丢掉');
+  assert.equal(answer.itemCount, 2);
+  assert.equal(answer.tooLarge, undefined);
 });
 
-test('F: 事件处理器的写回值经 normalizeModsEntry 后仍然是同一份（提交路径不会吞掉配置）', () => {
-  const key = '/app-center-static/serviceicon/emby/ui/images/icon_1.png';
-  const patch = applyIconSelection({}, key, `redraw:${prefectIconPath('panindex')}`);
-  for (const [k, v] of Object.entries(patch)) {
-    assert.deepEqual(normalizeModsEntry(k, v), v, k);
-  }
+test('F: 事件处理器写出的 patch 经 normalizeModsEntry 后仍是同一份（提交路径不会吞掉配置）', () => {
+  // 上游 popup 写的是 `launchpadIconRedrawMap` / `…RedrawKeys` / `…ScaleSelectedKeys` /
+  // `…MaskOnlyKeys` 这四个键（popup.js:559-581），本壳只在 `FNOS_APPLY` 那条路径上转发它们。
+  const patch = applyPatchFromPopup({
+    launchpadIconScaleSelectedKeys: [], launchpadIconMaskOnlyKeys: [],
+    launchpadIconRedrawKeys: ['/a.png'], launchpadIconRedrawMap: { '/a.png': 'prefect_icon/panIndex.png' },
+  });
+  for (const [k, v] of Object.entries(patch.mods)) assert.deepEqual(normalizeModsEntry(k, v), v, k);
 });
 
-test('F: 逐项下拉的选项集合（不处理/缩放/仅遮罩 + 14 个内置重绘目标）', () => {
-  const opts = iconChoiceOptions();
-  assert.deepEqual(opts.slice(0, 3).map((o) => o[0]), ['off', 'scale', 'mask']);
-  assert.equal(opts.length, 3 + PREFECT_ICONS.length);
-  for (const [value, text] of opts.slice(3)) {
-    assert.ok(value.startsWith('redraw:prefect_icon/'), value);
-    assert.ok(text.startsWith('重绘：'), text);
-    assert.ok(text.length > 3 && !text.includes('/'), '显示文本只用内置名');
-  }
+test('F: 上游消息里的每个派生键都落进 patch（白名单），其余一概不进', () => {
+  const patch = applyPatchFromPopup({
+    basePresetEnabled: false,
+    titlebarStyle: 'mac',
+    desktopIconPerColumn: 12,
+    brandColor: '#123456',
+    lockscreenDefaultUsername: 'me',
+    fontSettings: {
+      enabled: true, family: 'A', monospaceFamily: 'B', weight: '600',
+      featureSettings: '"liga" 1', faceName: 'X', url: 'https://x/y.woff2',
+    },
+    customCodeSettings: { css: 'body{}', js: 'void 0' },
+    // 这些是「资源要不要重算」的提示，本壳没有照着做的动作 → 不进 patch
+    refreshFontAsset: true, refreshCustomCode: true, refreshLoginWallpaper: true,
+    type: 'FNOS_APPLY',
+  });
+  assert.deepEqual(patch.mods, {
+    basePresetEnabled: false, titlebarStyle: 'mac', desktopIconPerColumn: 12,
+    brandColor: '#123456', lockscreenDefaultUsername: 'me',
+    fontOverrideEnabled: true, fontFamily: 'A', fontMonospaceFamily: 'B', fontWeight: '600',
+    fontFeatureSettings: '"liga" 1', fontFaceName: 'X', fontUrl: 'https://x/y.woff2',
+  });
+  assert.deepEqual(patch.local, { customCssCode: 'body{}', customJsCode: 'void 0' });
+  // 未知键 / 非对象输入不得产生任何 patch（空 patch 由调用方直接短路，不发 IPC）
+  assert.deepEqual(applyPatchFromPopup({ type: 'FNOS_APPLY', evil: 1 }), {});
+  assert.deepEqual(applyPatchFromPopup(null), {});
+  assert.deepEqual(applyPatchFromPopup({ fontSettings: 'x', customCodeSettings: 7 }), {});
 });
 
-test('F: 没有可用列表时的文案据实（四种情形四句话；页面可控 type 只回显 FNOS_* 形状）', () => {
-  const noReport = appListEmptyText(null, null);
-  assert.ok(noReport.includes('尚未收到'), noReport);
-  assert.ok(noReport.includes('打开配置目录'), noReport);
-
-  const empty = appListEmptyText(reportWith([]), []);
-  assert.ok(empty.includes('0 个应用项'), empty);
-
-  // 只发出过请求（`dir:'out'`，shim 自己发的）→ 「已经问过、还没有可用应答」，不是「形状不可用」
-  const asked = appListEmptyText({ type: 'FNOS_GET_LAUNCHPAD_APP_ITEMS', dir: 'out', payload: {} }, null);
-  assert.ok(asked.includes('已经向页面请求过'), asked);
-  assert.ok(!asked.includes('形状不可用'), asked);
-
-  const otherType = appListEmptyText({ type: 'FNOS_INJECTION_TRIGGERED', dir: 'out', payload: {} }, null);
-  assert.ok(otherType.includes('FNOS_INJECTION_TRIGGERED'), otherType);
-
-  const badShape = appListEmptyText({ type: 'FNOS_GET_LAUNCHPAD_APP_ITEMS', payload: { items: 7 } }, null);
-  assert.ok(badShape.includes('形状不可用'), badShape);
-
-  // 页面可控的 type 不得原样进 UI：奇怪形状一律走「形状不可用 / 未收到」的固定说法
-  for (const evil of ['<img src=x onerror=alert(1)>', 'evil\ntype', 'FNOS_x', 'A'.repeat(200), 7]) {
-    const text = appListEmptyText({ type: evil, payload: {} }, null);
-    assert.equal(typeof text, 'string');
-    assert.ok(!text.includes(String(evil)), `不得回显：${String(evil).slice(0, 20)}`);
-    assert.equal(text.split('\n').length, 1, '文案必须只有一行');
-  }
-});
-
-test('F: 列表过大的诊断有专属文案（不再让 UI 干等「还没收到可用的应答」）', () => {
+test('F: 列表过大的诊断被认出来并原样带给上游（不让它干等「未读取到应用」）', () => {
   // shim 在「装不下」时回的诊断（shim.js::noteAppItemsSend）：它必须被认出来，
-  // 而且**必须排在 `items.length === 0` 之前**——诊断的 items 就是空数组。
+  // 而且**必须排在「空列表 → null」之前**——诊断的 items 就是空数组。
   const diag = {
     type: 'FNOS_GET_LAUNCHPAD_APP_ITEMS',
     dir: 'response',
     payload: { items: [], titles: [], tooLarge: true, itemCount: 260 },
   };
   assert.equal(isTooLargeReport(diag), true);
-  const text = appListEmptyText(diag, appItemsFromReport(diag));
-  assert.ok(text.includes('列表过大'), text);
-  assert.ok(text.includes('260'), `必须给出项数：${text}`);
-  assert.ok(text.includes('无法上报'), text);
-  assert.ok(!text.includes('0 个应用项'), `不得说成「上游回报了 0 个应用项」：${text}`);
-  assert.ok(text.includes('打开配置目录'), text);
-  assert.equal(text.split('\n').length, 1, '文案必须只有一行');
+  const answer = appItemsAnswer(diag);
+  assert.equal(answer.tooLarge, true);
+  assert.deepEqual(answer.items, []);
+  assert.equal(answer.itemCount, 260, '必须把项数原样带出去（说明框要用它）');
+  // 关键：诊断**不是** null——若返回 null，调用方会去请页面重汇报一次，而装不下就是装不下，
+  // 重问一万次也一样，用户会永远看不到原因。
+  assert.notEqual(appItemsAnswer(diag), null);
 
   // 判据本身要收紧：别的 type、字符串 "true"、缺 payload 都不算诊断
   for (const bad of [
@@ -400,15 +348,12 @@ test('F: 列表过大的诊断有专属文案（不再让 UI 干等「还没收�
   ]) {
     assert.equal(isTooLargeReport(bad), false, `不得被当成诊断：${JSON.stringify(bad)}`);
   }
-  // 没有项数（或项数不是有限数）时也不能把页面可控文本插进文案
-  const noCount = appListEmptyText(
-    { type: 'FNOS_GET_LAUNCHPAD_APP_ITEMS', payload: { tooLarge: true, itemCount: '很多很多' } }, []
+  // 项数不是有限数时不把它当数字带出去（页面可控文本不进任何数字位置）
+  const noCount = appItemsAnswer(
+    { type: 'FNOS_GET_LAUNCHPAD_APP_ITEMS', payload: { tooLarge: true, itemCount: '很多很多' } }
   );
-  assert.ok(noCount.includes('列表过大'), noCount);
-  assert.ok(!noCount.includes('很多很多'), noCount);
-  // 正常的空列表文案没有被这条新分支吞掉
-  assert.ok(appListEmptyText({ type: 'FNOS_GET_LAUNCHPAD_APP_ITEMS', payload: { items: [] } }, [])
-    .includes('0 个应用项'));
+  assert.equal(noCount.tooLarge, true);
+  assert.equal(noCount.itemCount, 0);
 });
 
 test('F: 应用项列表取不到时各种形状都不会被当成「有数据」', () => {
@@ -442,16 +387,95 @@ test('G: get_page_report 的信封被拆成 report / appItems 两个槽位（缺
   assert.ok(Object.prototype.hasOwnProperty.call(state, 'appItemsReport'));
 });
 
-test('G: 逐项列表只读 appItems 槽位（绝不读状态条的证据槽位）', () => {
-  // 源码级断言：`case 'appList'` 这一段里只允许出现 appItemsReport。两个槽位接错的症状很隐蔽
+test('G: 应用项列表只读 appItems 槽位（绝不读状态条的证据槽位）', () => {
+  // 源码级断言：应用项那条通路里只允许出现 appItemsReport。两个槽位接错的症状很隐蔽
   // ——列表看起来「还没收到」，而状态条看起来正常——所以用一条机械锁钉住接线本身。
   const src = readFileSync(new URL('../ui/settings/app.js', import.meta.url), 'utf8');
-  const start = src.indexOf("case 'appList'");
-  const end = src.indexOf("case 'imageFile'");
-  assert.ok(start > 0 && end > start, 'app.js 必须同时有 appList 与 imageFile 分支');
+  const start = src.indexOf('export function appItemsAnswer(');
+  const end = src.indexOf('function sleep(');
+  assert.ok(start > 0 && end > start, 'app.js 必须有 appItemsAnswer 与紧随其后的 sleep');
   const block = src.slice(start, end);
-  assert.ok(block.includes('appItemsFromReport(state.appItemsReport)'), block.slice(0, 200));
-  assert.ok(block.includes('appListEmptyText(state.appItemsReport,'), block.slice(0, 200));
-  assert.ok(!block.includes('appItemsFromReport(state.report)'), '不得读状态条槽位');
-  assert.ok(!block.includes('appListEmptyText(state.report,'), '不得读状态条槽位');
+  assert.ok(block.includes('appItemsFromReport(report)'), block.slice(0, 200));
+  assert.ok(!block.includes('state.report'), '不得读状态条槽位');
+  // answerAppItems（异步那一半）同理：只碰 state.appItemsReport
+  const asyncStart = src.indexOf('export async function answerAppItems(');
+  const asyncEnd = src.indexOf('export function pageCheckAnswer(');
+  assert.ok(asyncStart > 0 && asyncEnd > asyncStart);
+  const asyncBlock = src.slice(asyncStart, asyncEnd);
+  assert.ok(asyncBlock.includes('appItemsAnswer(state.appItemsReport)'), asyncBlock.slice(0, 200));
+  assert.ok(!asyncBlock.includes('state.report'), '不得读状态条槽位');
+});
+
+// ---------- H：Task 14b —— 上游 UI 的判定、外壳桥、退休的分组 UI ----------
+
+test('H: pageCheckAnswer 只用宿主观测（识别或页面回报的注入链），错误页一律 false', () => {
+  const injected = { type: 'FNOS_INJECTION_TRIGGERED', dir: 'out', payload: {} };
+  assert.deepEqual(pageCheckAnswer({ recognized: true }, null), { isFnOSWebUi: true });
+  assert.deepEqual(pageCheckAnswer({ recognized: false }, injected), { isFnOSWebUi: true });
+  assert.deepEqual(pageCheckAnswer({ recognized: false }, null), { isFnOSWebUi: false });
+  // 错误页 / 加载失败：对着一张错误页说 true 只会让上游白干活
+  assert.deepEqual(pageCheckAnswer({ recognized: true, errorPage: true }, injected), { isFnOSWebUi: false });
+  assert.deepEqual(pageCheckAnswer({ recognized: true, loadFailed: true }, injected), { isFnOSWebUi: false });
+  // 取不到主窗口状态（IPC 失败）→ false，绝不猜成 true
+  assert.deepEqual(pageCheckAnswer(null, injected), { isFnOSWebUi: false });
+  // 伪造的注入回报不升级（与 status.js::reportVerdict 同源）：dir 不是 out 不算
+  assert.deepEqual(
+    pageCheckAnswer({ recognized: false }, { type: 'FNOS_INJECTION_TRIGGERED', dir: 'response', payload: {} }),
+    { isFnOSWebUi: false }
+  );
+});
+
+test('H: 上游 UI 被装进 iframe，且**只在配置快照就位之后**才创建（getManifest 是同步的）', () => {
+  const src = readFileSync(new URL('../ui/settings/app.js', import.meta.url), 'utf8');
+  // boot 的次序：先 getConfig + 画状态条，最后才 mountUpstreamFrame
+  const boot = src.slice(src.indexOf('export async function boot()'));
+  const adoptAt = boot.indexOf('adoptConfig(await api.getConfig())');
+  const mountAt = boot.indexOf('mountUpstreamFrame()');
+  assert.ok(adoptAt > 0 && mountAt > adoptAt, '必须先取到配置（写快照）再挂上游帧');
+  // 快照对象是**同一个引用**（就地更新），否则 shim 的同步读会读到旧对象
+  assert.ok(src.includes('window[SNAPSHOT_KEY] = snapshot;'), '桥必须把 snapshot 对象挂到 window 上');
+  assert.ok(src.includes('snapshot.config = state.config;'), 'adoptConfig 必须就地更新快照');
+  // 帧的源必须是上游页面本体，不是本壳重新拼的 HTML
+  assert.ok(src.includes("frame.setAttribute('src', UPSTREAM_PAGE)"), '帧的 src 必须是 UPSTREAM_PAGE');
+  // 宿主桥必须**白名单**派发：出现 `HOST_COMMANDS` 表 + 未命中即拒绝
+  assert.ok(src.includes('HOST_COMMANDS'), '必须有命令白名单表');
+  assert.ok(src.includes('设置窗没有映射这条命令'), '表外的命令名必须被明确拒绝');
+});
+
+test('H: 退休的分组 UI 不得留下任何可达引用（settings.html / app.js 都没有 nav/pane/schema）', () => {
+  const html = readFileSync(new URL('../ui/settings/settings.html', import.meta.url), 'utf8');
+  const app = readFileSync(new URL('../ui/settings/app.js', import.meta.url), 'utf8');
+  for (const dead of ['id="nav"', 'id="pane"', 'schema.js', 'SCHEMA']) {
+    assert.ok(!html.includes(dead), `settings.html 不得再引用 ${dead}`);
+  }
+  for (const dead of ["from './schema.js'", 'renderGroup', 'fieldEl(', 'iconChoiceOptions', 'applyIconSelection']) {
+    assert.ok(!app.includes(dead), `app.js 不得再引用 ${dead}`);
+  }
+  // schema.js 这个模块本身已经删除
+  assert.throws(() => readFileSync(new URL('../ui/settings/schema.js', import.meta.url), 'utf8'));
+  // 上游界面是**主内容**：html 里必须有它的宿主 id（app.js 的 boot 判据也用它）
+  assert.ok(html.includes('id="upstreamHost"'), 'settings.html 必须有上游界面宿主');
+  assert.ok(html.includes('id="about"'), 'settings.html 必须保留关于/合规容器');
+  assert.ok(html.includes('id="status"'), 'settings.html 必须保留状态条');
+});
+
+test('H: 新增的三个 IPC 命令在桥里的名字/参数形状与 Rust 侧一致', async () => {
+  const calls = [];
+  const prev = globalThis.window;
+  globalThis.window = {
+    __TAURI_INTERNALS__: { invoke: (cmd, args) => { calls.push([cmd, args]); return Promise.resolve({}); } },
+  };
+  try {
+    await bridge.getLocalStore();
+    await bridge.setLocalStore({ updateCheckState: '{"a":1}' });
+    await bridge.requestAppItems();
+  } finally {
+    if (prev === undefined) delete globalThis.window;
+    else globalThis.window = prev;
+  }
+  assert.deepEqual(calls, [
+    ['get_local_store', undefined],
+    ['set_local_store', { patch: { updateCheckState: '{"a":1}' } }],
+    ['request_app_items', undefined],
+  ]);
 });

@@ -8,8 +8,28 @@
 <body>
 <div id="status" class="status pending" role="status" aria-live="polite">正在读取配置…</div>
 <div class="shell">
-  <nav id="nav" aria-label="设置分组"></nav>
-  <main id="pane"></main>
+  <section class="upstream" aria-label="上游设置界面">
+    <!--
+      Task 14b：设置窗的**主界面**是上游原样的 popup UI。
+      `popup.html` 与 vendored 副本逐字节相同，只多插入一行
+      `<script src="./chrome-shim.js"></script>`（见 tools/vendor-mods.ps1 与 NOTICE 的
+      包装性改动第 7 条）：chrome.* 兼容层必须在上游 popup.js 之前定义 window.chrome。
+      装进 iframe 的理由有两条：① 上游 UI 的字节一个都不改（它自带 body 尺寸与整套样式）；
+      ② 它的样式因此不可能与下面本壳自己的区域互相打架。
+      帧在拿到配置快照之后才创建（见 app.js::mountUpstreamFrame）：上游在脚本开头就同步读
+      `chrome.runtime.getManifest().version`，所以快照必须先就位。
+    -->
+    <div id="upstreamHost" class="frame-host" data-state="loading">
+      <p class="frame-note" id="upstreamNote">正在读取配置…</p>
+    </div>
+  </section>
+  <aside class="shell-side" aria-label="外壳状态与关于">
+    <section class="card" id="shellCard">
+      <h2 class="pane-title">外壳（本应用，不是上游界面）</h2>
+      <div id="shellFields"></div>
+    </section>
+    <section id="about" aria-label="关于与合规"></section>
+  </aside>
 </div>
 <script type="module" src="app.js"></script>
 </body>

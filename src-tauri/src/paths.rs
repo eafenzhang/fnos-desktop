@@ -24,7 +24,7 @@ pub const LICENSE_RESOURCE: &str = "fnos-mods/LICENSE";
 pub const NOTICE_RESOURCE: &str = "fnos-mods/NOTICE";
 
 /// 源码树里 vendored 资源的位置。仅用于 `resource_dir()` 取不到时兜底
-/// （与 `ui/settings/schema.js` 的 `VENDOR_DIR` 同值）。
+/// （与设置窗 `ui/settings/app.js` 的 `VENDOR_DIR` 同值）。
 const VENDOR_SOURCE_DIR: &str = "src-tauri/assets/fnos-mods";
 
 /// 解析一个随包合规件的**实际**位置。
@@ -51,7 +51,7 @@ pub fn compliance_path(resource_dir: Option<&Path>, rel: &str) -> String {
             path.extend(rel.split('/'));
             path.display().to_string()
         }
-        // 回落路径与设置窗 `schema.js` 的 `VENDOR_DIR` 写法一致（正斜杠）
+        // 回落路径与设置窗 `app.js` 的 `VENDOR_DIR` 写法一致（正斜杠）
         None => {
             let name = Path::new(rel).file_name().unwrap_or_else(|| rel.as_ref());
             format!("{VENDOR_SOURCE_DIR}/{}", name.display())
@@ -113,7 +113,7 @@ mod tests {
         assert!(!compliance_path(Some(dir), LICENSE_RESOURCE).contains("assets"));
     }
 
-    /// 资源目录取不到时退回源码树相对路径，写法与 `schema.js` 的 `VENDOR_DIR` 一致。
+    /// 资源目录取不到时退回源码树相对路径，写法与 `app.js` 的 `VENDOR_DIR` 一致。
     #[test]
     fn compliance_path_falls_back_to_the_source_tree() {
         assert_eq!(

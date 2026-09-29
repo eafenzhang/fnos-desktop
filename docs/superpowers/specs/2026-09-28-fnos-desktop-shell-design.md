@@ -276,7 +276,11 @@ Tauri initialization_script（每次顶层文档导航、HTML 解析前）
 
 1. 设置窗 `invoke("set_config", {patch})`
 2. Rust 归一化 → 落盘 → `webview.eval` 派发 `storage.onChanged` 事件
-3. 上游增量分支（`cs:3039-3332`）就地生效。**勘误（2026-09-28，T7+8 实测）**：原文「`injectEnabled` 翻转或 `homeUrl` 变更时才整页重载」**不成立** —— 已注册的 `initialization_script` 在窗口存活期间无法替换，重载只会重跑旧载荷。正确做法是**销毁并按新载荷重建 main 窗口**（置 `recreating` 标志绕过 `CloseRequested` 的 `prevent_close()`+hide，待 `Destroyed` 事件中重建，因 tauri 只在此刻释放窗口 label 注册），随后 `sync_menus`。
+3. 上游增量分支（`cs:3039-3332`）就地生效。**勘误（2026-09-28，T7+8 实测）**：原文「`injectEnabled` 翻转或 `homeUrl` 变更时才整页重载」**不成立** —— 已注册的 `initialization_script` 在窗口存活期间无法替换，重载只会重跑旧载荷。正确做法是**销毁并按新载荷重建 main 窗口**（置 `recreating` 标志绕过 `CloseRequested` 的 `prevent_close()`+hide，待 `Destroyed` 事件中重建，因 tauri 只在此刻释放窗口 label 注册）。
+
+> **勘误（2026-09-29，T14a）**：上面那句「随后 `sync_menus`」已经不存在了——托盘在 T14a 精简为 4 个无状态动作项，宿主侧「把配置推给菜单」的同步通路（原 `tray::sync_menus`）整体删除。重建完成后**没有任何菜单状态需要跟随**，配置只有一个消费方（主窗口的注入载荷 + 免刷新推送）。
+>
+> **勘误（2026-09-29，T14b）**：触发「重建」的键不止 `injectEnabled` / `homeUrl` 两个。`commands::set_config` 现在的判据是**四类载荷内容键**：`shell.injectEnabled`、`shell.homeUrl`、完美图标的**开关状态**（`injector::perfect_icon_enabled`，决定 14 张 PNG 要不要进初始化载荷，约 +1.0 MiB）、登录壁纸的**文件名**（决定从配置目录读哪张图、以什么键嵌进 `binaryAssets`）。设置窗主界面换成上游 UI 之后这条通路更关键：上游 popup 恰好能改到「完美图标开关」与壁纸这两类。
 
 ---
 
@@ -315,9 +319,21 @@ Tauri initialization_script（每次顶层文档导航、HTML 解析前）
 
 ### 8.1 结构
 
+> **现状（勘误，2026-09-29，T14b，用户决策 D8 之后的直接要求）**：设置窗的**主界面是上游项目自己的设置界面**——`popup.html` + `popup.js` 经 `tools/vendor-mods.ps1` 逐字节 vendor，再逐字节复制到 `ui/settings/`（`frontendDist`），装在一个 372×522 的 iframe 里（上游 popup 自己写死的 body 尺寸）。`ui/settings/popup.html` 与 vendored 副本的**唯一**差别是插入一行 `<script src="./chrome-shim.js"></script>`（在上游的 `popup.js` 标签之前——`chrome.*` 兼容层必须先定义 `window.chrome`）；`popup.js` 逐字节未改。这两条都写进 NOTICE 的包装性改动第 7 条。
+>
+> `ui/settings/chrome-shim.js`（本壳自己的代码，运行在 iframe 里）把上游用到的整个 `chrome.*` 面接到宿主：`storage.sync` ↔ `get_config`/`set_config{mods}`；`storage.local` 的四类键分别去 `local` 段（`customCssCode`/`customJsCode`）、宿主 `import_wallpaper` + `local.loginWallpaperFileName`（壁纸两键）、设置窗本地存储 `local-store.json`（`updateCheckState`）、以及**如实拒绝**（`customFontDataUrl`/`…Name`/`…Format`，D4）；`tabs.query` ↔ `get_page_state`；`tabs.sendMessage` 的三个 type 分别映射（见 §8.3）；`runtime.getURL` 同步返回设置窗资产根下的真实 URL；`runtime.getManifest` 同步读父窗口事先写好的配置快照；`tabs.create` ↔ `open_url`；`action.*` 空操作；上游的**更新检查被接管为离线**（不发任何网络请求，返回「本壳内置的 vendored commit」）。
+>
+> 上游 UI 的 `chrome.storage.sync` 默认值对象**就是**本壳 `mods` 段的 25 个键（`popup.js:1785-1811`），所以 `mods` 段一个字段都不用改。
+>
+> 本壳自己的界面只剩三块（都在 iframe 之外，因此不会与上游样式互相影响）：顶部**状态条**（§12.3）、**外壳开关**（`shell.injectEnabled` 与 `shell.nasUrl`——上游是扩展，假设注入总开永远是开、也没有 NAS 地址这个概念，而这两个键在本壳里有真实语义；托盘精简后注入总开关只剩这一个入口）、**关于/合规**页（§10）。原「左侧分组导航 + 右侧面板」的 schema 驱动渲染（`ui/settings/schema.js` 与 `app.js` 的 `renderGroup`/`fieldEl`）**已整体退休并删除**，不留不可达模块。
+>
+> 历史原文（T14b 之前的设计）保留在下面，仅作为当时 revision 的记录。
+
 左侧分组导航 + 右侧面板，纯原生 HTML/CSS/JS（零框架，避免引入构建链）。风格对齐飞牛系统设置（深色、圆角、分组卡片）。
 
 ### 8.2 分组与项
+
+> **现状（勘误，2026-09-29，T14b）**：下面这张表里的**每一项**现在都由上游 popup UI 提供（控件形态也以上游为准），本壳不再自己渲染这些项。逐项完美图标（P1）与登录壁纸（P1）都在 T13b 落地，T14b 起由上游 UI 呈现。本壳额外保留的区域只有状态条、`shell.injectEnabled` / `shell.nasUrl` 两个外壳开关与关于页。
 
 | 分组 | 项 | 绑定 | 控件 |
 |---|---|---|---|
@@ -349,8 +365,19 @@ Tauri initialization_script（每次顶层文档导航、HTML 解析前）
 | `reload_main` | `{url?}` | `()` | 重载/导航主窗口 |
 | `open_config_dir` | — | `()` | 打开配置目录 |
 | `reset_config` | `{scope}` | `{config}` | 重置为默认（含确认） |
+| `open_url` | `{url}` | `()` | 用系统默认浏览器打开外链（只放行 http/https；见 §10） |
+| `get_page_state` | — | `PageStateView` | 主窗口的观测状态（Task 11 的状态条数据源；**只读**） |
+| `get_page_report` | — | `{report, appItems}` | 页面上报的两个槽位（Task 13a/13b；上报本体走 `document.title`，不占权限） |
+| `import_wallpaper` | `{name, dataBase64}` | `落盘文件名` | 登录壁纸落盘（Task 13b；**唯一会写文件的命令**） |
+| `get_local_store` | — | `{键: 字符串}` | 设置窗本地存储（Task 14b；`local-store.json`，上游 `chrome.storage.local` 里本壳配置模型没有对应字段的那部分） |
+| `set_local_store` | `{patch: {键: 字符串\|null}}` | `{键: 字符串}` | 同上；`null` = 删除该键。键名形状 + 单值 64 KiB + 总量 256 KiB + 最多 32 键四道上限；**整份校验在前**，坏键不产生半份写入 |
+| `request_app_items` | — | `()` | 请主窗口页面**重新**汇报一次启动台应用项（Task 14b）。**无参数**，因此不是注入面；只授设置窗，并进 remote-deny |
+
+> **勘误（2026-09-29，T14b）**：`set_config` 的 `needsReload` 判据不止 `injectEnabled` / `homeUrl`——见 §6.6 的第二条勘误（完美图标开关、壁纸文件名同样在列）。
 
 ### 8.4 视觉要求
+
+> **现状（勘误，2026-09-29，T14b）**：主界面的视觉由**上游 popup 自己**决定（`popup.html` 自带整套样式，本壳不覆盖它的任何一条规则）；本壳自己渲染的只有状态条、外壳开关与关于页，它们沿用原来的深色卡面风格。下面的历史要求仍然适用于这三块。
 
 - 与飞牛系统设置一致的深色卡面、分组卡片、开关与单选样式
 - 所有项的当前值必须显示**归一化之后**的值（避免 §6.5 的「显示不一致」）
@@ -378,6 +405,15 @@ Tauri initialization_script（每次顶层文档导航、HTML 解析前）
   ]
 }
 ```
+
+> **勘误（2026-09-29，T14b）**：上面的 JSON 是 round 0 的原文，早已不是现状。当前事实来源是
+> `src-tauri/capabilities/default.json`（`windows: ["settings"]`，**12 条 `allow-*`** + `core:default`：
+> get/set_config、reload_main、open_config_dir、open_url、reset_config、get_page_state、
+> get_page_report、import_wallpaper、get_local_store、set_local_store、request_app_items）与
+> `remote-deny.json`（`local: false` + `remote.urls: ["*://*:*"]`，**11 条 `deny-*`、0 条 `allow-*`**；
+> 唯一没有 deny 项的是 `open_url`，它同样没有对远程的授权）。每次 `cargo test` 都由
+> `commands::tests::every_ipc_command_is_registered_in_all_four_places` 逐字断言这四处同步，
+> 以及「`default.json` 里 `"remote"` 出现次数为 0」。
 
 - **不配置 `remote.urls`** → 远程页面即使有 IPC 桥也调不到任何命令
 - **纵深防御**：增加一个 `remote: { urls: ["*"] }` 的 capability，只列 `deny-*`

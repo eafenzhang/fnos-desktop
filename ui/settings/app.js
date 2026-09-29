@@ -1,54 +1,74 @@
-// 设置窗主逻辑：schema 驱动渲染 + IPC 提交（spec §8）。
+// 设置窗（Task 14b 起）：**托管上游 popup UI** + 本壳自己的状态条 / 外壳开关 / 关于页。
 //
-// 三条硬约束：
-// 1. **显示的值 = 生效的值**（§8.4）：`state.config.mods` 一律原样采纳 `get_config` /
-//    `set_config` 的返回（Rust 已经归一化过，它就是权威值），**不再二次归一化**——
-//    `clampLightness` 不是不动点，二次夹取会让界面显示 `#c4b4a1` 而页面按 `#c4b4a2`
-//    生效。归一化只保留给「用户刚输入的值」，在提交 patch 之前跑一次（见 `commit`）。
-//    任何渲染都只读 `state.config`，绝不把 IPC 原始值或用户刚输入的原文画到界面上。
-// 2. **提交后就地重渲染**：`set_config` 返回的是 Rust 归一化后的权威配置，
-//    以它为准刷新界面（因此「取色器选了 #ffffff，右侧显示 #b3b3b3」是同一份数据的两个视图）。
-// 3. `needsReload` 为真（只有 `shell.injectEnabled` / `shell.homeUrl` 会）时随后调
-//    `reload_main`——Rust 侧销毁并按新载荷重建主窗口（§6.6 勘误）。
+// 结构（`settings.html`）：
 //
-// 另外两条窗口级行为：
-// - **焦点刷新**（`refresh`）：带外改动（手工编辑 `config.json`、将来任何新增的写入方）
-//   不发事件，重新获得焦点时重取配置。托盘精简后托盘侧只剩「退出前保存窗口几何」
-//   （`tray.rs` → `commands::save_window_geom`），不再有配置开关；见 `refresh` 的注释。
-// - **关于页外链**：不在窗内导航，交给 Rust `open_url` → 系统默认浏览器。
-import { SCHEMA, UPSTREAM_REPO, VENDOR_DIR, PREFECT_ICONS, prefectIconPath } from './schema.js';
-import { MODS_KEYS, normalizeModsEntry, parseHttpOrigin, DEFAULT_BRAND_COLOR } from './normalize.js';
-import { addCurrentOriginToWhitelist, cornerShapeHint, statusBar, statusFor } from './status.js';
+//   #status      顶部状态条（Task 11 / spec §12.3），判据全在 `status.js`（本文件只负责画）
+//   #upstreamHost 上游 UI：`popup.html` 装在一个 372×522 的 iframe 里（上游自己写死的尺寸）
+//   #shellFields  本壳的开关（`shell.injectEnabled` / `shell.nasUrl`）——上游 UI 里没有这两项
+//   #about        关于/合规（spec §10）
+//
+// 本文件**不再**有任何 schema 驱动的分组渲染（Task 14b 退休）：面板、控件、逐项完美图标、
+// 壁纸与自定义代码的界面全部由上游 popup 提供。因此这里只剩下三件事：
+//
+// 1. **宿主桥**（`installHostBridge`）：iframe 里的 `chrome-shim.js` 不直接发 IPC，
+//    它把命令 postMessage 过来，由本文件用既有 IPC 通路执行。**命令白名单**在这里，
+//    iframe 拿不到任意命令；纯读的 `get_page_report` / `get_local_store` 也在表里。
+// 2. **两个组合应答**：`page_check`（上游问「这一页是不是 fnOS WebUI」）与 `app_items`
+//    （上游要「启动台应用项列表」）。后者的数据源是**页面上报的槽位**（Task 13b），
+//    槽位是空的时候才请宿主去让页面再汇报一次，并在有界窗口内轮询（见 `answerAppItems`）。
+// 3. 本壳自己的三块 UI：状态条、外壳开关、关于页。
+//
+// 纪律（与前几轮一致）：
+// - **显示的值 = 生效的值**：`state.config` 一律原样采纳 `get_config` / `set_config` 的返回，
+//   不在 JS 侧二次归一化（`normalize.js` 仍是「用户刚输入的值」在提交前的唯一入口，
+//   而这里唯一的手工输入是 NAS 地址，提交时由 Rust 的 `Config::normalize` 收口）。
+// - **显示与否都要有据**：状态条只读真实回包；应用项列表只读 Rust 分好槽的上报。
+// - 页面可控文本一律 `textContent`，绝不 `innerHTML`。
+import { addCurrentOriginToWhitelist, cornerShapeHint, statusBar, statusFor, reportVerdict } from './status.js';
 import * as api from './bridge.js';
 
-/** 配置的三个段（键前缀）。 */
-const SECTIONS = ['mods', 'local', 'shell'];
+/** 上游项目主页 + vendored 资源位置（spec §10：关于页必须给出这两件事）。 */
+export const UPSTREAM_REPO = 'https://github.com/aurysian-yan/fnOS_UI_Mods';
+export const VENDOR_DIR = 'src-tauri/assets/fnos-mods';
+
+/** 上游 popup 的页面（`ui/settings/popup.html`，与 vendored 副本逐字节相同 + 一行 shim 标签）。 */
+export const UPSTREAM_PAGE = 'popup.html';
+
+/** 宿主桥的 postMessage 协议（与 `chrome-shim.js` 逐字对应）。 */
+const BRIDGE_FLAG = '__FNOS_SETTINGS_BRIDGE__';
+const SNAPSHOT_KEY = '__FNOS_SETTINGS_SNAPSHOT__';
+const REQ = 'FNOS_SHIM_REQUEST';
+const REP = 'FNOS_SHIM_REPLY';
+
+/** 应用项槽位为空时：请页面重汇报之后，最多等多久 / 多久看一眼（有界，不是无限等）。 */
+export const APP_ITEMS_WAIT_MS = 6000;
+export const APP_ITEMS_POLL_MS = 400;
 
 /**
  * 界面状态。导出供单测与状态条读取。
  *
- * `page` 是 Rust 侧 `get_page_state` 的**最近一次**回包（主窗口 URL / 是否命中白名单 /
- * 上次加载是否失败）；`report` / `appItemsReport` 是 `get_page_report` 回包信封里的**两个
- * 槽位**（见 [`reportSlots`]）：前者是状态条证据（Task 13a 的上游注入链信号），后者是
- * 「完美图标」逐项 UI 的数据源（Task 13b 的应用项列表）。
- *
- * 为什么要拆成两个槽位：Task 13b 的 shim 会在完美图标启用时主动向上游拉取应用项列表，那条
- * 上报**晚于**上游的 `FNOS_INJECTION_TRIGGERED`。若是同一个「最近一次」槽位，状态条的强态
- * 判据就会被自己拉的数据冲掉（T13b 审计发现的回归）。宿主侧的分流见
- * `src-tauri/src/report.rs::is_app_items_report`。
- *
- * 三者相互独立：主窗口可以只导航不改配置，而页面上报又只在页面自己跑完注入链（或应答了
- * 列表请求）后才出现，所以 `refresh()` 三条都要取（见那里的注释）。
+ * `page` / `report` / `appItemsReport` 与 Task 11/13a/13b 同义：`page` 是 `get_page_state`
+ * 的最近一次回包，`report` 与 `appItemsReport` 是 `get_page_report` 信封的两个槽位
+ * （状态条证据 / 应用项列表）。三者必须在同一个快照里取（见 `fetchPageSnapshot`）。
  */
 export const state = {
-  config: null, active: null, error: null, page: null, report: null, appItemsReport: null,
+  config: null, error: null, page: null, report: null, appItemsReport: null,
 };
+
+/**
+ * 给 iframe 里的 `chrome-shim.js` **同步**读的快照（同一对象引用，就地更新）。
+ *
+ * 为什么需要：上游 popup.js 在脚本开头就同步调用 `chrome.runtime.getManifest().version`，
+ * 而 IPC 是异步的。父 frame 在**创建 iframe 之前**先把 `get_config` 拿到手、写进这个对象，
+ * 于是 shim 的同步读一定命中；此后每次配置变化都就地更新同一个对象。
+ */
+export const snapshot = { config: null };
 
 /**
  * `get_page_report` 的回包信封 → 两个槽位（两个字段各自可能缺失/不是对象 → `null`）。
  *
  * 宿主**永远**返回对象（`{report, appItems}`），但设置窗可能正跑在一个更老的宿主上
- * （升级中途），所以这里对非对象输入一律回落成两个 `null`，绝不把 `undefined` 画进界面。
+ * （升级中途），所以这里对非对象输入一律回落成两个 `null`。
  */
 export function reportSlots(envelope) {
   const e = envelope && typeof envelope === 'object' ? envelope : {};
@@ -56,7 +76,9 @@ export function reportSlots(envelope) {
   return { report: pick(e.report), appItems: pick(e.appItems) };
 }
 
-// ---------- DOM 小工具 ----------
+function message(e) {
+  return String((e && e.message) || e || '未知错误');
+}
 
 function el(tag, opts = {}) {
   const node = document.createElement(tag);
@@ -73,145 +95,60 @@ function button(text, className) {
   return b;
 }
 
-function message(e) {
-  return String((e && e.message) || e || '未知错误');
+/** 有 DOM 才动 DOM（`node --test` 会在无 DOM 的 Node 里 import 本模块）。 */
+function domReady() {
+  return typeof document !== 'undefined' && typeof document.getElementById === 'function';
 }
 
-// ---------- 配置路径解析 ----------
-
-/** `mods.x` / `shell.y` / `local.z`；无前缀按 `mods.x`（与上游 popup 的写法兼容）。 */
-export function resolvePath(key) {
-  const head = String(key).split('.')[0];
-  return SECTIONS.includes(head) ? String(key) : `mods.${key}`;
-}
-
-/** 设置项的 DOM id：`mods.basePresetEnabled` → `f_mods_basePresetEnabled`。 */
-export function fieldId(key) {
-  return `f_${resolvePath(key).replace(/\./g, '_')}`;
-}
-
-function readValue(config, key) {
-  let cur = config;
-  for (const part of resolvePath(key).split('.')) {
-    if (cur == null) return undefined;
-    cur = cur[part];
-  }
-  return cur;
-}
-
-function setPath(obj, path, value) {
-  const parts = path.split('.');
-  const last = parts.pop();
-  let cur = obj;
-  for (const p of parts) {
-    if (cur[p] == null || typeof cur[p] !== 'object') cur[p] = {};
-    cur = cur[p];
-  }
-  cur[last] = value;
-  return obj;
-}
+// ---------- 配置 ----------
 
 /**
- * 把 IPC 返回的配置收进 state。
+ * 把 IPC 返回的配置收进 state **与** iframe 的快照。
  *
- * **`mods` 原样采纳，不做任何归一化**（Review finding A / §8.4）。理由：
- * Rust 的 `Config::normalize` 在 `load` 与**每次** `set_config` 都跑过，`get_config` /
- * `set_config` 回包里的 `mods` 就是「页面实际生效的那份值」。JS 侧再夹一次会引入
- * 一个单通道偏差，因为 `clampLightness` **不是不动点**：
- *
- *   `#cec1b2` --Rust--> `#c4b4a2` --JS 再夹一次--> `#c4b4a1`
- *
- * 于是设置窗显示 `#c4b4a1`（取色器与 `f_mods_brandColor_value` 都是它），而页面按
- * `#c4b4a2` 生效——正是 §8.4 要根除的「显示 A、生效 B」。实测 20 万随机色里约 40 个
- * 落在这种「再夹一次就变」的带上，所以手写/历史遗留颜色很容易踩到。
- *
- * 归一化只剩一个合法入口：用户刚输入的值，在提交 patch 之前（`commit` →
- * `normalizeModsEntry`）。回归测试见 `tests/settings.test.mjs` 的 `#cec1b2` 案例。
+ * **`mods` 原样采纳，不做任何归一化**（Review finding A / §8.4）：`clampLightness` 不是不动点
+ * （`#cec1b2` → Rust `#c4b4a2` → JS 再夹一次 `#c4b4a1`），而页面按 Rust 那份生效。
+ * 归一化只剩一个合法入口：用户刚输入的值在提交 patch 之前（本文件只剩 NAS 地址一处，
+ * 且它由 Rust 的 `Config::normalize` 收口）。回归测试见 `tests/settings.test.mjs`。
  */
 export function adoptConfig(raw) {
   if (!raw || typeof raw !== 'object') return;
-  // 只做「形状」兜底（缺 `mods` 时给空对象，避免渲染期到处判空），不改任何值。
   const mods = raw.mods && typeof raw.mods === 'object' ? raw.mods : {};
   state.config = { ...raw, mods };
+  snapshot.config = state.config;
 }
 
-// ---------- 提交 ----------
-
-/**
- * 提交前的最后一次归一化：**只对 `mods.*` 白名单键**做（与 Rust 同义）。
- *
- * 这是归一化的唯一入口——它作用在「用户刚输入的值」上，绝不作用在 IPC 回包上
- * （`adoptConfig` 的注释说明了二次夹取的危害）。`shell.*` / `local.*` 原样提交，
- * 由 Rust 侧按各自规则处理。
- */
-function normalizeForSubmit(path, value) {
-  const [section, ...rest] = path.split('.');
-  const sub = rest.join('.');
-  return section === 'mods' && MODS_KEYS.includes(sub) ? normalizeModsEntry(sub, value) : value;
-}
-
-/** 提交一个设置项：`set_config` → 需要时 `reload_main` → 用返回的权威配置重渲染。 */
-async function commit(key, value, node) {
-  if (node) node.classList.add('pending');
-  const path = resolvePath(key);
+/** 提交一个 `shell.*` 键；需要时跟随 `reload_main`（与 T13b 的设置窗行为一致）。 */
+async function commitShell(path, value) {
   try {
-    const res = await api.setConfig(setPath({}, path, normalizeForSubmit(path, value)));
+    const patch = path === 'injectEnabled'
+      ? { shell: { injectEnabled: !!value } }
+      : { shell: { nasUrl: String(value == null ? '' : value) } };
+    const res = await api.setConfig(patch);
     adoptConfig(res.config);
-    // gap (a)：只有 injectEnabled / homeUrl 变更才会是 true，此时必须重建主窗口
+    state.error = null;
     if (res.needsReload) {
       await api.reloadMain(null);
-      // 重建会换掉主窗口那一整次加载：状态条必须跟着换，否则会一直显示旧页面的判定
       await fetchPageSnapshot();
     }
-    state.error = null;
-    render();
-    renderStatus();
   } catch (e) {
-    state.error = `保存「${key}」失败：${message(e)}`;
-    render();
-  } finally {
-    if (node && node.isConnected) node.classList.remove('pending');
+    state.error = `保存「${path}」失败：${message(e)}`;
   }
+  renderShell();
+  renderStatus();
 }
 
-// ---------- 完美图标：逐项语义（Task 13b） ----------
-//
-// **上游的语义（照抄，不发明形状）**：`content-script.js:755-794`
-//   - 光有 `launchpadIconRedrawMap[key]` 不够：`redrawKeys` 也必须包含 key，
-//     上游用 `normalizeLaunchpadKeyList(redrawKeys).filter(k => typeof map[k] === 'string')`
-//     重建 `currentLaunchpadIconRedrawMap`（cs:764-772）；
-//   - **重绘优先于另外两种**：`maskOnlyKeys` 与 `scaleSelectedKeys` 都会被剔除掉已经在
-//     `redrawSet` 里的 key（cs:773-778）；
-//   - 三种处置**全部**受 `launchpadIconScaleEnabled` 总开关约束
-//     （cs:644-648 的 `enabled && shouldXxx(...)`）。
-// 所以逐项 UI 每个应用只有一个「处置」：不处理 / 缩放 / 仅遮罩 / 重绘为某个内置图标。
-//
-// **订正（fix round 1 / Minor 6）**：上一条曾写成「三种处置互斥，重绘优先」——**这是错的**。
-// cs:773-778 只做了「把已在 `redrawSet` 里的 key 从另外两个 list 里删掉」这一件事；上游**没有**
-// 在 `maskOnlyKeys` 与 `scaleSelectedKeys` 之间做任何互斥（cs:633-652 里两个判定各自独立，
-// 一个 key 可以同时 `shouldScale` 与 `shouldMaskOnly`，两个 class 都会被 toggle 上）。
-// 真正成立的性质只有两条：① 重绘会盖过另外两种；② 三种都受总开关约束。
-//
-// 那么「一个下拉、四种取值」的 UI 模型还站得住吗？**站得住，但理由是 UI 自己的选择**：
-// 一个下拉天然只能表达一个值（这正是「每项一个处置」的交互模型），而它写出去的四个键在
-// 上游那边**各自独立生效**（`applyIconSelection` 每次都先把这一项的三种成员身份全清掉、
-// 只加回选中的那一种，见那里的注释），所以「下拉选了 A 就不会再留着 B」是**本壳写入时的
-// 规范化**，不是上游强制的互斥。用户若手工在配置里同时写上两个 list，页面会两个都应用——
-// 这与上面两条真性质都不冲突。
+// ---------- 完美图标：应用项列表（数据来自页面上报的槽位） ----------
 
 /** 应用项上报被接受的两个 type（上游 cs:2853-2855 的同一个分支）。 */
 const APP_ITEM_REPORT_TYPES = ['FNOS_GET_LAUNCHPAD_APP_ITEMS', 'FNOS_GET_LAUNCHPAD_APP_TITLES'];
 
 /**
- * 这条上报是不是 shim 在「列表大到装不下」时回的**诊断**（fix round 1 / Minor 5）。
+ * 这条上报是不是 shim 在「列表大到装不下」时回的**诊断**（T13b fix round 1 / Minor 5）。
  *
  * 形状由 `src-tauri/inject/shim.js::noteAppItemsSend` 定义：`{items:[],titles:[],tooLarge:true,
  * itemCount:N}`。它走的是**同一条**应用项通道（宿主的分流判据只看 type），所以宿主侧不需要
- * 任何新命令/新槽位，设置窗只是多认一个字段。
- *
- * 为什么需要它：清单大到超过分片预算时，shim 不会发那份列表（越界即拒），而重发同一份列表
- * 永远不会成功、重试循环因此停下。没有这条诊断的话，UI 只会说「还没收到可用的应答」——
- * 一个永远等不到结果的谎。`tooLarge === true` 用严格比较：页面可控的 `"true"` 字符串不算。
+ * 任何新槽位，设置窗只是多认一个字段。`tooLarge === true` 用严格比较：页面可控的 `"true"`
+ * 字符串不算。
  */
 export function isTooLargeReport(report) {
   if (!report || typeof report !== 'object') return false;
@@ -223,11 +160,9 @@ export function isTooLargeReport(report) {
 /**
  * 从最近一次页面上报里取出应用项列表；取不到（没上报 / 形状不对）返回 `null`。
  *
- * 只认**形状**，不做任何猜测：`payload.items` 必须是数组，元素必须有非空字符串 `key`
- * （`iconSrc` / `title` 缺失时由渲染侧兜底）。返回 `[]` 是「上游确实回报了 0 个应用」——
- * 与 `null`（没有可用数据）在下游是两种不同的文案，不能混。
- *
- * 页面可控文本（`title` / `key` / `iconSrc`）**只经 textContent 渲染**，绝不做 HTML 拼接。
+ * 只认**形状**：`payload.items` 必须是数组，元素必须有非空字符串 `key`。返回 `[]` 是
+ * 「上游确实回报了 0 个应用」——与 `null`（没有可用数据）在下游是两种不同的事实。
+ * 页面可控文本（`title` / `key`）只经 `textContent` 渲染，绝不做 HTML 拼接。
  */
 export function appItemsFromReport(report) {
   if (!report || typeof report !== 'object') return null;
@@ -239,509 +174,146 @@ export function appItemsFromReport(report) {
   ));
 }
 
-/** 某个应用项当前的处置：`'off'` / `'scale'` / `'mask'` / `'redraw:<path>'`。 */
-export function iconSelectionFor(mods, key) {
-  const m = mods && typeof mods === 'object' ? mods : {};
-  const map = m.launchpadIconRedrawMap && typeof m.launchpadIconRedrawMap === 'object'
-    ? m.launchpadIconRedrawMap
-    : {};
-  const path = typeof map[key] === 'string' ? map[key] : '';
-  const list = (v) => (Array.isArray(v) ? v : []);
-  if (path && list(m.launchpadIconRedrawKeys).indexOf(key) >= 0) return `redraw:${path}`;
-  if (list(m.launchpadIconMaskOnlyKeys).indexOf(key) >= 0) return 'mask';
-  if (list(m.launchpadIconScaleSelectedKeys).indexOf(key) >= 0) return 'scale';
-  return 'off';
-}
-
 /**
- * 把一个应用项的处置换算成四个键的**下一个值**（四条键的语义与「重绘优先」见上面的文件级注释）。
+ * 应用项槽位 → 给上游 `chrome.tabs.sendMessage` 的应答（Task 14b 的**纯判据**，可单测）。
  *
- * 返回的对象用配置键名做字段（可以直接 `set_config`）；`config` 只读不改。
+ * 三种结果，各自对应一个**如实**的下一步：
+ * - 槽位里是「列表过大」的诊断 → `{items:[], titles:[], tooLarge:true, itemCount}`：
+ *   再问多少次都一样（装不下就是装不下），所以直接回空列表，让上游走它的兜底文案，
+ *   而**为什么**由 `chrome-shim.js` 的可见说明框说清楚；
+ * - 槽位里有非空的可用列表 → `{items, titles, itemCount}`（含 `iconSrc` 已被页面侧剥掉，
+ *   上游对缺失的 iconSrc 有自己的兜底：`if (iconSrc)` + `img.onerror` 隐藏）；
+ * - 其余（没上报 / 形状不对 / 空列表）→ `null` =「还没有可用数据」，调用方据此去
+ *   请页面重汇报一次并在有界窗口内轮询。
  */
-export function applyIconSelection(mods, key, choice) {
-  const m = mods && typeof mods === 'object' ? mods : {};
-  const scale = new Set(Array.isArray(m.launchpadIconScaleSelectedKeys) ? m.launchpadIconScaleSelectedKeys : []);
-  const mask = new Set(Array.isArray(m.launchpadIconMaskOnlyKeys) ? m.launchpadIconMaskOnlyKeys : []);
-  const redraw = new Set(Array.isArray(m.launchpadIconRedrawKeys) ? m.launchpadIconRedrawKeys : []);
-  const map = m.launchpadIconRedrawMap && typeof m.launchpadIconRedrawMap === 'object'
-    ? { ...m.launchpadIconRedrawMap }
-    : {};
-
-  // 先把这一项的三种成员身份全清掉，再按需要加回唯一的一种。这是**本壳写入时的规范化**：
-  // 一个下拉只能表达一个值，而四个键在上游各自独立生效（上游只保证「重绘盖过另外两种」，
-  // 见文件级注释的订正）。
-  scale.delete(key);
-  mask.delete(key);
-  redraw.delete(key);
-  delete map[key];
-
-  if (choice === 'scale') {
-    scale.add(key);
-  } else if (choice === 'mask') {
-    mask.add(key);
-  } else if (typeof choice === 'string' && choice.indexOf('redraw:') === 0) {
-    const path = choice.slice('redraw:'.length);
-    if (PREFECT_ICONS.some((name) => prefectIconPath(name) === path)) {
-      redraw.add(key);
-      map[key] = path;
-    }
-  }
-
-  return {
-    launchpadIconScaleSelectedKeys: Array.from(scale),
-    launchpadIconMaskOnlyKeys: Array.from(mask),
-    launchpadIconRedrawKeys: Array.from(redraw),
-    launchpadIconRedrawMap: map,
-  };
-}
-
-/** 「重绘」下拉里的一项：[值, 显示文本]（显示文本只用内置名，不含任何页面可控文本）。 */
-function redrawOption(name) {
-  return [`redraw:${prefectIconPath(name)}`, `重绘：${name}`];
-}
-
-/** 逐项处置的下拉选项（顺序：不处理 → 缩放 → 仅遮罩 → 14 个重绘目标）。 */
-export function iconChoiceOptions() {
-  return [['off', '不处理'], ['scale', '缩放'], ['mask', '仅遮罩']]
-    .concat(PREFECT_ICONS.map(redrawOption));
-}
-
-/** 壁纸大小上限（与 `config::MAX_WALLPAPER_BYTES` / 宿主命令同一个数，这里早退一次省一次 IPC）。 */
-export const MAX_WALLPAPER_BYTES = 8 * 1024 * 1024;
-
-/**
- * 「没有可用应用项列表」时的**如实**说明。
- *
- * 五种情形必须说五种话（`null` 与 `[]` 是不同的事实）：
- * - 上游的列表**大到装不下**（shim 回的诊断）→ 说清「列表过大，无法上报」并给出项数；
- * - 没有任何应用项上报 → 「还没收到」，并说明它什么时候才会有（启动台渲染出应用图标时）；
- * - 只是 shim 自己发出的**请求**（`dir === 'out'`）→ 「已经问过，但还没有可用的应答」；
- * - 有应答但形状不对 → 「已按拒绝处理」，不画任何项；
- * - 别种 type → 把 type 说出来（只回显形如 `FNOS_XXX` 的串，页面可控文本不原样进 UI）。
- */
-export function appListEmptyText(report, items) {
-  // 列表过大这条**必须排在 `items.length === 0` 之前**：shim 的诊断上报里 items 就是空数组
-  // （它只能是空的——装得下就不叫过大了），排在后面会把它误说成「上游回报了 0 个应用项」。
-  // `itemCount` 是宿主算出来的数字（Number.isFinite 收口），页面可控文本一个字符都不进文案。
+export function appItemsAnswer(report) {
   if (isTooLargeReport(report)) {
     const n = Number(report.payload.itemCount);
-    const howMany = Number.isFinite(n) && n > 0 ? `${n} 个` : '过多';
-    return `应用项列表过大（${howMany}），超过分片上报的预算（8 片 × 3000 字节），无法上报：`
-      + '设置窗因此拿不到逐项列表。请减少启动台中的应用数量，或点下面的「打开配置目录」手工编辑'
-      + '（逐项映射写在 `launchpadIconRedrawMap` / `launchpadIconRedrawKeys`）。';
-  }
-  if (items && items.length === 0) {
-    return '上游回报了 0 个应用项：启动台的图标还没渲染出来时只能收集到空列表。'
-      + '请回到主窗口打开一次启动台，再切回本窗口（会自动刷新）。';
-  }
-  const isObject = !!report && typeof report === 'object';
-  const type = isObject ? report.type : null;
-  // 只回显形如 `FNOS_XXX` 的串：页面上报的 type 已经过宿主白名单，这里再收一次口，
-  // 免得任何奇怪形状的字符串被画进界面（它只用于**说明**，不进任何判据）。
-  const known = typeof type === 'string' && /^FNOS_[A-Z_]{2,40}$/.test(type) ? type : '';
-  if (!isObject) {
-    return '尚未收到应用项列表：它由主窗口页面经上报通道回报，而上游只能在启动台渲染出应用图标时'
-      + '收集到（content-script.js:595-610）。请回到主窗口打开一次启动台，再切回本窗口（会自动刷新）；'
-      + '也可以点下面的「打开配置目录」手工编辑。';
-  }
-  if (APP_ITEM_REPORT_TYPES.indexOf(type) >= 0 && report.dir === 'out') {
-    // 这一条是 shim **自己发出的请求**（宿主原样存下来了）：说明请求已经送到页面，但上游还没有
-    // 答出一份非空的列表——空列表的应答由 shim 主动丢弃（否则会把上一次的真实列表覆盖成 0 项）。
-    return '已经向页面请求过应用项列表，但还没收到可用的应答：上游只在启动台渲染出应用图标时'
-      + '才能收集到（content-script.js:595-610）。请回到主窗口打开一次启动台，再切回本窗口'
-      + '（会自动刷新）；也可以点下面的「打开配置目录」手工编辑。';
-  }
-  if (APP_ITEM_REPORT_TYPES.indexOf(type) >= 0) {
-    // 声称是应用项列表，却没有可用的 items（形状不对 / 上报被组装后被拒）
-    return '最近一次上报声称是应用项列表，但形状不可用，已按拒绝处理（不画任何项）。'
-      + '请回到主窗口打开一次启动台让它重新回报；也可以点下面的「打开配置目录」手工编辑。';
-  }
-  if (known) {
-    return `最近一次上报是 ${known}，不含应用项列表（可能是主窗口刚加载完，或启动台还没打开）。`
-      + '请回到主窗口打开一次启动台，再切回本窗口；也可以点下面的「打开配置目录」手工编辑。';
-  }
-  return '最近一次上报不含应用项列表。请回到主窗口打开一次启动台，再切回本窗口；'
-    + '也可以点下面的「打开配置目录」手工编辑。';
-}
-
-/**
- * 一组「打开配置目录」的入口（应用项列表取不到时的手工编辑指引）。
- *
- * 用的还是既有的 `open_config_dir` 命令（关于页也有同一个按钮）——**不新增任何命令**，
- * 因此设置窗的授权面在这一轮只多了 `import_wallpaper` 一条。
- */
-function configDirRow(idPrefix) {
-  const row = el('div', { className: 'app-actions' });
-  row.appendChild(el('span', {
-    className: 'hint',
-    text: '手工编辑入口（mods.launchpadIconRedrawMap / launchpadIconRedrawKeys）：'
-  }));
-  const open = button('打开配置目录');
-  open.id = `${idPrefix}_open`;
-  open.addEventListener('click', async () => {
-    try {
-      await api.openConfigDir();
-      state.error = null;
-    } catch (e) {
-      state.error = `打开配置目录失败：${message(e)}`;
-      render();
-    }
-  });
-  row.appendChild(open);
-  return row;
-}
-
-/** 把选中的文件读成 base64（`data:` 头去掉，只把载荷交给 IPC）。 */
-function readFileBase64(file) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onerror = () => reject(new Error('FileReader 读取失败'));
-    reader.onload = () => {
-      const text = String(reader.result || '');
-      const comma = text.indexOf(',');
-      resolve(comma >= 0 ? text.slice(comma + 1) : text);
+    return {
+      items: [], titles: [],
+      itemCount: Number.isFinite(n) && n > 0 ? n : 0,
+      tooLarge: true,
     };
-    reader.readAsDataURL(file);
-  });
+  }
+  const items = appItemsFromReport(report);
+  if (!items || items.length === 0) return null;
+  const payload = report.payload && typeof report.payload === 'object' ? report.payload : {};
+  const titles = Array.isArray(payload.titles)
+    ? payload.titles.filter((t) => typeof t === 'string')
+    : [];
+  return { items, titles, itemCount: items.length };
 }
 
-// ---------- 控件 ----------
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 /**
- * 一次提交**多个** `mods.*` 键（完美图标的逐项处置要同时改四个键，不能分四次提交）。
+ * 上游要应用项列表时的完整应答（纯判据 + 有界的「再问一次」）。
  *
- * 与 `commit` 同一套纪律：值先在 JS 侧过一遍 `normalizeModsEntry`（归一化的唯一入口，
- * 作用在「用户刚输入的值」上），回包再原样采纳（`adoptConfig`）；`needsReload` 时重建主窗口
- * ——逐项键本身经 `apply_to_page` 即时生效，但「第一次把某个键从默认值改成非默认」会改变
- * `injector::perfect_icon_enabled`（要不要嵌图标），那时必须重建。
+ * 为什么不能只读槽位：那份列表只能由**页面侧**主动向上游请求（T13b 的
+ * `inject/shim.js::requestAppItems`，页面加载时跑一轮有限重试），设置窗开得晚就错过了。
+ * 所以槽位为空时请宿主 [`api.requestAppItems`] 去让页面**当场**再问一次，然后最多等
+ * [`APP_ITEMS_WAIT_MS`]（每 [`APP_ITEMS_POLL_MS`] 取一次快照）。超时就如实返回一个空应答
+ * ——上游会走它自己的兜底文案（「先打开启动台再试」），而不是我们编一份假列表。
  */
-async function commitMods(patch, node) {
-  if (node) node.classList.add('pending');
+export async function answerAppItems() {
+  await fetchPageSnapshot();
+  const first = appItemsAnswer(state.appItemsReport);
+  if (first) return first;
+
   try {
-    const normalized = {};
-    for (const [k, v] of Object.entries(patch)) normalized[k] = normalizeModsEntry(k, v);
-    const res = await api.setConfig({ mods: normalized });
-    adoptConfig(res.config);
-    if (res.needsReload) {
-      await api.reloadMain(null);
-      await fetchPageSnapshot();
-    }
-    state.error = null;
+    await api.requestAppItems();
   } catch (e) {
-    state.error = `保存逐项设置失败：${message(e)}`;
-  } finally {
-    if (node && node.isConnected) node.classList.remove('pending');
+    // 主窗口没开 / 页面不在了：如实回空（上游的兜底文案说的是同一件事）
+    return { items: [], titles: [], itemCount: 0, pending: true, reason: message(e) };
   }
-  render();
-  renderStatus();
+  const deadline = Date.now() + APP_ITEMS_WAIT_MS;
+  do {
+    await sleep(APP_ITEMS_POLL_MS);
+    await fetchPageSnapshot();
+    const next = appItemsAnswer(state.appItemsReport);
+    if (next) return next;
+  } while (Date.now() < deadline);
+  return { items: [], titles: [], itemCount: 0, pending: true };
 }
-
-function appendHint(wrap, item) {
-  if (item.hint) wrap.appendChild(el('p', { className: 'hint', text: item.hint }));
-  return wrap;
-}
-
-function fieldEl(item) {
-  const key = resolvePath(item.key);
-  const id = fieldId(key);
-  const value = readValue(state.config, key);
-  const wrap = el('div', { className: 'field' });
-  wrap.dataset.key = key;
-
-  const label = el('label', { id: `${id}_label`, text: item.label });
-  label.htmlFor = id;
-  wrap.appendChild(label);
-
-  switch (item.type) {
-    case 'bool': {
-      const input = el('input', { id });
-      input.type = 'checkbox';
-      input.checked = !!value;
-      input.addEventListener('change', () => commit(key, input.checked, wrap));
-      wrap.appendChild(input);
-      break;
-    }
-    case 'color': {
-      const box = el('div', { className: 'color-box' });
-      const input = el('input', { id });
-      input.type = 'color';
-      input.value = value || DEFAULT_BRAND_COLOR;
-      input.addEventListener('change', () => commit(key, input.value, wrap));
-      // §8.4 的正面落实：把**归一化后实际生效**的值用文字显示出来，
-      // 与取色器里用户刚点的原始颜色是两个不同的东西（明度被夹时会不同）。
-      const shown = el('code', { id: `${id}_value`, className: 'normalized', text: value || DEFAULT_BRAND_COLOR });
-      shown.title = '归一化后实际生效的值';
-      const reset = button('重置', 'reset');
-      reset.id = `${id}_reset`;
-      reset.addEventListener('click', () => commit(key, DEFAULT_BRAND_COLOR, wrap));
-      box.append(input, shown, reset);
-      wrap.appendChild(box);
-      break;
-    }
-    case 'radio': {
-      const box = el('div', { className: 'radios', attrs: { role: 'radiogroup' } });
-      for (const [v, text] of item.options) {
-        const l = el('label', { className: 'radio' });
-        const r = el('input', { id: `${id}_${v}` });
-        r.type = 'radio';
-        r.name = key;
-        r.value = v;
-        r.checked = value === v;
-        r.addEventListener('change', () => commit(key, v, wrap));
-        l.htmlFor = r.id;
-        l.append(r, document.createTextNode(text));
-        box.appendChild(l);
-      }
-      wrap.appendChild(box);
-      break;
-    }
-    case 'select': {
-      const input = el('select', { id });
-      for (const [v, text] of item.options) {
-        const o = el('option', { text });
-        o.value = v;
-        o.selected = v === value;
-        input.appendChild(o);
-      }
-      input.addEventListener('change', () => commit(key, input.value, wrap));
-      wrap.appendChild(input);
-      break;
-    }
-    case 'number': {
-      const input = el('input', { id });
-      input.type = 'number';
-      input.min = String(item.min);
-      input.max = String(item.max);
-      input.step = '1';
-      input.value = String(value);
-      input.addEventListener('change', () => commit(key, Number(input.value), wrap));
-      wrap.appendChild(input);
-      break;
-    }
-    case 'originList': {
-      const box = el('div', { className: 'origins' });
-      const list = Array.isArray(value) ? value : [];
-      for (const origin of list) {
-        const row = el('div', { className: 'origin-row' });
-        row.appendChild(el('code', { className: 'origin', text: origin }));
-        const del = button('删除', 'del');
-        del.id = `${id}_del_${list.indexOf(origin)}`;
-        del.addEventListener('click', () => commit(key, list.filter((x) => x !== origin), wrap));
-        row.appendChild(del);
-        box.appendChild(row);
-      }
-      if (!list.length) {
-        box.appendChild(el('p', { className: 'origin-empty', text: '（空：未命中白名单的站点会先走约 1.5s 的探测）' }));
-      }
-      const addRow = el('div', { className: 'origin-row add' });
-      const addInput = el('input', { id: `${id}_add` });
-      addInput.type = 'text';
-      addInput.placeholder = 'https://nas.example.com:8000';
-      const add = button('添加');
-      add.id = `${id}_addbtn`;
-      // 可见的错误提示（不是只把边框标红）：`role=alert` 让读屏与 UIA 都能拿到它。
-      const addErr = el('p', { id: `${id}_adderr`, className: 'origin-error', attrs: { role: 'alert' } });
-      const doAdd = () => {
-        // 只接受 http(s) 绝对地址（Review finding B）。旧写法 `new URL(v).origin` 对
-        // `nas.example.com:8000` / `nas:8000` / `mailto:` / `data:` / `javascript:` 返回
-        // **字符串 `"null"`**，而 `"null"` 是 truthy，`if (!origin)` 拦不住 → junk 落盘成
-        // 一个永远匹配不上的白名单条目。
-        const origin = parseHttpOrigin(addInput.value);
-        if (!origin) {
-          addInput.classList.add('error');
-          addErr.textContent = '只接受 http:// 或 https:// 开头的完整地址，例如 http://nas.local:5666（未写入任何内容）';
-          addInput.focus();
-          return;
-        }
-        addInput.classList.remove('error');
-        addErr.textContent = '';
-        addInput.value = '';
-        const next = list.concat([origin]).filter((o, i, a) => a.indexOf(o) === i);
-        commit(key, next, wrap);
-      };
-      add.addEventListener('click', doAdd);
-      addInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') doAdd(); });
-      addRow.append(addInput, add);
-      box.append(addRow, addErr);
-      wrap.appendChild(box);
-      break;
-    }
-    case 'code': {
-      const input = el('textarea', { id });
-      input.rows = 8;
-      input.spellcheck = false;
-      input.value = value == null ? '' : String(value);
-      input.addEventListener('change', () => commit(key, input.value, wrap));
-      wrap.appendChild(input);
-      break;
-    }
-    case 'appList': {
-      // 数据来源：主窗口页面经标题通道回报的应用项列表（`get_page_report` 信封的 `appItems`
-      // 槽位 → `state.appItemsReport`）。**不读** `state.report`——那是状态条的证据槽位，
-      // 里面永远是「最近一条非应用项上报」。没有可用数据时**不画空列表、不造项**，而是如实
-      // 说明 + 指向「打开配置目录」手工编辑（这一项的数据不在宿主侧，宿主无法代用户补出来）。
-      const box = el('div', { className: 'app-list' });
-      const items = appItemsFromReport(state.appItemsReport);
-      const mods = (state.config && state.config.mods) || {};
-
-      if (items === null || items.length === 0) {
-        box.appendChild(el('p', {
-          id: `${id}_empty`,
-          className: items === null ? 'hint warn' : 'hint',
-          text: appListEmptyText(state.appItemsReport, items),
-          attrs: { role: 'note' }
-        }));
-        box.appendChild(configDirRow(`${id}_dir`));
-        wrap.appendChild(box);
-        break;
-      }
-
-      // 逐项处置只在总开关打开时被上游采纳（cs:644-648），这一点必须写在界面上
-      if (!mods.launchpadIconScaleEnabled) {
-        box.appendChild(el('p', {
-          id: `${id}_gated`,
-          className: 'hint warn',
-          text: '「完美图标」总开关当前是关闭的：下面这些逐项处置已经写进配置，但页面上不会生效（上游只在总开关打开时处理逐项键）。',
-          attrs: { role: 'note' }
-        }));
-      }
-      const options = iconChoiceOptions();
-      items.forEach((item, index) => {
-        const row = el('div', { className: 'app-item' });
-        row.dataset.appKey = item.key;
-        const title = typeof item.title === 'string' && item.title ? item.title : item.key;
-        row.appendChild(el('span', { className: 'app-title', text: title }));
-        row.appendChild(el('code', { className: 'app-key', text: item.key }));
-        const select = el('select', { id: `${id}_sel_${index}` });
-        select.dataset.appKey = item.key;
-        const current = iconSelectionFor(mods, item.key);
-        for (const [v, text] of options) {
-          const o = el('option', { text });
-          o.value = v;
-          o.selected = v === current;
-          select.appendChild(o);
-        }
-        select.addEventListener('change', () => {
-          commitMods(applyIconSelection(state.config.mods, item.key, select.value), wrap);
-        });
-        row.appendChild(select);
-        box.appendChild(row);
-      });
-      box.appendChild(el('p', {
-        className: 'hint',
-        text: `共 ${items.length} 个应用项（来自页面回报；主窗口重新加载后需要再回报一次）`
-      }));
-      box.appendChild(configDirRow(`${id}_dir`));
-      wrap.appendChild(box);
-      break;
-    }
-    case 'imageFile': {
-      const box = el('div', { className: 'file-box' });
-      const input = el('input', { id });
-      input.type = 'file';
-      input.accept = 'image/png,image/jpeg,image/webp';
-      const stored = value == null ? '' : String(value);
-      const status = el('p', { id: `${id}_status`, className: 'hint' });
-      status.textContent = stored ? `当前：${stored}` : '当前：未设置';
-
-      const applyStoredName = async (name) => {
-        wrap.classList.add('pending');
-        try {
-          const res = await api.setConfig({ local: { loginWallpaperFileName: name } });
-          adoptConfig(res.config);
-          state.error = null;
-          // 壁纸是**载荷内容**（`injector` 建窗时把它嵌进 binaryAssets），所以 Rust 侧会把
-          // 它判成 needsReload；这里照既有流程重建主窗口，下一次加载就带上新图。
-          if (res.needsReload) {
-            await api.reloadMain(null);
-            await fetchPageSnapshot();
-          }
-        } catch (e) {
-          state.error = `保存「${key}」失败：${message(e)}`;
-        } finally {
-          if (wrap.isConnected) wrap.classList.remove('pending');
-        }
-        render();
-        renderStatus();
-      };
-
-      input.addEventListener('change', async () => {
-        const file = input.files && input.files[0];
-        if (!file) return;
-        if (file.size > MAX_WALLPAPER_BYTES) {
-          state.error = `图片 ${file.size} 字节，超过 ${MAX_WALLPAPER_BYTES / 1024 / 1024} MiB 上限，未导入`;
-          render();
-          return;
-        }
-        wrap.classList.add('pending');
-        let dataBase64;
-        try {
-          dataBase64 = await readFileBase64(file);
-        } catch (e) {
-          wrap.classList.remove('pending');
-          state.error = `读取文件失败：${message(e)}`;
-          render();
-          return;
-        }
-        try {
-          // 第一步：宿主校验 + 落盘到配置目录，返回它实际用的文件名
-          const imported = await api.importWallpaper(file.name, dataBase64);
-          state.error = null;
-          wrap.classList.remove('pending');
-          // 第二步：走既有的 set_config 路径写入配置（Rust 侧会判 needsReload 并重建主窗口）
-          await applyStoredName(imported);
-        } catch (e) {
-          wrap.classList.remove('pending');
-          state.error = `导入壁纸失败：${message(e)}`;
-          render();
-        }
-      });
-
-      const clear = button('清除', 'reset');
-      clear.id = `${id}_clear`;
-      clear.disabled = !stored;
-      clear.addEventListener('click', () => { applyStoredName(null); });
-      box.append(input, clear, status);
-      wrap.appendChild(box);
-      break;
-    }
-    default: {
-      const input = el('input', { id });
-      input.type = 'text';
-      input.value = value == null ? '' : String(value);
-      if (item.maxlength) input.maxLength = item.maxlength;
-      input.addEventListener('change', () => commit(key, input.value, wrap));
-      wrap.appendChild(input);
-    }
-  }
-
-  return appendHint(wrap, item);
-}
-
-// ---------- 顶部状态条（Task 11 / spec §12.3） ----------
 
 /**
- * 取一次主窗口的观测状态。
+ * 上游问「这一页是不是 fnOS WebUI」。
  *
- * 失败时**返回 null**（而不是抛）：状态条于是显示「主窗口状态未知」，这与「取到了，
- * 确实没检测到 WebUI」是两件事——不许把一次 IPC 失败说成「未检测到 fnOS WebUI」。
+ * 判据只用宿主观测：**识别**（白名单 / *.fnos.net / nasUrl 的 origin，`config.rs::is_recognized`）
+ * **或**页面自己的注入链回报（`status.js::reportVerdict`，与状态条的强态同源）。
+ * 错误页 / 加载失败一律 false：上游据此决定要不要 `FNOS_APPLY`，对着一张错误页说 true 只会
+ * 让它白干活。
  */
+export function pageCheckAnswer(page, report) {
+  if (!page || typeof page !== 'object') return { isFnOSWebUi: false };
+  if (page.errorPage === true || page.loadFailed === true) return { isFnOSWebUi: false };
+  return { isFnOSWebUi: page.recognized === true || reportVerdict(report).injected };
+}
+
+/**
+ * 上游 `FNOS_APPLY` 的转发：消息里的派生值 → `set_config` 的 patch。
+ *
+ * 上游在发这条消息之前已经逐键 `storage.sync.set` 过了，所以**配置就是权威**；这条消息里
+ * 的价值是「不必等下一次导航」：把它落到 `set_config`，宿主的 `apply_to_page` 会当场
+ * `eval` 一次 `__FNOS_APPLY_CONFIG__`，活页面立刻收到。字段映射与 `mods` 段一一对应。
+ *
+ * 只认**列出了的键**（白名单），其余一概不进 patch：上游 UI 里的 `refreshFontAsset` /
+ * `refreshCustomCode` / `refreshLoginWallpaper` 是「资源要不要重算」的提示，本壳的对应资源
+ * 都由宿主按配置派生（字体不导入、代码/壁纸走载荷重建），没有需要照着做的动作。
+ */
+export function applyPatchFromPopup(msg) {
+  const m = msg && typeof msg === 'object' ? msg : {};
+  const mods = {};
+  const local = {};
+  const modsKeys = [
+    'basePresetEnabled', 'windowAnimationBlurEnabled', 'titlebarStyle', 'launchpadStyle',
+    'desktopIconLayoutEnabled', 'desktopIconLayoutMode', 'desktopIconPerColumn',
+    'launchpadIconScaleEnabled', 'launchpadIconScaleSelectedKeys',
+    'launchpadIconMaskOnlyKeys', 'launchpadIconRedrawKeys', 'launchpadIconRedrawMap',
+    'brandColor', 'lockscreenDefaultUsername', 'customCodeEnabled',
+  ];
+  for (const key of modsKeys) if (key in m) mods[key] = m[key];
+
+  const font = m.fontSettings && typeof m.fontSettings === 'object' ? m.fontSettings : null;
+  if (font) {
+    if ('enabled' in font) mods.fontOverrideEnabled = !!font.enabled;
+    if ('family' in font) mods.fontFamily = String(font.family == null ? '' : font.family);
+    if ('monospaceFamily' in font) {
+      mods.fontMonospaceFamily = String(font.monospaceFamily == null ? '' : font.monospaceFamily);
+    }
+    if ('weight' in font) mods.fontWeight = String(font.weight == null ? '' : font.weight);
+    if ('featureSettings' in font) {
+      mods.fontFeatureSettings = String(font.featureSettings == null ? '' : font.featureSettings);
+    }
+    if ('faceName' in font) mods.fontFaceName = String(font.faceName == null ? '' : font.faceName);
+    if ('url' in font) mods.fontUrl = String(font.url == null ? '' : font.url);
+  }
+
+  const code = m.customCodeSettings && typeof m.customCodeSettings === 'object' ? m.customCodeSettings : null;
+  if (code) {
+    if ('css' in code) local.customCssCode = String(code.css == null ? '' : code.css);
+    if ('js' in code) local.customJsCode = String(code.js == null ? '' : code.js);
+  }
+
+  const patch = {};
+  if (Object.keys(mods).length) patch.mods = mods;
+  if (Object.keys(local).length) patch.local = local;
+  return patch;
+}
+
+// ---------- 主窗口观测 ----------
+
 async function fetchPageState() {
   try {
     const page = await api.getPageState();
     return page && typeof page === 'object' ? page : null;
   } catch (e) {
-    return null;
+    return null; // 「取不到」与「取到了、确实没识别」是两件事（见 status.js）
   }
 }
 
-/**
- * 取一次页面上报（Task 13a）。
- *
- * 与 `fetchPageState` 同一套失败语义：取不到就 `null` → 状态条退回「注入脚本已注册」
- * 这一弱文案。**不许**把「IPC 失败」当成「已上报」或「未上报」之外的任何结论——
- * 这里没有第三个状态可说。
- */
 async function fetchPageReport() {
   try {
     const report = await api.getPageReport();
@@ -752,15 +324,11 @@ async function fetchPageReport() {
 }
 
 /**
- * 一次性刷新「主窗口观测 + 页面上报」两份快照。
+ * 一次性刷新「主窗口观测 + 两个上报槽位」。
  *
- * 两者都属于**同一时刻的主窗口**：上报是页面文档的属性，主窗口导航/重建后旧上报会被
- * Rust 侧作废（`commands.rs::get_page_report` 按文档身份判定），所以任何取 `page` 的地方
- * 都必须**同时**重取两个上报槽位，否则会出现「page 说是新页面、report 还是上一页的注入信号」
- * 这种自相矛盾的状态条。
- *
- * Task 13b：回包是信封（`{report, appItems}`），两个槽位分别进 `state.report` 与
- * `state.appItemsReport`——状态条只读前者，逐项 UI 只读后者。
+ * 三者属于**同一时刻的主窗口**：上报是页面文档的属性，主窗口导航/重建后旧上报会被 Rust
+ * 侧作废（`commands.rs::get_page_report` 按文档身份判定），所以取 `page` 的地方必须同时
+ * 重取两个槽位，否则会出现「page 说是新页面、report 还是上一页的注入信号」这种自相矛盾。
  */
 async function fetchPageSnapshot() {
   const [page, envelope] = await Promise.all([fetchPageState(), fetchPageReport()]);
@@ -770,18 +338,163 @@ async function fetchPageSnapshot() {
   state.appItemsReport = slots.appItems;
 }
 
-/** 判据是否还停在「加载失败」这一态（重试后的轮询用于决定何时停）。 */
+// ---------- 宿主桥（iframe 里的 chrome-shim → 本文件 → IPC） ----------
+
+/**
+ * iframe 允许调用的**命令白名单**。表外的一切命令名都会被拒绝（回 `ok:false` 的错误）——
+ * iframe 是我们自己的 shim，但「它能调什么」不该由它自己决定。
+ */
+const HOST_COMMANDS = {
+  get_config: () => api.getConfig(),
+  set_config: (a) => api.setConfig(a.patch),
+  reload_main: (a) => api.reloadMain(a && a.url ? a.url : null),
+  get_page_state: () => api.getPageState(),
+  get_page_report: () => api.getPageReport(),
+  get_local_store: () => api.getLocalStore(),
+  set_local_store: (a) => api.setLocalStore(a.patch),
+  import_wallpaper: (a) => api.importWallpaper(a.name, a.dataBase64),
+  open_url: (a) => api.openUrl(a.url),
+  request_app_items: () => api.requestAppItems(),
+  // 组合命令：不是 tauri 命令，只在本窗内部成立（见各自的实现）
+  page_check: async () => {
+    await fetchPageSnapshot();
+    return pageCheckAnswer(state.page, state.report);
+  },
+  app_items: () => answerAppItems(),
+  apply: async (a) => {
+    const patch = applyPatchFromPopup(a && a.message);
+    if (!Object.keys(patch).length) return {};
+    const res = await api.setConfig(patch);
+    adoptConfig(res.config);
+    if (res.needsReload) {
+      await api.reloadMain(null);
+      await fetchPageSnapshot();
+    }
+    return {};
+  },
+};
+
+/** 安装宿主桥：把 iframe 的命令请求派发到白名单，并把结果回传。 */
+export function installHostBridge() {
+  if (!domReady() || typeof window.addEventListener !== 'function') return;
+  window[BRIDGE_FLAG] = true;
+  window[SNAPSHOT_KEY] = snapshot;
+  window.addEventListener('message', (event) => {
+    const frame = document.getElementById('upstreamFrame');
+    if (!frame || event.source !== frame.contentWindow) return;
+    const data = event.data;
+    if (!data || typeof data !== 'object' || data[REQ] !== true) return;
+    const reply = (ok, value, error) => {
+      try {
+        frame.contentWindow.postMessage({ [REP]: true, id: data.id, ok, value, error }, '*');
+      } catch (e) { /* 帧已经没了：这次调用按失败处理即可 */ }
+    };
+    const handler = Object.prototype.hasOwnProperty.call(HOST_COMMANDS, data.cmd)
+      ? HOST_COMMANDS[data.cmd]
+      : null;
+    if (!handler) {
+      reply(false, undefined, `设置窗没有映射这条命令：${String(data.cmd)}`);
+      return;
+    }
+    Promise.resolve()
+      .then(() => handler(data.args || {}))
+      .then((value) => {
+        // 写完配置/重建主窗口之后：状态条与外壳区必须跟着换，否则会停在旧判定上
+        if (data.cmd === 'set_config' || data.cmd === 'reload_main' || data.cmd === 'apply') {
+          renderStatus();
+          renderShell();
+        }
+        reply(true, value === undefined ? null : value);
+      })
+      .catch((e) => reply(false, undefined, message(e)));
+  });
+}
+
+// ---------- 上游帧 ----------
+
+/**
+ * 挂载上游 popup（**只在配置快照就位之后**）。
+ *
+ * 时序是硬约束：上游 popup.js 第一行就同步读 `chrome.runtime.getManifest().version`，
+ * 而 shim 的 `getManifest` 读的是父 frame 的快照。先建帧再取配置会让版本显示落在兜底值上。
+ */
+export function mountUpstreamFrame() {
+  if (!domReady()) return null;
+  const host = document.getElementById('upstreamHost');
+  if (!host || host.dataset.state === 'ready') return null;
+  const frame = document.createElement('iframe');
+  frame.id = 'upstreamFrame';
+  frame.title = '上游设置界面（fnOS UI Mods popup）';
+  frame.setAttribute('src', UPSTREAM_PAGE);
+  frame.addEventListener('load', () => { reportFrameVerdict(); });
+  host.appendChild(frame);
+  host.dataset.state = 'ready';
+  return frame;
+}
+
+/**
+ * 帧内自检：上游 UI 到底渲染出来没有（运行期证据也读它）。
+ *
+ * 判据只用**上游自己的** id/class（`#siteToggle` 是站点开关、`code.version` 是版本行），
+ * 所以「本壳的旧分组 UI 还在不在」这件事在这里是可判定的：旧 UI 没有这些元素。
+ * 读不到（跨源/还没就绪）时如实说明，不猜。
+ */
+export function probeUpstreamFrame() {
+  if (!domReady()) return { mounted: false, reason: '无 DOM' };
+  const frame = document.getElementById('upstreamFrame');
+  if (!frame) return { mounted: false, reason: '还没挂载上游界面' };
+  let doc = null;
+  let win = null;
+  try {
+    doc = frame.contentDocument;
+    win = frame.contentWindow;
+  } catch (e) {
+    return { mounted: true, sameOrigin: false, reason: '跨源读不到帧内文档' };
+  }
+  if (!doc || !doc.getElementById) return { mounted: true, sameOrigin: true, ready: false, reason: '帧内文档还没就绪' };
+  const version = doc.querySelector('code.version');
+  const siteToggle = doc.getElementById('siteToggle');
+  const appList = doc.getElementById('launchpadAppList');
+  const notice = doc.getElementById('fnosShellNotice');
+  const chromeObj = win && win.chrome;
+  const upstreamGroups = doc.querySelectorAll('#nav, #pane, .nav-item');
+  return {
+    mounted: true,
+    sameOrigin: true,
+    ready: !!siteToggle && !!version,
+    version: version ? String(version.textContent).trim() : null,
+    siteToggle: !!siteToggle,
+    appListEmptyText: appList ? String(appList.textContent).trim().slice(0, 80) : null,
+    appListItemCount: appList ? appList.querySelectorAll('.launchpad-app-item').length : 0,
+    chromeReady: !!(chromeObj && chromeObj.storage && chromeObj.storage.sync && chromeObj.runtime),
+    retiredGroupUiPresent: upstreamGroups.length > 0,
+    notice: notice ? String(notice.textContent).replace(/\s+/g, ' ').slice(0, 500) : null,
+  };
+}
+
+/** 把帧内自检的结论写进占位说明（只在**没渲染出来**时才说话）。 */
+function reportFrameVerdict() {
+  const host = domReady() ? document.getElementById('upstreamHost') : null;
+  if (!host) return;
+  const verdict = probeUpstreamFrame();
+  if (verdict.ready) return;
+  const note = document.getElementById('upstreamNote');
+  if (note) note.textContent = `上游设置界面没能渲染：${verdict.reason || '未知原因'}`;
+}
+
+// ---------- 状态条（spec §12.3） ----------
+
+/** 判据是否还停在「加载失败 / 加载中」（重试后的轮询用于决定何时停）。 */
 function stillFailed(page) {
   return !!page && (page.loadFailed === true || page.loading === true);
 }
 
 /**
- * 「重试」：走既有 `reload_main`（Rust 侧销毁主窗口并按配置的 homeUrl + 新载荷重建）。
+ * 「重试」：走既有 `reload_main`（Rust 侧销毁主窗口并按配置重建）。
  *
- * 重建是异步的，紧接着取一次 `get_page_state` 大概率还是旧的失败态（窗口还没建回来），
- * 所以这里轮询一小会儿：状态条于是从「加载失败」走到真实结果，而不是卡在旧快照上。
- * `errorPage` 是内置错误页，**没有**任何 IPC 授权（capability 只给 settings 窗），
- * 所以重试入口只能在设置窗与托盘——这正是本函数存在的理由。
+ * 重建是异步的，紧接着取一次 `get_page_state` 大概率还是旧的失败态，所以轮询一小会儿：
+ * 状态条于是从「加载失败」走到真实结果，而不是卡在旧快照上。错误页本身没有任何 IPC
+ * 授权，重试入口只能在设置窗与托盘——这正是本函数存在的理由。
  */
 async function retryMain() {
   state.error = null;
@@ -791,36 +504,31 @@ async function retryMain() {
   } catch (e) {
     state.error = `重试失败：${message(e)}`;
     await fetchPageSnapshot();
-    render();
     renderStatus();
+    renderShell();
     return;
   }
   const deadline = Date.now() + 8000;
   do {
-    await new Promise((r) => setTimeout(r, 600));
+    await sleep(600);
     await fetchPageSnapshot();
     renderStatus(true);
   } while (Date.now() < deadline && stillFailed(state.page));
-  render();
   renderStatus();
+  renderShell();
 }
 
 /**
- * 「把当前页加入白名单」：走既有 `set_config` patch 路径写入 `mods.enabledOrigins`。
+ * 「把当前页加入白名单」：走 `set_config {mods:{enabledOrigins}}`。
  *
- * origin 的合法性由 `status.js::addCurrentOriginToWhitelist` + Rust 的
- * `Config::normalize` 双保险（后者会把非 `scheme://host[:port]` 的东西挡在语义之外，
- * 且 `enabledOrigins` 只做 trim/小写/去重），这里拿到的 origin 来自
- * `get_page_state`（Rust 用 `config::origin_of` 解析出来的），不是页面上抓来的字符串。
- *
- * 写完**显式重建主窗口**：注入载荷是建窗时注册到 WebView2 的（`initialization_script`
- * 无法在活窗口上替换），而 `needsReload` 只覆盖 `injectEnabled`/`homeUrl`——不重建的话
- * 这次加入要等下一次导航才生效。重建后「下一次加载即注入」当场成立。
+ * origin 来自 `get_page_state`（Rust 用 `config::origin_of` 解析出来的），不是页面上抓来的
+ * 字符串；去重/小写由 `status.js::addCurrentOriginToWhitelist` 与 Rust 的 `Config::normalize`
+ * 双保险。写完显式重建主窗口：注入载荷是建窗时注册的（活窗口换不掉），不重建就要等下一次导航。
  */
 async function whitelistCurrentOrigin() {
   const origin = state.page && state.page.origin;
   if (!origin) return;
-  const next = addCurrentOriginToWhitelist(origin, (state.config.mods || {}).enabledOrigins);
+  const next = addCurrentOriginToWhitelist(origin, (state.config && state.config.mods || {}).enabledOrigins);
   try {
     const res = await api.setConfig({ mods: { enabledOrigins: next } });
     adoptConfig(res.config);
@@ -830,52 +538,117 @@ async function whitelistCurrentOrigin() {
     state.error = `加入白名单失败：${message(e)}`;
   }
   await fetchPageSnapshot();
-  render();
   renderStatus();
+  renderShell();
 }
 
-/**
- * 把状态条重新画一遍（`status.js::statusFor` 是唯一的判据来源）。
- *
- * `busy` 只影响按钮可用性：重试期间的按钮置灰，避免连点堆出多次重建。
- */
+/** 把状态条重新画一遍（`status.js::statusFor` 是唯一的判据来源）。 */
 function renderStatus(busy) {
+  if (!domReady()) return;
   const model = statusFor(state.config, state.page, state.report);
-  const el = statusBar(model.text, model.kind);
-  if (!el) return;
+  const bar = statusBar(model.text, model.kind);
+  if (!bar) return;
   for (const action of model.actions) {
     if (action === 'retry') {
       const b = button('重试');
       b.id = 'statusRetry';
       b.disabled = !!busy;
       b.addEventListener('click', () => { retryMain(); });
-      el.appendChild(b);
+      bar.appendChild(b);
     } else if (action === 'whitelist') {
       const b = button('把当前页加入白名单');
       b.id = 'statusWhitelist';
       b.disabled = !!busy;
       b.addEventListener('click', () => { whitelistCurrentOrigin(); });
-      el.appendChild(b);
+      bar.appendChild(b);
     }
   }
+}
+
+// ---------- 外壳开关（上游 UI 里没有的两项） ----------
+
+/**
+ * `shell.injectEnabled`（注入总开关）与 `shell.nasUrl`。
+ *
+ * 为什么本壳还要留这两项（T14b 的设计取舍，不是漏删）：上游 popup 是**扩展**的设置界面，
+ * 它假设「扩展总是被注入」，所以没有注入总开关，也没有「NAS 地址」这个概念（上游用
+ * `enabledOrigins` 白名单表达同一件事的另一半）。而本壳这两个键有真实语义：
+ * `injectEnabled=false` 会让宿主**不注册**任何 mods 初始化脚本（T7+8 的 gap (a)）；
+ * `nasUrl` 在保存时会把它的 origin 并入白名单，是「一键把 NAS 加进来」的入口。
+ * 托盘精简（T14a）之后，注入总开关只剩设置窗这一个入口——把它一起删掉就等于删功能。
+ * 因此它们放在**本壳自己的区域**里（与上游界面并列），而不是塞进上游 UI。
+ */
+function renderShell() {
+  if (!domReady()) return;
+  const host = document.getElementById('shellFields');
+  if (!host) return;
+  host.textContent = '';
+  const shell = (state.config && state.config.shell) || {};
+
+  const injectField = el('div', { className: 'field' });
+  const injectId = 'f_shell_injectEnabled';
+  const injectLabel = el('label', { text: '注入 mods（总开关）' });
+  injectLabel.htmlFor = injectId;
+  const inject = el('input', { id: injectId });
+  inject.type = 'checkbox';
+  inject.checked = shell.injectEnabled !== false;
+  inject.addEventListener('change', () => { commitShell('injectEnabled', inject.checked); });
+  injectField.append(injectLabel, inject, el('p', {
+    className: 'hint',
+    text: '关掉之后宿主不再为任何窗口注册 mods 载荷（改这一项会重建主窗口）。',
+  }));
+  host.appendChild(injectField);
+
+  const nasField = el('div', { className: 'field' });
+  const nasId = 'f_shell_nasUrl';
+  const nasLabel = el('label', { text: 'NAS WebUI 地址' });
+  nasLabel.htmlFor = nasId;
+  const nas = el('input', { id: nasId });
+  nas.type = 'text';
+  nas.placeholder = 'http://192.168.1.10:8000';
+  nas.value = typeof shell.nasUrl === 'string' ? shell.nasUrl : '';
+  const nasSave = button('保存');
+  nasSave.id = 'f_shell_nasUrl_save';
+  const commitNas = () => { commitShell('nasUrl', nas.value); };
+  nasSave.addEventListener('click', commitNas);
+  nas.addEventListener('keydown', (e) => { if (e.key === 'Enter') commitNas(); });
+  nasField.append(nasLabel, nas, nasSave, el('p', {
+    className: 'hint',
+    text: '保存后宿主会把它的 origin 并入 mods.enabledOrigins（白名单）。',
+  }));
+  host.appendChild(nasField);
+
+  const actions = el('div', { className: 'field' });
+  const openDir = button('打开配置目录');
+  openDir.id = 'shellOpenDir';
+  openDir.addEventListener('click', async () => {
+    try {
+      await api.openConfigDir();
+      state.error = null;
+    } catch (e) {
+      state.error = `打开配置目录失败：${message(e)}`;
+    }
+    renderShell();
+  });
+  actions.appendChild(openDir);
+  host.appendChild(actions);
+
+  if (state.error) host.insertBefore(el('p', { className: 'error-banner', text: state.error }), host.firstChild);
 }
 
 // ---------- 关于页（spec §10：合规与品牌） ----------
 
 /**
- * 关于页要展示的两个合规件路径（spec §10「分发必须保留许可全文」/ Ruling R54）。
+ * 关于页要展示的两个合规件路径（spec §10 / Ruling R54）。
  *
- * 优先用宿主解析出的**随包真实路径**（`meta.licensePath` / `meta.noticePath`：安装版落在
- * 安装目录的 `fnos-mods/`，开发版落在 `target/(debug|release)/fnos-mods/`，两处都由
- * `tauri-build` 的 `copy_resources` 保证文件确实在）。这两个字段是 T12 才加上的，
- * 老宿主（或只喂半个 meta 的单测）没有它们——那时才回落到源码树里的 vendored 位置，
- * 而不是把 `undefined` 画到界面上。
+ * 优先用宿主解析出的**随包真实路径**（`meta.licensePath` / `meta.noticePath`），老宿主
+ * （或只喂半个 meta 的单测）没有它们时才回落到源码树里的 vendored 位置，而不是画 `undefined`。
  */
 export function compliancePaths(meta) {
   const m = meta || {};
   return {
     license: m.licensePath || `${VENDOR_DIR}/LICENSE`,
-    notice: m.noticePath || `${VENDOR_DIR}/NOTICE`
+    notice: m.noticePath || `${VENDOR_DIR}/NOTICE`,
   };
 }
 
@@ -886,49 +659,36 @@ function metaRow(label, value, tag, className) {
   return row;
 }
 
-function renderAbout(pane) {
-  const meta = state.config.meta || {};
-  // Rust 侧字段是 `webview_version` + `#[serde(rename_all = "camelCase")]`，serde 只把
-  // `_v` 变成 `V`，因此真实 JSON 键是 **`webviewVersion`**（不是 `webViewVersion`）。
-  // 任务书/spec §8.3 的写法是 `webViewVersion`，这里两个都读：契约写法差异不该表现为
-  // 「关于页永远显示未知」（本轮真机 UIA 断言正是靠这一点区分出 `undefined` 的）。
-  const webviewVersion = meta.webViewVersion || meta.webviewVersion;
+function renderAbout() {
+  if (!domReady()) return;
+  const about = document.getElementById('about');
+  if (!about) return;
+  about.textContent = '';
+  const meta = (state.config && state.config.meta) || {};
+
   const card = el('div', { className: 'card' });
+  card.appendChild(el('h2', { className: 'pane-title', text: '关于' }));
   card.appendChild(metaRow('应用版本', meta.shellVersion || '未知'));
   card.appendChild(metaRow('mods commit', meta.modsCommit || '未知'));
   card.appendChild(metaRow('mods 版本', meta.modsVersion || '未知'));
+  // Rust 侧字段是 `webview_version` + `#[serde(rename_all = "camelCase")]`，serde 只把 `_v`
+  // 变成 `V`，因此真实 JSON 键是 **`webviewVersion`**（不是 `webViewVersion`）。两个都读：
+  // 契约写法差异不该表现为「关于页永远显示未知」。
+  const webviewVersion = meta.webViewVersion || meta.webviewVersion;
   card.appendChild(metaRow('WebView2 版本', webviewVersion || '未知（未取到运行时版本）'));
-  // spec §12.3 / §14：`corner-shape`（squircle 圆角）需要 Chromium/WebView2 139+；
-  // 低于门槛时只说「会退化为普通圆角」，取不到版本时什么都不说（见 status.js 的注释）。
+  // spec §12.3 / §14：`corner-shape` 需要 Chromium/WebView2 139+；取不到版本时什么都不说。
   const shapeHint = cornerShapeHint(webviewVersion);
   if (shapeHint) {
-    card.appendChild(el('p', {
-      id: 'cornerShapeHint',
-      className: 'hint warn',
-      text: shapeHint,
-      attrs: { role: 'note' },
-    }));
+    card.appendChild(el('p', { id: 'cornerShapeHint', className: 'hint warn', text: shapeHint, attrs: { role: 'note' } }));
   }
   card.appendChild(metaRow('配置文件', meta.configPath || '未知', 'code', 'row-value path'));
-  // spec §10 / R54：关于页必须指出**随包**许可全文与 NOTICE 的真实位置。
-  // 这两行是 T12 新增的（此前只显示源码树路径，安装后在磁盘上并不存在）。
+  // spec §10 / R54：必须指出**随包**许可全文与 NOTICE 的真实位置。
   const legalPaths = compliancePaths(meta);
   card.appendChild(metaRow('上游许可全文', legalPaths.license, 'code', 'row-value path'));
   card.appendChild(metaRow('来源与改动声明', legalPaths.notice, 'code', 'row-value path'));
-  pane.appendChild(card);
+  about.appendChild(card);
 
   const actions = el('div', { className: 'card' });
-  const openDir = button('打开配置目录');
-  openDir.id = 'openDir';
-  openDir.addEventListener('click', async () => {
-    try {
-      await api.openConfigDir();
-      state.error = null;
-    } catch (e) {
-      state.error = `打开配置目录失败：${message(e)}`;
-      render();
-    }
-  });
   const reset = button('恢复默认设置', 'danger');
   reset.id = 'resetAll';
   reset.addEventListener('click', async () => {
@@ -939,20 +699,26 @@ function renderAbout(pane) {
     } catch (e) {
       state.error = `恢复默认失败：${message(e)}`;
     }
-    render();
+    renderShell();
+    renderStatus();
   });
-  actions.append(openDir, reset);
-  pane.appendChild(actions);
+  actions.appendChild(reset);
+  about.appendChild(actions);
 
   // 许可与免责（spec §10）：非官方 + 非商业 + 上游出处 + vendored 许可全文位置。
   const legal = el('div', { className: 'card legal' });
   legal.appendChild(el('p', {
     className: 'legal-line',
-    text: '本应用是第三方桌面壳，非飞牛（fnOS）官方产品，与飞牛官方无任何关联，也未获其授权或认可。'
+    text: '本应用是第三方桌面壳，非飞牛（fnOS）官方产品，与飞牛官方无任何关联，也未获其授权或认可。',
   }));
   legal.appendChild(el('p', {
     className: 'legal-line',
-    text: '随应用注入的界面修改资源（CSS/JS）来自上游开源项目 fnOS UI Mods，遵循其 Non-Commercial License 1.0，仅供非商业个人使用；本应用及这些资源均不得用于任何商业用途。上游资源按原样保留、未作修改，本壳仅做注入与包装性改动。'
+    text: '随应用注入的界面修改资源（CSS/JS）来自上游开源项目 fnOS UI Mods，遵循其 Non-Commercial License 1.0，仅供非商业个人使用；本应用及这些资源均不得用于任何商业用途。上游资源按原样保留、未作修改，本壳仅做注入与包装性改动（清单见 NOTICE）。',
+  }));
+  legal.appendChild(el('p', {
+    className: 'legal-line',
+    text: '本窗的主界面就是上游自己的设置界面（popup.html + popup.js，逐字节原样 + 一行 chrome.* 兼容层标签），'
+      + '本壳只额外提供状态条、上面这两项外壳开关与这一页关于/合规信息。',
   }));
   const linkLine = el('p', { className: 'legal-line' });
   linkLine.appendChild(document.createTextNode('上游项目：'));
@@ -961,13 +727,9 @@ function renderAbout(pane) {
   link.rel = 'noopener noreferrer';
   link.id = 'upstreamLink';
   // 外链**不在窗内导航**，交给 Rust `open_url` 用系统默认浏览器打开（Review finding D）。
-  //
-  // 为什么必须 preventDefault：不加的话 Chromium 会在**设置窗自身**里导航到 GitHub——
-  // UI 被顶掉，而 `capabilities/default.json` 只授权本地来源，加载后的远程页面调不动
-  // 任何命令，设置窗等于废掉。`target=_blank` 也救不了：wry 在 `new_window_handler`
-  // 为 None 时直接 `args.SetHandled(true)`（wry-0.57.0/src/webview2/mod.rs 的
-  // NewWindowRequested 分支，tauri 默认不注册），新窗口请求被静默吞掉 = 点了不跳转。
-  // `href` 仍然保留：URL 可见、可复制、在无障碍树里仍是 Hyperlink。
+  // 不加 preventDefault 的话 Chromium 会在设置窗自身里导航到 GitHub——UI 被顶掉，而
+  // capability 只授权本地来源；`target=_blank` 也救不了（wry 默认不注册 new_window_handler，
+  // 新窗口请求被静默吞掉）。`href` 仍保留：URL 可见、可复制、在无障碍树里仍是 Hyperlink。
   link.addEventListener('click', async (e) => {
     e.preventDefault();
     try {
@@ -975,101 +737,36 @@ function renderAbout(pane) {
       state.error = null;
     } catch (err) {
       state.error = `打开上游链接失败：${message(err)}`;
-      render();
+      renderShell();
     }
   });
   linkLine.appendChild(link);
   legal.appendChild(linkLine);
   legal.appendChild(el('p', {
     className: 'legal-line dim',
-    text: `上游许可全文：${legalPaths.license}；来源与改动声明：${legalPaths.notice}（后者含来源仓库、锁定 commit、各文件 SHA-256、本壳的包装性改动清单）。两者都随安装包分发；上方的链接会用系统默认浏览器打开上游仓库，若被系统策略拦截，可手动复制上面的路径。`
+    text: `上游许可全文：${legalPaths.license}；来源与改动声明：${legalPaths.notice}（后者含来源仓库、锁定 commit、各文件 SHA-256、本壳的包装性改动清单）。两者都随安装包分发；上方的链接会用系统默认浏览器打开上游仓库，若被系统策略拦截，可手动复制上面的路径。`,
   }));
-  pane.appendChild(legal);
+  about.appendChild(legal);
 }
 
-// ---------- 渲染 ----------
+// ---------- 生命周期 ----------
 
-function renderGroup(pane, group) {
-  const card = el('div', { className: 'card' });
-  for (const item of group.items) card.appendChild(fieldEl(item));
-  pane.appendChild(card);
-}
-
-function render() {
-  const nav = document.getElementById('nav');
-  const pane = document.getElementById('pane');
-  const scroll = pane.scrollTop;
-  nav.textContent = '';
-  pane.textContent = '';
-
-  if (!state.config) {
-    pane.appendChild(el('p', { className: 'fatal', text: state.error || '配置尚未加载' }));
-    return;
-  }
-
-  const active = SCHEMA.find((g) => g.id === state.active) || SCHEMA[0];
-  state.active = active.id;
-
-  for (const group of SCHEMA) {
-    const b = button(group.title, `nav-item${group.id === active.id ? ' on' : ''}`);
-    b.id = `nav_${group.id}`;
-    b.dataset.group = group.id;
-    b.setAttribute('aria-current', group.id === active.id ? 'true' : 'false');
-    b.addEventListener('click', () => { state.active = group.id; render(); });
-    nav.appendChild(b);
-  }
-
-  pane.appendChild(el('h2', { className: 'pane-title', text: active.title }));
-  if (state.error) pane.appendChild(el('p', { className: 'error-banner', text: state.error }));
-
-  if (active.id === 'about') renderAbout(pane);
-  else renderGroup(pane, active);
-
-  pane.scrollTop = scroll;
-}
-
-/** 正在刷新（防止焦点事件与 boot / commit 的两次 getConfig 互相穿插）。 */
 let refreshing = false;
 
-/** 粗粒度比较：IPC 配置是纯 JSON（mods/local/shell/meta），序列化结果一致即视为没变。 */
 function sameConfig(a, b) {
   return !!a && !!b && JSON.stringify(a) === JSON.stringify(b);
 }
 
 /**
- * 重取配置**与主窗口状态**并就地重渲染（Review finding C + Task 11）。
+ * 重取配置 + 主窗口快照并就地重画。
  *
- * 为什么需要：配置可以被本窗**之外**的入口改动（`set_config` 的带外调用、手工编辑
- * `config.json` 后重启、以及将来任何新增的写入方），而那些入口**不向设置窗发任何事件**；
- * 本窗只在 `boot()` 取过一次配置，于是带外改动后它会一直显示过期值，直到关掉重开。
- * 窗口重新获得焦点时刷新是最小实现：不引入事件总线、不改 Rust 侧。
+ * 为什么需要：配置可以被本窗**之外**的入口改动（手工编辑 `config.json`、`set_config` 的
+ * 带外调用），而那些入口不向本窗发任何事件；主窗口更是**可以不改配置**就导航（用户点链接、
+ * 错误页自动重试）。窗口重新获得焦点时刷新是最小实现。
  *
- * 注（T13b fix round 1 订正注释）：托盘曾有一个「注入 mods」勾选项，走
- * `commands::set_inject_enabled` + `tray::sync_menus`；托盘精简后勾选项与 `sync_menus`
- * 都已删除，开关只剩设置窗这一个入口（`schema.js` 的 `shell.injectEnabled`）。
- * 这条焦点刷新对**任何**带外改动仍然必要，所以保留。
- *
- * Task 11 的状态条复用同一个钩子，但它要的数据比配置多一份：主窗口**可以在不改任何
- * 配置**的情况下导航（用户在页面里点链接、错误页自动重试……），
- * 所以 `get_page_state` 必须每次刷新都取——不能挂在「配置变了」这个条件上。反过来，
- * 配置没变时依旧**不重渲染 #pane**（否则每次 alt-tab 回来都会重建 DOM、丢掉用户正在
- * 输入却尚未提交的文本）。
- *
- * Task 13a 再加一份：`get_page_report`（页面经标题通道回报的注入链信号）与 `get_page_state`
- * 是**同一时刻主窗口**的两个视图，必须在同一个快照里取（见 `fetchPageSnapshot`）。焦点刷新
- * 正好是「页面刚跑完注入链、用户切回设置窗」的时刻——状态条据实化主要靠这个钩子。
- *
- * Task 13b：**应用项列表**（`state.appItemsReport`）和配置一样是「主窗口那边的事，本窗只读
- * 快照」。用户的实际动线就是「切到主窗口打开启动台 → 切回设置窗」，所以焦点刷新必须让
- * **正在显示它的那一组**重画一次，否则界面会一直停在「尚未收到应用项列表」——而那句文案
- * 又写着「会自动刷新」，就成了一句假话。
- *
- * 重画的条件刻意收得很窄：**只有**当前分组是「完美图标」（该组只有总开关与应用项下拉，
- * 没有用户可能正在输入却尚未提交的文本框）**且**应用项槽位的内容真的变了。其余情形一律
- * 沿用「配置没变就不重渲染 #pane」的既有纪律（见上一段）。
- *
- * `render()` 会保留 `state.active`（当前分组）与 `pane.scrollTop`（滚动位置），
- * 所以刷新不会把用户弹回第一组。
+ * **不重挂上游帧**：上游 UI 有自己的输入状态与滚动位置，重新加载 iframe 会把它清掉；
+ * 上游自己通过 `storage.sync.set` 写配置，所以它的界面与配置天然同步。本窗只重画
+ * 状态条、外壳开关与关于页（它们才是本壳的视图）。
  */
 export async function refresh() {
   if (refreshing) return;
@@ -1081,26 +778,29 @@ export async function refresh() {
   } catch (e) {
     failure = e;
   }
-  const beforeAppItems = JSON.stringify(state.appItemsReport);
   await fetchPageSnapshot();
-  const appItemsChanged = JSON.stringify(state.appItemsReport) !== beforeAppItems;
   refreshing = false;
   if (failure) {
     state.error = `刷新配置失败：${message(failure)}`;
     renderStatus();
-    render();
+    renderShell();
     return;
   }
-  const changed = !sameConfig(state.config, next);
-  if (changed) {
+  if (!sameConfig(state.config, next)) {
     adoptConfig(next);
     state.error = null;
+    renderAbout();
   }
   renderStatus();
-  if (changed || (appItemsChanged && state.active === 'perfectIcon')) render();
+  renderShell();
 }
 
-/** 取一次配置并渲染。导出以便单测；无 DOM 时模块加载不会自动执行（见文件末尾）。 */
+/**
+ * 启动：取配置 → 写快照 → 挂宿主桥 → **然后**才建上游帧 → 画状态条/外壳/关于。
+ *
+ * 次序是硬约束（见 `mountUpstreamFrame` 的注释）：上游在脚本开头同步读版本号。
+ * 导出以便单测；无 DOM 时模块加载不会自动执行（见文件末尾）。
+ */
 export async function boot() {
   try {
     adoptConfig(await api.getConfig());
@@ -1108,15 +808,23 @@ export async function boot() {
     state.error = `读取配置失败：${message(e)}`;
   }
   await fetchPageSnapshot();
-  render();
   renderStatus();
+  renderShell();
+  renderAbout();
+  installHostBridge();
+  mountUpstreamFrame();
+  // 运行期证据口（UIA / WebView2 CDP 都读它）：帧内自检 + 当前快照，用于证明
+  // 「渲染出来的是上游 UI，不是本壳退休掉的分组 UI」。
+  window.__FNOS_UPSTREAM_PROBE__ = () => ({
+    ...probeUpstreamFrame(),
+    pageCheck: pageCheckAnswer(state.page, state.report),
+    configPath: (state.config && state.config.meta && state.config.meta.configPath) || null,
+    modsVersion: (state.config && state.config.meta && state.config.meta.modsVersion) || null,
+  });
   window.addEventListener('focus', () => { refresh(); });
 }
 
-// 只有真实页面才自动启动：Node 单测 `import` 本模块时没有 DOM，直接 `boot()` 会抛错，
-// 于是「导入 app.js 测内部逻辑」就变得不可行（Review 打磨项）。判据用 `#pane` 而不是
-// 只看 `typeof document`：只有 DOM、没有页面骨架时同样不该启动。
-const hasPane = typeof document !== 'undefined'
-  && typeof document.getElementById === 'function'
-  && !!document.getElementById('pane');
-if (hasPane) boot();
+// 只有真实页面才自动启动：Node 单测 `import` 本模块时没有 DOM（`#upstreamHost`），
+// 直接 `boot()` 会抛错，于是「导入 app.js 测内部逻辑」就变得不可行。
+const hasShell = domReady() && !!document.getElementById('upstreamHost');
+if (hasShell) boot();
