@@ -621,6 +621,39 @@ mod tests {
         assert!(!js.contains("innerHTML"), "不写页面内容");
     }
 
+    /// T14c 修复轮 16（用户实测：窗口「会跳动到居中」而不是一开始就居中）：落位必须发生在
+    /// **观察回调返回之前**（= DOM 插入与首帧之间），且不得再有去抖合并窗；尺寸一时量不到
+    /// 时要先按住（visibility），免得它以级联位置先露一脸。
+    #[test]
+    fn window_positions_land_before_first_paint() {
+        let js = include_str!("../inject/windowpos.js");
+        assert!(
+            js.contains("addedNodes"),
+            "观察回调必须只处理新增节点（同步落位的入口）"
+        );
+        assert!(
+            !js.contains("SCAN_DELAY_MS") && !js.contains("scheduleScan"),
+            "不得再有延迟合并扫描：那正是「先出现在级联位置、再跳一下」的来源"
+        );
+        let on_mut = js.find("function onMutations").expect("必须有观察回调");
+        let body = &js[on_mut..on_mut + 700];
+        assert!(
+            body.contains("place("),
+            "回调体里必须**同步**调 place（不是排进 setTimeout/rAF 再落位）"
+        );
+        assert!(
+            js.contains("visibility") && js.contains("held"),
+            "尺寸量不到时先按住（宁可晚一帧出现，也不要先出现在错的位置）"
+        );
+        let place = js.find("function place(").expect("必须有 place");
+        let place_body = &js[place..place + 500];
+        assert!(
+            place_body.find("attempt(el)").unwrap_or(usize::MAX)
+                < place_body.find("requestAnimationFrame").unwrap_or(usize::MAX),
+            "place 的第一件事必须是同步 attempt，重试只是补正"
+        );
+    }
+
     #[test]
     fn shell_section_is_narrow_and_defaults_off() {
         // T14c：shell 段是**手写的窄对象**，只带页面消费的两个键（dockAutoHide /
