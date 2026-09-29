@@ -198,10 +198,13 @@ impl ShellConfig {
     /// NAS WebUI 地址（trim 后的原文）：`None` = 未配置**或填错**。
     ///
     /// Finding 1 选定的语义是「**保留原文但一律禁用**」：`normalize` 不删用户写错的值
-    /// （用户能在配置文件里看到自己的错字并改回来），但凡是要*使用*它的地方——托盘的
-    /// 「打开 NAS」置灰（`tray::sync_menus`）、`commands::open_nas` 的跳转——都只看这个
+    /// （用户能在配置文件里看到自己的错字并改回来），但凡是要*使用*它的地方都只看这个
     /// 取值器。于是「非法 nasUrl」在所有入口都一致地表现为「没有可用地址」，
     /// 不会再出现 round 0 那种「菜单可点、点了静默什么都不做」。
+    ///
+    /// 注（T13b fix round 1 订正注释）：托盘的「打开 NAS」菜单项、`tray::sync_menus` 与
+    /// `commands::open_nas` 都已随托盘精简删除；这条取值器现在唯一的消费方是
+    /// `normalize`（把合法 `nasUrl` 的 origin 并入注入白名单，见 `enabled_origins`）。
     pub fn nas_target(&self) -> Option<&str> {
         self.nas_url_parsed()?;
         Some(self.nas_url.trim())
@@ -443,6 +446,8 @@ pub fn wallpaper_ext(name: &str) -> Option<&'static str> {
 /// - 路径分隔符 `/` `\`、盘符 `:`、Windows 保留字符 `*?"<>|`、`..`、以 `.` 开头 → 穿越与
 ///   意外路径（`Path::join` 遇到分隔符会真的换目录）；
 /// - 任何控制字符（含 `\n`：日志是本项目的评审证据，绝不允许页面/用户可控文本换行）；
+/// - **Windows 保留设备名**（`CON` / `PRN` / `AUX` / `NUL` / `COM1`–`COM9` / `LPT1`–`LPT9`，
+///   大小写不敏感、**带不带扩展名都算**）——见 [`is_windows_device_name`]；
 /// - 没有扩展名或扩展名不在 `png/jpg/jpeg/webp` 内（mime 由扩展名推导，见 [`wallpaper_mime`]）。
 pub fn is_wallpaper_name(name: &str) -> bool {
     if name.is_empty() || name.len() > MAX_WALLPAPER_NAME_LEN {
@@ -460,7 +465,40 @@ pub fn is_wallpaper_name(name: &str) -> bool {
     }) {
         return false;
     }
+    if is_windows_device_name(name) {
+        return false;
+    }
     wallpaper_ext(name).is_some()
+}
+
+/// 这个文件名是不是 Windows 的**保留设备名**。
+///
+/// 判据取「第一个 `.` 之前的那一段」（Windows 认名字的方式：`NUL.txt`、`CON.log.png` 都是设备，
+/// 扩展名不改变结论），大小写不敏感；`CON` / `PRN` / `AUX` / `NUL` 是完整名单，
+/// `COM1`–`COM9` / `LPT1`–`LPT9` 是「三字母 + 一位数字」的形状。
+///
+/// ## 为什么读路径也必须拒（Review fix round 1 / Minor 2）
+///
+/// 写路径本来就免疫：导入落盘的名字一律是 `stored_wallpaper_name()` 生成的
+/// `<stem>-<fnv64 指纹>.<ext>`，**永远带一串十六进制后缀**，所以 `CON.png` 这类名字根本落不了盘
+/// （而且 `stored_wallpaper_name` 会把非法字符剥掉）。但读路径不是这样：
+/// `local.loginWallpaperFileName` 是**用户可编辑**的配置值，
+/// `injector::load_wallpaper_from` 会拿它 `Path::join(配置目录, name)` 去 `metadata`/`read`。
+/// 在 Windows 上 `...\config\CON.png` 解析到的不是你放在配置目录里的文件，而是**控制台设备**——
+/// 也就是说用户的配置会悄悄指向一个与配置目录无关的东西（成败取决于设备语义，而不是我们的校验）。
+/// 在写路径拒绝它、读路径却放行，两边就不一致了；统一在**名字形状**这一层拒掉最省事也最可审计。
+pub fn is_windows_device_name(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or(name).trim_end();
+    let upper = stem.to_ascii_uppercase();
+    if matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL") {
+        return true;
+    }
+    let bytes = upper.as_bytes();
+    // `COM1`–`COM9` / `LPT1`–`LPT9`：恰好三字母 + 一位数字，不是子串匹配
+    //（`CONSOLE` / `mycon` / `com10` 都应该放行）。
+    bytes.len() == 4
+        && (bytes.starts_with(b"COM") || bytes.starts_with(b"LPT"))
+        && (b'1'..=b'9').contains(&bytes[3])
 }
 
 /// 登录壁纸的 mime（由扩展名推导）；名字形状不合法或扩展名不在允许表内 → `None`。
@@ -827,7 +865,8 @@ impl Config {
             None => self.shell.home_url = DEFAULT_HOME_URL.into(),
         }
         // Item 2：窗口几何在这里夹取（`load` 与 `save` 都必经 `normalize`，
-        // `set_config` / `reset_config` / `set_inject_enabled` 也各自显式调用），因此
+        // `set_config` / `reset_config` 也各自显式调用；T13b fix round 1 订正：托盘精简后
+        // `commands::set_inject_enabled` 已删除，开关改动现在同样走 `set_config`），因此
         // `commands::build_main_window` 的 `inner_size(cfg.shell.window.w, h)` 拿到的
         // 一定是可用几何——历史遗留的 `0x0` 不会再建出 0 尺寸窗口。
         self.shell.window.clamp_to_usable();
@@ -1475,17 +1514,20 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// Finding 1：非法 `nasUrl` 一律视为「未配置」——托盘的「打开 NAS」据此置灰
-    /// （`tray::sync_menus` 的唯一判据就是这个 `nas_target()`），`commands::open_nas`
-    /// 也走同一取值器，因此不会再出现「菜单可点、点了静默无事发生」。
+    /// Finding 1：非法 `nasUrl` 一律视为「未配置」——`nas_target()` 是唯一取值器，
+    /// 所有消费方（现在只剩 `normalize` 的白名单并入）都据此表现为「没有可用地址」，
+    /// 因此不会再出现「菜单可点、点了静默无事发生」。
+    ///
+    /// 名字里的 `tray` 是历史遗留（T13b fix round 1 订正注释）：托盘「打开 NAS」菜单项、
+    /// `tray::sync_menus` 与 `commands::open_nas` 都已随托盘精简删除；这条用例守的语义
+    /// （非法值解析不出来、合法值能把 origin 并入白名单）没有变，也就没有改测试名。
     #[test]
     fn malformed_nas_url_disables_tray_item() {
         for raw in MALFORMED_URLS {
             let mut c = Config::default();
             c.shell.nas_url = raw.into();
             c.normalize();
-            // 这就是托盘「打开 NAS」置灰的判据本身：`tray::sync_menus` 里写的是
-            // `item.set_enabled(cfg.shell.nas_target().is_some())`
+            // 「未配置」的判据本身：所有消费方都是 `nas_target()` 这一个取值器
             assert_eq!(c.shell.nas_target(), None, "raw={raw:?}");
             // 「保留原文但禁用」：用户输入不被静默删除（与 `homeUrl` 的回落策略不同，
             // 原因见 `ShellConfig::nas_target` 的文档）
@@ -1494,7 +1536,7 @@ mod tests {
             assert!(c.mods.enabled_origins.is_empty(), "raw={raw:?}");
         }
 
-        // 合法值：托盘可点 + origin 并入白名单
+        // 合法值：可解析 + origin 并入白名单
         let mut c = Config::default();
         c.shell.nas_url = " http://192.168.1.10:5666/webui/ ".into();
         c.normalize();
@@ -1995,9 +2037,46 @@ mod tests {
             "a<b.png",
             "a>b.png",
             "a|b.png",
+            // Windows 保留设备名（Minor 2）：读路径会 `Path::join` 这个配置值，
+            // `CON.png` 之类的名字在 Windows 上指向设备而不是配置目录里的文件。
+            // 带不带扩展名、大小写、以及 `NUL.txt` 这种多扩展名形态都算。
+            "CON.png",
+            "con.PNG",
+            "Con.png",
+            "PRN.png",
+            "aux.jpg",
+            "nul.webp",
+            "COM1.png",
+            "com9.jpeg",
+            "LPT1.png",
+            "lpt9.PNG",
+            "NUL.txt.png",
+            "COM1.jpg",
         ] {
             assert_eq!(wallpaper_mime(name), None, "{name:?} 必须被拒");
             assert!(!is_wallpaper_name(name), "{name:?} 必须被拒");
+        }
+        // 设备名判定是**精确**的：含 `con`/`com` 子串的普通名字、以及 `COM10` 这种
+        // 不在文档名单里的形状都必须照常放行（过宽的拒绝会把用户的正常文件名挡在门外）。
+        for ok in [
+            "console.png",
+            "mycon.png",
+            "con-1.png",
+            "com.png",
+            "com0.png",
+            "com10.png",
+            "lpt.png",
+            "lpt0.png",
+            "lpt10.png",
+            "auxiliary.jpg",
+            "null.webp",
+        ] {
+            assert!(is_wallpaper_name(ok), "{ok:?} 不得被设备名规则误伤");
+            assert!(wallpaper_mime(ok).is_some(), "{ok:?}");
+            assert!(!is_windows_device_name(ok), "{ok:?}");
+        }
+        for dev in ["CON", "prn", "Aux", "nul", "COM1", "lpt9", "NUL.txt"] {
+            assert!(is_windows_device_name(dev), "{dev:?}");
         }
         // `wallpaper.png.png` 的具体结论：字符集允许、扩展名判定看**最后**一段，于是它是
         // 「合法形状」——这不是漏洞（名字里没有分隔符就不能穿越，落盘名还会被重新生成），

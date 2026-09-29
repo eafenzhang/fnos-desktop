@@ -171,16 +171,35 @@
    * 为什么不能同步连写：同一帧内两次标题改动会被 WebView2 合并成最后一次（Task 11 的探针
    * 注释记录过同一现象）——那样中间的分片会永远到不了宿主。`setTimeout(…, 0)` 让每片落在
    * 各自的 task 里（宿主侧还有 5 秒窗口兜住「页面卡住」的情形）。
+   *
+   * 返回「**第一片**写出去了没有」：整个序列是同步启动的（`step()` 立刻写第 0 片），所以这个
+   * 布尔值就能回答调用方「这次上报有没有真的开始」（Minor 5 的 `sendReport` 判定要用）。
+   * 后续片失败是页面中途消失这类情形，宿主侧的 5 秒窗口会丢掉半截组装，本层无能为力。
    */
   function sendChunks(chunks) {
     var i = 0;
+    var firstSent = false;
     function step() {
       if (i >= chunks.length) { armTitleRestore(); return; }
       if (!writeTitle(REPORT_CHUNK_PREFIX + i + ',' + chunks.length + ',' + chunks[i])) return;
+      if (i === 0) firstSent = true;
       i += 1;
       later(step, 0);
     }
     step();
+    return firstSent;
+  }
+
+  /**
+   * 这条 `type` 是不是「应用项列表」通道。
+   *
+   * 上游对两个 type 的处理**完全一样**（content-script.js:2853-2868：同一个 `if`，同一个
+   * `sendResponse({items, titles})`），宿主侧也把这两个都分流进应用项槽
+   * （`report.rs::APP_ITEMS_TYPES`，fix round 1 / Minor 4）。这里用同一个判据，
+   * 免得页面侧只认一个、宿主/设置窗认两个——那种不一致正是 Minor 4 的成因。
+   */
+  function isAppItemsType(type) {
+    return type === 'FNOS_GET_LAUNCHPAD_APP_ITEMS' || type === 'FNOS_GET_LAUNCHPAD_APP_TITLES';
   }
 
   /**
@@ -190,14 +209,52 @@
    * （见 `requestAppItems` 的注释），把它写进上报会覆盖掉之前那份真实列表 —— 设置窗的逐项 UI
    * 就会从「有 12 个应用」变成「0 个应用」。状态条依赖的 `FNOS_INJECTION_TRIGGERED`
    * 完全不经过这里（它是 `dir:'out'` 的上游消息，不是应答）。
+   *
+   * **这里不置 `appItemsSeen`**（fix round 1 / Minor 5）：值不值得上报与「有没有真的送出去」
+   * 是两件事，后者只有 `sendReport` 的返回值知道（见 `noteAppItemsSend`）。
    */
   function reportableResponse(type, resp) {
-    if (type !== 'FNOS_GET_LAUNCHPAD_APP_ITEMS' && type !== 'FNOS_GET_LAUNCHPAD_APP_TITLES') return true;
-    var ok = !!(resp && typeof resp === 'object' && Array.isArray(resp.items) && resp.items.length > 0);
-    // 拿到非空列表就不再重试（见 `requestAppItems`）：一次成功之后仍每 6 秒问上游一遍，
-    // 只会让页面白做 DOM 扫描。
-    if (ok) appItemsSeen = true;
-    return ok;
+    if (!isAppItemsType(type)) return true;
+    return !!(resp && typeof resp === 'object' && Array.isArray(resp.items) && resp.items.length > 0);
+  }
+
+  /**
+   * 记一次应用项应答的**结局**（fix round 1 / Minor 5）。
+   *
+   * 旧实现在 `reportableResponse` 里一看到非空列表就置 `appItemsSeen`——那说的是「值得上报」，
+   * 不是「已经送出去了」。于是**一份大到装不下的列表**（剥掉 iconSrc 之后仍超过 8 片 ×
+   * 3000 字节的预算）会把那一份文档的重试循环**永久停掉**：既不再问上游，设置窗又只会说
+   * 「还没收到可用的应答」，用户无从知道真实原因。现在按 `sendReport` 的三种结局分别处理：
+   *
+   * - [`SEND_OK`]：真的送出去了 → 停掉重试（一次成功之后继续每 6 秒问一遍只会让页面白扫 DOM）；
+   * - [`SEND_FAILED`]：与列表大小无关的失败（写标题失败等）→ **不置位**，下一轮重试还有机会；
+   * - [`SEND_TOO_LARGE`]：重发同一份列表永远不会成功（列表大小由页面上的应用数量决定）→
+   *   停掉重试，但**把原因明说**：先记一条 `console.warn`，再沿同一条应用项通道回一条小到
+   *   装得下的诊断 `{items:[],titles:[],tooLarge:true,itemCount:N}`，设置窗据此显示
+   *   「列表过大，无法上报（N 项）」。诊断本身很小（< 200 字节），一定是单条通道。
+   */
+  function noteAppItemsSend(type, verdict, resp) {
+    if (!isAppItemsType(type)) return;
+    if (verdict === SEND_OK) {
+      appItemsSeen = true;
+      appItemsTooLarge = 0;
+      return;
+    }
+    if (verdict !== SEND_TOO_LARGE) return;
+    appItemsSeen = true;
+    appItemsTooLarge = resp && Array.isArray(resp.items) ? resp.items.length : 0;
+    try {
+      if (W.console && typeof W.console.warn === 'function') {
+        W.console.warn('[fnos] 应用项列表过大，无法上报：' + appItemsTooLarge +
+          ' 项（上限 8 片 × ' + REPORT_CHUNK_BODY_MAX_BYTES + ' 字节）');
+      }
+    } catch (e) { /* 页面没有可用 console：不影响上报 */ }
+    sendReport(type, 'response', {
+      items: [],
+      titles: [],
+      tooLarge: true,
+      itemCount: appItemsTooLarge
+    });
   }
 
   /**
@@ -247,27 +304,45 @@
 
   /** 上报给宿主的应答正文（目前只有应用项列表需要**瘦身**，见 [`appItemsForReport`]）。 */
   function responseForReport(type, resp) {
-    if (type === 'FNOS_GET_LAUNCHPAD_APP_ITEMS' || type === 'FNOS_GET_LAUNCHPAD_APP_TITLES') {
+    if (isAppItemsType(type)) {
       return appItemsForReport(resp);
     }
     return resp;
   }
 
+  /* `sendReport` 的三种结局——调用方据此决定要不要重试（Minor 5）。 */
+  /** 控制标题真的写出去了（单条或第一片）。 */
+  var SEND_OK = 'ok';
+  /** **装不下**：正文超过单条通道上限，或分片后超过 8 片。重发同一份列表永远不会成功。 */
+  var SEND_TOO_LARGE = 'too-large';
+  /** 这次没送出去（写标题失败 / 序列化异常）——原因与列表大小无关，值得重试。 */
+  var SEND_FAILED = 'failed';
+
+  /**
+   * 写一条上报，并回答「到底送出去了没有」。
+   *
+   * 返回值是 [`SEND_OK`] / [`SEND_TOO_LARGE`] / [`SEND_FAILED`] 之一。为什么必须区分
+   * `TOO_LARGE` 与 `FAILED`（fix round 1 / Minor 5）：应用项列表的有限重试原本在
+   * `reportableResponse` 里就置了「已见过」标志，于是**一份大到装不下的列表会让这一份文档
+   * 的重试永久停下**，而设置窗只会说「还没收到可用的应答」——用户无从知道真实原因。
+   * 现在只有真的送出（或确定永远送不出去）才停，并且会把后者的原因明说。
+   */
   function sendReport(type, dir, payload) {
-    if (!HOST || !REPORT_TYPES[type]) return;
+    if (!HOST || !REPORT_TYPES[type]) return SEND_FAILED;
     var body;
-    try { body = JSON.stringify({ type: type, dir: dir, payload: payload }); } catch (e) { return; }
-    if (typeof body !== 'string' || body.length === 0 || body.length > REPORT_MAX_CHARS) return;
+    try { body = JSON.stringify({ type: type, dir: dir, payload: payload }); } catch (e) { return SEND_FAILED; }
+    if (typeof body !== 'string' || body.length === 0) return SEND_FAILED;
+    if (body.length > REPORT_MAX_CHARS) return SEND_TOO_LARGE;
     // 小载荷走**既有**的单条路径（语义逐字未变）：状态条依赖的 FNOS_INJECTION_TRIGGERED
     // 就在这里。1000 字符以内即使全是汉字也只有 3000 字节 < 4000，无需测量。
     if (body.length <= 1000 || utf8Length(body) <= REPORT_SINGLE_MAX_BYTES) {
-      if (!writeTitle(REPORT_TITLE_PREFIX + body)) return;
+      if (!writeTitle(REPORT_TITLE_PREFIX + body)) return SEND_FAILED;
       armTitleRestore();
-      return;
+      return SEND_OK;
     }
     var chunks = utf8Chunks(body, REPORT_CHUNK_BODY_MAX_BYTES, REPORT_CHUNK_MAX);
-    if (!chunks) return;
-    sendChunks(chunks);
+    if (!chunks) return SEND_TOO_LARGE;
+    return sendChunks(chunks) ? SEND_OK : SEND_FAILED;
   }
 
   function toDataUrl(mime, text) {
@@ -414,7 +489,9 @@
             // 应答同样只回传**第一次**应答的原文（多个监听者时后到的不是上游的语义结果）。
             // `responseForReport` 只对**上报的那一份**做瘦身（应用项列表剥掉 `iconSrc`，见那里的
             // 注释）；`cb(resp)` 拿到的仍是上游原文。
-            if (!handled && reportableResponse(reportType, resp)) sendReport(reportType, 'response', responseForReport(reportType, resp));
+            if (!handled && reportableResponse(reportType, resp)) {
+              noteAppItemsSend(reportType, sendReport(reportType, 'response', responseForReport(reportType, resp)), resp);
+            }
             handled = true;
             if (typeof cb === 'function') cb(resp);
           });
@@ -480,11 +557,23 @@
    * 之后，列表就会经既有的上报通道（大载荷自动分片）回到宿主。
    *
    * 只发请求、不改页面：应答由上游自己的监听器给出，本层只转发原文。
+   *
+   * 重试的两个停止条件都必须**如实**（fix round 1 / Minor 5）：成功送出（`noteAppItemsSend`
+   * 的 `SEND_OK`），或者确定再问也没用（列表大到装不下 → `appItemsTooLarge` + 一条诊断上报）。
+   * 旧实现在「拿到非空列表」那一刻就停，装不下的列表因此静默地终止了这份文档的整个重试循环。
    */
   var APP_ITEMS_TRIES = 10;
   var APP_ITEMS_INTERVAL_MS = 6000;
-  /** 已经拿到过一份非空的列表（`reportableResponse` 置位）→ 不再重试。 */
+  /**
+   * 已经拿到一份**确实送出去了**的非空列表（`noteAppItemsSend` 置位）→ 不再重试。
+   *
+   * 注意置位点（fix round 1 / Minor 5）：**不在** `reportableResponse` 里——「值得上报」不等于
+   * 「送出去了」。装不下的列表同样会置位（重发没有意义），但原因由 `appItemsTooLarge` 与
+   * 那条诊断上报如实带出去，而不是让设置窗一直猜。
+   */
   var appItemsSeen = false;
+  /** 最近一次「列表大到装不下」的项数（0 = 没发生过）；只用于把原因带进上报与页面 console。 */
+  var appItemsTooLarge = 0;
 
   function perfectIconConfigured() {
     var mods = SHELL.mods || {};

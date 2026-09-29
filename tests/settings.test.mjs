@@ -10,7 +10,7 @@ import assert from 'node:assert/strict';
 import { readdirSync, readFileSync } from 'node:fs';
 import {
   adoptConfig, appItemsFromReport, appListEmptyText, applyIconSelection, compliancePaths,
-  iconChoiceOptions, iconSelectionFor, reportSlots, state,
+  iconChoiceOptions, iconSelectionFor, isTooLargeReport, reportSlots, state,
 } from '../ui/settings/app.js';
 import * as bridge from '../ui/settings/bridge.js';
 import {
@@ -258,7 +258,11 @@ test('F: appItemsFromReport 只认形状（没有上报 / 别的 type / 形状�
   assert.equal(appItemsFromReport({ type: 'FNOS_GET_LAUNCHPAD_APP_TITLES', payload: {} }), null);
 });
 
-test('F: 逐项处置的读写与上游互斥语义一致（cs:755-794）', () => {
+test('F: 逐项处置的读写（上游只保证「重绘盖过另两种」，一个下拉是本壳的写入规范化）', () => {
+  // 订正（fix round 1 / Minor 6）：上游 cs:773-778 **只**把已在 `redrawSet` 里的 key 从
+  // `maskOnlyKeys` / `scaleSelectedKeys` 里剔除，并**没有**在缩放与仅遮罩之间做互斥
+  // （cs:633-652 两个判定各自独立）。所以本用例守的是「本壳写入时每项只留一种」，
+  // 不是「上游要求互斥」。
   const key = '/app-center-static/serviceicon/emby/ui/images/icon_1.png';
   const base = { launchpadIconScaleSelectedKeys: [], launchpadIconMaskOnlyKeys: [], launchpadIconRedrawKeys: [], launchpadIconRedrawMap: {} };
   assert.equal(iconSelectionFor(base, key), 'off');
@@ -278,11 +282,21 @@ test('F: 逐项处置的读写与上游互斥语义一致（cs:755-794）', () =
   assert.deepEqual(scale.launchpadIconRedrawMap, {});
   assert.equal(iconSelectionFor(scale, key), 'scale');
 
-  // 改选「仅遮罩」→ 同上，且与缩放互斥
+  // 改选「仅遮罩」→ 重绘同样被摘掉；「缩放」这一项也被本壳的写入规范化清掉
+  //（上游并不要求两者互斥，见上面的订正；清掉是为了让一个下拉的读数唯一）
   const mask = applyIconSelection(scale, key, 'mask');
   assert.deepEqual(mask.launchpadIconMaskOnlyKeys, [key]);
   assert.deepEqual(mask.launchpadIconScaleSelectedKeys, []);
   assert.equal(iconSelectionFor(mask, key), 'mask');
+
+  // 手工编辑配置让两种同时命中（上游真的允许这么写）→ 读数必须确定（本壳的优先级：遮罩先看）
+  const bothLists = {
+    launchpadIconScaleSelectedKeys: [key],
+    launchpadIconMaskOnlyKeys: [key],
+    launchpadIconRedrawKeys: [],
+    launchpadIconRedrawMap: {},
+  };
+  assert.equal(iconSelectionFor(bothLists, key), 'mask', '两个列表同时命中时读数必须确定');
 
   // 回到「不处理」→ 四个键里都不留这一项
   const off = applyIconSelection(mask, key, 'off');
@@ -356,6 +370,45 @@ test('F: 没有可用列表时的文案据实（四种情形四句话；页面�
     assert.ok(!text.includes(String(evil)), `不得回显：${String(evil).slice(0, 20)}`);
     assert.equal(text.split('\n').length, 1, '文案必须只有一行');
   }
+});
+
+test('F: 列表过大的诊断有专属文案（不再让 UI 干等「还没收到可用的应答」）', () => {
+  // shim 在「装不下」时回的诊断（shim.js::noteAppItemsSend）：它必须被认出来，
+  // 而且**必须排在 `items.length === 0` 之前**——诊断的 items 就是空数组。
+  const diag = {
+    type: 'FNOS_GET_LAUNCHPAD_APP_ITEMS',
+    dir: 'response',
+    payload: { items: [], titles: [], tooLarge: true, itemCount: 260 },
+  };
+  assert.equal(isTooLargeReport(diag), true);
+  const text = appListEmptyText(diag, appItemsFromReport(diag));
+  assert.ok(text.includes('列表过大'), text);
+  assert.ok(text.includes('260'), `必须给出项数：${text}`);
+  assert.ok(text.includes('无法上报'), text);
+  assert.ok(!text.includes('0 个应用项'), `不得说成「上游回报了 0 个应用项」：${text}`);
+  assert.ok(text.includes('打开配置目录'), text);
+  assert.equal(text.split('\n').length, 1, '文案必须只有一行');
+
+  // 判据本身要收紧：别的 type、字符串 "true"、缺 payload 都不算诊断
+  for (const bad of [
+    { type: 'FNOS_CHECK', payload: { tooLarge: true } },
+    { type: 'FNOS_GET_LAUNCHPAD_APP_ITEMS', payload: { tooLarge: 'true', itemCount: 9 } },
+    { type: 'FNOS_GET_LAUNCHPAD_APP_ITEMS', payload: {} },
+    { type: 'FNOS_GET_LAUNCHPAD_APP_ITEMS' },
+    null,
+    'x',
+  ]) {
+    assert.equal(isTooLargeReport(bad), false, `不得被当成诊断：${JSON.stringify(bad)}`);
+  }
+  // 没有项数（或项数不是有限数）时也不能把页面可控文本插进文案
+  const noCount = appListEmptyText(
+    { type: 'FNOS_GET_LAUNCHPAD_APP_ITEMS', payload: { tooLarge: true, itemCount: '很多很多' } }, []
+  );
+  assert.ok(noCount.includes('列表过大'), noCount);
+  assert.ok(!noCount.includes('很多很多'), noCount);
+  // 正常的空列表文案没有被这条新分支吞掉
+  assert.ok(appListEmptyText({ type: 'FNOS_GET_LAUNCHPAD_APP_ITEMS', payload: { items: [] } }, [])
+    .includes('0 个应用项'));
 });
 
 test('F: 应用项列表取不到时各种形状都不会被当成「有数据」', () => {

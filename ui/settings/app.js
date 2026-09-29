@@ -12,7 +12,9 @@
 //    `reload_main`——Rust 侧销毁并按新载荷重建主窗口（§6.6 勘误）。
 //
 // 另外两条窗口级行为：
-// - **焦点刷新**（`refresh`）：托盘等带外改动不发事件，重新获得焦点时重取配置。
+// - **焦点刷新**（`refresh`）：带外改动（手工编辑 `config.json`、将来任何新增的写入方）
+//   不发事件，重新获得焦点时重取配置。托盘精简后托盘侧只剩「退出前保存窗口几何」
+//   （`tray.rs` → `commands::save_window_geom`），不再有配置开关；见 `refresh` 的注释。
 // - **关于页外链**：不在窗内导航，交给 Rust `open_url` → 系统默认浏览器。
 import { SCHEMA, UPSTREAM_REPO, VENDOR_DIR, PREFECT_ICONS, prefectIconPath } from './schema.js';
 import { MODS_KEYS, normalizeModsEntry, parseHttpOrigin, DEFAULT_BRAND_COLOR } from './normalize.js';
@@ -178,14 +180,45 @@ async function commit(key, value, node) {
 //   - 光有 `launchpadIconRedrawMap[key]` 不够：`redrawKeys` 也必须包含 key，
 //     上游用 `normalizeLaunchpadKeyList(redrawKeys).filter(k => typeof map[k] === 'string')`
 //     重建 `currentLaunchpadIconRedrawMap`（cs:764-772）；
-//   - `maskOnlyKeys` 与 `scaleSelectedKeys` 都会被**剔除**掉已经在 `redrawSet` 里的 key
-//     （cs:773-778）——三种处置互斥，重绘优先；
+//   - **重绘优先于另外两种**：`maskOnlyKeys` 与 `scaleSelectedKeys` 都会被剔除掉已经在
+//     `redrawSet` 里的 key（cs:773-778）；
 //   - 三种处置**全部**受 `launchpadIconScaleEnabled` 总开关约束
 //     （cs:644-648 的 `enabled && shouldXxx(...)`）。
 // 所以逐项 UI 每个应用只有一个「处置」：不处理 / 缩放 / 仅遮罩 / 重绘为某个内置图标。
+//
+// **订正（fix round 1 / Minor 6）**：上一条曾写成「三种处置互斥，重绘优先」——**这是错的**。
+// cs:773-778 只做了「把已在 `redrawSet` 里的 key 从另外两个 list 里删掉」这一件事；上游**没有**
+// 在 `maskOnlyKeys` 与 `scaleSelectedKeys` 之间做任何互斥（cs:633-652 里两个判定各自独立，
+// 一个 key 可以同时 `shouldScale` 与 `shouldMaskOnly`，两个 class 都会被 toggle 上）。
+// 真正成立的性质只有两条：① 重绘会盖过另外两种；② 三种都受总开关约束。
+//
+// 那么「一个下拉、四种取值」的 UI 模型还站得住吗？**站得住，但理由是 UI 自己的选择**：
+// 一个下拉天然只能表达一个值（这正是「每项一个处置」的交互模型），而它写出去的四个键在
+// 上游那边**各自独立生效**（`applyIconSelection` 每次都先把这一项的三种成员身份全清掉、
+// 只加回选中的那一种，见那里的注释），所以「下拉选了 A 就不会再留着 B」是**本壳写入时的
+// 规范化**，不是上游强制的互斥。用户若手工在配置里同时写上两个 list，页面会两个都应用——
+// 这与上面两条真性质都不冲突。
 
 /** 应用项上报被接受的两个 type（上游 cs:2853-2855 的同一个分支）。 */
 const APP_ITEM_REPORT_TYPES = ['FNOS_GET_LAUNCHPAD_APP_ITEMS', 'FNOS_GET_LAUNCHPAD_APP_TITLES'];
+
+/**
+ * 这条上报是不是 shim 在「列表大到装不下」时回的**诊断**（fix round 1 / Minor 5）。
+ *
+ * 形状由 `src-tauri/inject/shim.js::noteAppItemsSend` 定义：`{items:[],titles:[],tooLarge:true,
+ * itemCount:N}`。它走的是**同一条**应用项通道（宿主的分流判据只看 type），所以宿主侧不需要
+ * 任何新命令/新槽位，设置窗只是多认一个字段。
+ *
+ * 为什么需要它：清单大到超过分片预算时，shim 不会发那份列表（越界即拒），而重发同一份列表
+ * 永远不会成功、重试循环因此停下。没有这条诊断的话，UI 只会说「还没收到可用的应答」——
+ * 一个永远等不到结果的谎。`tooLarge === true` 用严格比较：页面可控的 `"true"` 字符串不算。
+ */
+export function isTooLargeReport(report) {
+  if (!report || typeof report !== 'object') return false;
+  if (APP_ITEM_REPORT_TYPES.indexOf(report.type) < 0) return false;
+  const payload = report.payload;
+  return !!payload && typeof payload === 'object' && payload.tooLarge === true;
+}
 
 /**
  * 从最近一次页面上报里取出应用项列表；取不到（没上报 / 形状不对）返回 `null`。
@@ -221,7 +254,7 @@ export function iconSelectionFor(mods, key) {
 }
 
 /**
- * 把一个应用项的处置换算成四个键的**下一个值**（互斥规则见上面的文件级注释）。
+ * 把一个应用项的处置换算成四个键的**下一个值**（四条键的语义与「重绘优先」见上面的文件级注释）。
  *
  * 返回的对象用配置键名做字段（可以直接 `set_config`）；`config` 只读不改。
  */
@@ -234,7 +267,9 @@ export function applyIconSelection(mods, key, choice) {
     ? { ...m.launchpadIconRedrawMap }
     : {};
 
-  // 先把这一项的三种处置全清掉，再按需要加回唯一的一种（上游也是「互斥」语义）
+  // 先把这一项的三种成员身份全清掉，再按需要加回唯一的一种。这是**本壳写入时的规范化**：
+  // 一个下拉只能表达一个值，而四个键在上游各自独立生效（上游只保证「重绘盖过另外两种」，
+  // 见文件级注释的订正）。
   scale.delete(key);
   mask.delete(key);
   redraw.delete(key);
@@ -277,13 +312,24 @@ export const MAX_WALLPAPER_BYTES = 8 * 1024 * 1024;
 /**
  * 「没有可用应用项列表」时的**如实**说明。
  *
- * 四种情形必须说四种话（`null` 与 `[]` 是不同的事实）：
+ * 五种情形必须说五种话（`null` 与 `[]` 是不同的事实）：
+ * - 上游的列表**大到装不下**（shim 回的诊断）→ 说清「列表过大，无法上报」并给出项数；
  * - 没有任何应用项上报 → 「还没收到」，并说明它什么时候才会有（启动台渲染出应用图标时）；
  * - 只是 shim 自己发出的**请求**（`dir === 'out'`）→ 「已经问过，但还没有可用的应答」；
  * - 有应答但形状不对 → 「已按拒绝处理」，不画任何项；
  * - 别种 type → 把 type 说出来（只回显形如 `FNOS_XXX` 的串，页面可控文本不原样进 UI）。
  */
 export function appListEmptyText(report, items) {
+  // 列表过大这条**必须排在 `items.length === 0` 之前**：shim 的诊断上报里 items 就是空数组
+  // （它只能是空的——装得下就不叫过大了），排在后面会把它误说成「上游回报了 0 个应用项」。
+  // `itemCount` 是宿主算出来的数字（Number.isFinite 收口），页面可控文本一个字符都不进文案。
+  if (isTooLargeReport(report)) {
+    const n = Number(report.payload.itemCount);
+    const howMany = Number.isFinite(n) && n > 0 ? `${n} 个` : '过多';
+    return `应用项列表过大（${howMany}），超过分片上报的预算（8 片 × 3000 字节），无法上报：`
+      + '设置窗因此拿不到逐项列表。请减少启动台中的应用数量，或点下面的「打开配置目录」手工编辑'
+      + '（逐项映射写在 `launchpadIconRedrawMap` / `launchpadIconRedrawKeys`）。';
+  }
   if (items && items.length === 0) {
     return '上游回报了 0 个应用项：启动台的图标还没渲染出来时只能收集到空列表。'
       + '请回到主窗口打开一次启动台，再切回本窗口（会自动刷新）。';
@@ -993,13 +1039,18 @@ function sameConfig(a, b) {
 /**
  * 重取配置**与主窗口状态**并就地重渲染（Review finding C + Task 11）。
  *
- * 为什么需要：托盘「注入 mods」勾选项走 `commands::set_inject_enabled`，它只改
- * `AppState` + 落盘 + `sync_menus`，**不向设置窗发任何事件**；而本窗只在 `boot()` 取过
- * 一次配置，于是带外改动后它会一直显示过期值，直到关掉重开。窗口重新获得焦点时刷新是
- * 最小实现：不引入事件总线、不改 Rust 侧。
+ * 为什么需要：配置可以被本窗**之外**的入口改动（`set_config` 的带外调用、手工编辑
+ * `config.json` 后重启、以及将来任何新增的写入方），而那些入口**不向设置窗发任何事件**；
+ * 本窗只在 `boot()` 取过一次配置，于是带外改动后它会一直显示过期值，直到关掉重开。
+ * 窗口重新获得焦点时刷新是最小实现：不引入事件总线、不改 Rust 侧。
+ *
+ * 注（T13b fix round 1 订正注释）：托盘曾有一个「注入 mods」勾选项，走
+ * `commands::set_inject_enabled` + `tray::sync_menus`；托盘精简后勾选项与 `sync_menus`
+ * 都已删除，开关只剩设置窗这一个入口（`schema.js` 的 `shell.injectEnabled`）。
+ * 这条焦点刷新对**任何**带外改动仍然必要，所以保留。
  *
  * Task 11 的状态条复用同一个钩子，但它要的数据比配置多一份：主窗口**可以在不改任何
- * 配置**的情况下导航（用户在页面里点链接、托盘「打开 NAS」、错误页自动重试……），
+ * 配置**的情况下导航（用户在页面里点链接、错误页自动重试……），
  * 所以 `get_page_state` 必须每次刷新都取——不能挂在「配置变了」这个条件上。反过来，
  * 配置没变时依旧**不重渲染 #pane**（否则每次 alt-tab 回来都会重建 DOM、丢掉用户正在
  * 输入却尚未提交的文本）。

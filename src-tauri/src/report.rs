@@ -94,6 +94,17 @@ pub const REPORT_TYPES: [&str; 5] = [
 /// （[`crate::commands::AppState::page_report`]）。理由见 [`is_app_items_report`]。
 pub const APP_ITEMS_TYPE: &str = "FNOS_GET_LAUNCHPAD_APP_ITEMS";
 
+/// 上游**同一个分支**里的另一个请求类型，应答形状与 [`APP_ITEMS_TYPE`] 逐字相同。
+///
+/// 上游对这两个 type 的处理完全一样（`content-script.js:2853-2868`：同一个 `if` 里先
+/// `collectLaunchpadAppItems()`，再 `sendResponse({items, titles})`），所以从宿主的角度看
+/// 它们不是两种东西——必须走同一条上行通道（详见 [`is_app_items_report`] 的分流论证）。
+pub const APP_ITEMS_TITLES_TYPE: &str = "FNOS_GET_LAUNCHPAD_APP_TITLES";
+
+/// 进「应用项列表」槽位的 `type` 集合（`ui/settings/app.js` 的 `APP_ITEM_REPORT_TYPES`
+/// 必须与它集合相等，`tests/contract.test.mjs` 逐字锁着这件事）。
+pub const APP_ITEMS_TYPES: [&str; 2] = [APP_ITEMS_TYPE, APP_ITEMS_TITLES_TYPE];
+
 /// 这条**已通过校验**的上报是不是「应用项列表」通道（Task 13b）。
 ///
 /// ## 为什么必须分流（T13b 审计发现）
@@ -111,14 +122,29 @@ pub const APP_ITEMS_TYPE: &str = "FNOS_GET_LAUNCHPAD_APP_ITEMS";
 /// **功能回归**（需求 D 明确点名「诚实的状态条」不许回归）。
 ///
 /// 分流之后：状态槽只收「不是应用项列表」的上报（`FNOS_INJECTION_TRIGGERED` 因此不会被
-/// 覆盖），应用项槽只收这一种。两个槽位都仍然受文档身份门约束
+/// 覆盖），应用项槽只收 [`APP_ITEMS_TYPES`] 里的两种。两个槽位都仍然受文档身份门约束
 /// （[`ReportEntry::matches_document`]），都由 `commands::get_page_report` 一并返回。
 ///
 /// 注意 `dir` **不**参与分流：请求与应答都属于「应用项列表」这件事，UI 自己按 `dir` 区分
 /// 「已经问过、还没有可用应答」与「拿到了应答但形状不对」两种文案（见
 /// `ui/settings/app.js::appListEmptyText`）。
+///
+/// ## 为什么 `FNOS_GET_LAUNCHPAD_APP_TITLES` 也算（fix round 1 / Minor 4）
+///
+/// 早先这里只认 [`APP_ITEMS_TYPE`]，而设置窗的 `APP_ITEM_REPORT_TYPES` 认两个。两侧不一致
+/// 的直接后果是：**任何人真的请求过 titles，那条 `{items,titles}` 应答就会被塞进状态槽**
+/// ——正好把上面第 3 条的功能回归重新引回来（而且逐项 UI 也永远读不到它）。
+/// 「让两侧一致」有两条路：把 JS 的 titles 收窄，或者把宿主的判据放宽。**选了后者**，理由：
+/// 上游对两个 type 的应答**形状逐字相同**（同一个 `if`、同一个 `sendResponse`），把它们当成
+/// 两种东西没有任何事实依据；而 shim 的 `sendAppItems`/`responseForReport` 早已按
+/// 「两个 type 都算应用项」写好（`inject/shim.js` 的 `isAppItemsType` 同义），收窄 JS 反而会让
+/// 页面侧与设置窗对同一份上报有两种解释。判别式因此是「type ∈ [`APP_ITEMS_TYPES`]」，
+/// 而不是「type == 某一个」。
 pub fn is_app_items_report(value: &Value) -> bool {
-    value.get("type").and_then(Value::as_str) == Some(APP_ITEMS_TYPE)
+    value
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|ty| APP_ITEMS_TYPES.contains(&ty))
 }
 
 /// 允许出现在日志里的上报**方向**标签——逐字取自本壳 shim 的两处 `sendReport` 调用点
@@ -1187,13 +1213,18 @@ mod tests {
         assert!(slot.is_none());
     }
 
-    /// **T13b 审计发现的核心用例**：只有「应用项列表」那一种 type 进应用项槽。
+    /// **T13b 审计发现的核心用例**（fix round 1 / Minor 4 起覆盖**两个** type）。
     ///
     /// 分流错了的两种表现都很坏：漏分流 = T13a 的状态条强态被自己的列表拉取冲掉（功能回归）；
     /// 分错方向 = 状态槽收到一条永远升不了级的应用项上报。请求（`dir:'out'`）与应答
     /// （`dir:'response'`）**都**算应用项通道——`dir` 只是给 UI 区分文案用的。
+    ///
+    /// `FNOS_GET_LAUNCHPAD_APP_TITLES` 与 `FNOS_GET_LAUNCHPAD_APP_ITEMS` **同属**这条通道：
+    /// 上游在同一个 `if` 里用同一个 `sendResponse({items, titles})` 应答两者
+    /// （`content-script.js:2853-2868`），把它们分开处理只会凭空造出「titles 应答冲掉状态条」
+    /// 这条回路（Minor 4）。
     #[test]
-    fn only_the_app_items_type_is_routed_to_the_app_items_slot() {
+    fn only_the_app_items_types_are_routed_to_the_app_items_slot() {
         for v in [
             json!({ "type": "FNOS_GET_LAUNCHPAD_APP_ITEMS", "dir": "out", "payload": {} }),
             json!({
@@ -1201,18 +1232,24 @@ mod tests {
                 "dir": "response",
                 "payload": { "items": [], "titles": [] }
             }),
+            json!({ "type": "FNOS_GET_LAUNCHPAD_APP_TITLES", "dir": "out", "payload": {} }),
+            json!({
+                "type": "FNOS_GET_LAUNCHPAD_APP_TITLES",
+                "dir": "response",
+                "payload": { "items": [{ "key": "/a/icon_1.png", "title": "x" }], "titles": ["x"] }
+            }),
         ] {
             assert!(is_app_items_report(&v), "必须分流到应用项槽：{v}");
         }
         for v in [
             json!({ "type": "FNOS_INJECTION_TRIGGERED", "dir": "out" }),
-            json!({ "type": "FNOS_GET_LAUNCHPAD_APP_TITLES", "dir": "response" }),
             json!({ "type": "FNOS_APPLY", "dir": "response" }),
             json!({ "type": "FNOS_CHECK" }),
             json!({ "dir": "out" }),
             json!({ "type": 7 }),
             json!(null),
             json!("FNOS_GET_LAUNCHPAD_APP_ITEMS"),
+            json!({ "type": "fnos_get_launchpad_app_items" }),
         ] {
             assert!(
                 !is_app_items_report(&v),
@@ -1220,9 +1257,17 @@ mod tests {
             );
         }
         // 分流出来的 type 必须在允许表内，否则它永远过不了 `validate`，分流本身没有意义
-        assert!(
-            REPORT_TYPES.contains(&APP_ITEMS_TYPE),
-            "APP_ITEMS_TYPE 必须在 REPORT_TYPES 允许表内"
+        for ty in APP_ITEMS_TYPES {
+            assert!(
+                REPORT_TYPES.contains(&ty),
+                "{ty} 必须在 REPORT_TYPES 允许表内"
+            );
+        }
+        // 分流集合**恰好**是这两个（多一个就是死条目，少一个就有上文那条回归）
+        assert_eq!(
+            APP_ITEMS_TYPES,
+            [APP_ITEMS_TYPE, APP_ITEMS_TITLES_TYPE],
+            "分流集合只允许这两个 type"
         );
         // 上游真正会回的那条应答（`{items,titles}`）确实能被分流（形状与 content-script.js 一致）
         let resp = json!({

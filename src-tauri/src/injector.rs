@@ -140,11 +140,99 @@ impl WallpaperAsset {
     }
 }
 
+/// 「读文件之前」这道门的结论（纯函数的返回值，见 [`precheck_wallpaper_len`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Precheck {
+    /// 长度与文件类型都可以读。
+    Readable,
+    /// 不是一个普通文件（目录 / 设备 / 命名管道……）。
+    NotAFile,
+    /// 超过 [`MAX_WALLPAPER_BYTES`]。
+    TooLarge,
+    /// 长度为 0。
+    Empty,
+}
+
+/// **读文件之前**的准入判定：只吃 `metadata` 就能拿到的两个事实（长度、是不是普通文件）。
+///
+/// ## 为什么这道门必须在 `fs::read` **之前**（Review fix round 1 / Important）
+///
+/// 壁纸的文件名是**用户可编辑**的配置值，而设置窗明确提供「打开配置目录」——所以配置目录里
+/// 完全可能被放进（或软链到）一个巨大的文件。旧实现先 `std::fs::read` 再比
+/// `bytes.len() > MAX_WALLPAPER_BYTES`，于是超限文件会被**整份分配**进内存：
+/// 需求承诺的是「记一行日志、优雅跳过」，而分配失败是 abort（整个进程直接死）。
+/// `fs::metadata` 只看目录项，是 O(1) 的；长度已知之后，超限文件一个字节都不会被读。
+///
+/// `is_file` 同样在这里判：目录/设备也能通过 `metadata`，但 `read` 它们要么失败要么没有意义。
+/// 注意 `fs::metadata` **跟随软链**（等价于 `stat`），所以「软链到一个超大的普通文件」也会
+/// 在这里被长度挡住——这正是不希望把链接目标整份读进来的场景。
+///
+/// 抽成纯函数是为了让单测直接驱动边界值（0 / 恰好上限 / 上限 +1 / 非普通文件），
+/// 不必每次都造 8 MiB 的真文件；`precheck_rejects_oversize_empty_and_non_files` 驱动边界，
+/// `load_wallpaper_skips_missing_oversized_and_illegal_files` 用**真文件** + 读数计数器佐证。
+fn precheck_wallpaper_len(len: u64, is_file: bool) -> Precheck {
+    if !is_file {
+        return Precheck::NotAFile;
+    }
+    if len > MAX_WALLPAPER_BYTES as u64 {
+        return Precheck::TooLarge;
+    }
+    if len == 0 {
+        return Precheck::Empty;
+    }
+    Precheck::Readable
+}
+
+// 测试用：**本线程**对壁纸文件做系统调用的次数（两个计数器分开）。
+//
+// 存在的唯一目的是让两条性质成为**可断言的事实**，而不是只断言「结果是空的」：
+// ① 「超限时一次字节都没读」= `stat > 0` 而 `read == 0`；
+// ② 「注入关闭时一次文件 IO 都没做」= 两个都是 0。
+// 用 thread-local 而不是全局原子量：cargo 的测试线程池会并行跑用例，全局计数会互相干扰。
+// （写成 `//` 而不是 `///`：下面是宏调用，rustdoc 不给宏展开生成文档，`///` 会触发
+//  unused_doc_comments —— 而本项目的门禁要求 0 warning。）
+#[cfg(test)]
+thread_local! {
+    static WALLPAPER_STAT_ATTEMPTS: std::cell::Cell<usize> = std::cell::Cell::new(0);
+    static WALLPAPER_READ_ATTEMPTS: std::cell::Cell<usize> = std::cell::Cell::new(0);
+}
+
+#[cfg(test)]
+fn wallpaper_stat_attempts() -> usize {
+    WALLPAPER_STAT_ATTEMPTS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn wallpaper_read_attempts() -> usize {
+    WALLPAPER_READ_ATTEMPTS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn reset_wallpaper_io_counters() {
+    WALLPAPER_STAT_ATTEMPTS.with(|c| c.set(0));
+    WALLPAPER_READ_ATTEMPTS.with(|c| c.set(0));
+}
+
+/// 生产代码里没有任何调用点（`#[cfg(test)]`）——见上面两个计数器。
+#[cfg(test)]
+fn note_wallpaper_stat_attempt() {
+    WALLPAPER_STAT_ATTEMPTS.with(|c| c.set(c.get() + 1));
+}
+
+#[cfg(test)]
+fn note_wallpaper_read_attempt() {
+    WALLPAPER_READ_ATTEMPTS.with(|c| c.set(c.get() + 1));
+}
+
 /// 从 `dir` 读登录壁纸；任何一步不满足都返回 `None` 并记一行日志（**永不 panic**）。
 ///
-/// 校验顺序：配置里有名字 → 名字形状与扩展名合法（[`config::wallpaper_mime`]）→ 文件可读 →
-/// 非空 → 不超 [`MAX_WALLPAPER_BYTES`]。之所以把形状判定放在读文件之前：不合法时连
-/// `Path::join` 都不做（名字里不可能有分隔符，但「先不信、先判」比「先拼路径」更容易审计）。
+/// 校验顺序：配置里有名字 → 名字形状与扩展名合法（[`config::wallpaper_mime`]）→
+/// **`metadata` 预检（普通文件 / 非空 / 不超上限，见 [`precheck_wallpaper_len`]）** → 读文件 →
+/// 读完之后再核一次大小（TOCTOU：预检与读之间文件可能被换掉或长大；这一步只保证**结果**正确，
+/// 「不整份分配」由预检保证）。
+///
+/// 之所以把形状判定也放在读文件之前：不合法时连 `Path::join` 都不做（名字里不可能有分隔符，
+/// 但「先不信、先判」比「先拼路径」更容易审计）。
 ///
 /// 日志里的名字都过 `[report::log_safe]`（形状判定已经拒掉控制字符，这里是纵深防御），
 /// 页面/用户可控文本不可能在 stderr 里伪造出换行。
@@ -162,6 +250,46 @@ fn load_wallpaper_from(dir: &std::path::Path, cfg: &Config) -> Option<WallpaperA
         return None;
     };
     let path = dir.join(name);
+    #[cfg(test)]
+    note_wallpaper_stat_attempt();
+    let meta = match std::fs::metadata(&path) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!(
+                "[fnos] 登录壁纸读取失败（已跳过）：{} — {e}",
+                report::log_safe(name)
+            );
+            return None;
+        }
+    };
+    match precheck_wallpaper_len(meta.len(), meta.is_file()) {
+        Precheck::Readable => {}
+        Precheck::NotAFile => {
+            eprintln!(
+                "[fnos] 登录壁纸不是一个普通文件（已跳过，未读文件）：{}",
+                report::log_safe(name)
+            );
+            return None;
+        }
+        Precheck::TooLarge => {
+            eprintln!(
+                "[fnos] 登录壁纸超过 {} MiB 上限（已跳过，未读文件）：{} 实为 {} 字节",
+                MAX_WALLPAPER_BYTES / 1024 / 1024,
+                report::log_safe(name),
+                meta.len()
+            );
+            return None;
+        }
+        Precheck::Empty => {
+            eprintln!(
+                "[fnos] 登录壁纸是空文件（已跳过，未读文件）：{}",
+                report::log_safe(name)
+            );
+            return None;
+        }
+    }
+    #[cfg(test)]
+    note_wallpaper_read_attempt();
     let bytes = match std::fs::read(&path) {
         Ok(b) => b,
         Err(e) => {
@@ -172,17 +300,10 @@ fn load_wallpaper_from(dir: &std::path::Path, cfg: &Config) -> Option<WallpaperA
             return None;
         }
     };
-    if bytes.is_empty() {
+    // TOCTOU：预检之后文件可能被换掉/长大（预检只管「不因为一个本来就超限的文件去分配内存」）。
+    if bytes.is_empty() || bytes.len() > MAX_WALLPAPER_BYTES {
         eprintln!(
-            "[fnos] 登录壁纸是空文件（已跳过）：{}",
-            report::log_safe(name)
-        );
-        return None;
-    }
-    if bytes.len() > MAX_WALLPAPER_BYTES {
-        eprintln!(
-            "[fnos] 登录壁纸超过 {} MiB 上限（已跳过）：{} 实为 {} 字节",
-            MAX_WALLPAPER_BYTES / 1024 / 1024,
+            "[fnos] 登录壁纸在预检之后变了（已跳过）：{} 实读 {} 字节",
             report::log_safe(name),
             bytes.len()
         );
@@ -297,7 +418,17 @@ fn wrap_upstream(content: &str) -> String {
     )
 }
 
+/// 生产入口：配置 → initialization_script。
+///
+/// **注入关闭时在读壁纸之前就返回**（Review fix round 1 / Minor 1）：早先的写法是
+/// `build_init_script_with(cfg, load_wallpaper(cfg))` —— 参数先求值，于是哪怕
+/// `inject_enabled == false`（脚本最终一定是空的），也会去配置目录读一次壁纸，
+/// 配置里写了个不存在/超大/非法的名字时还会打出一行「登录壁纸读取失败（已跳过）」这种
+/// 与用户实际状态无关的噪声。现在关态一次文件 IO 都不做。
 pub fn build_init_script(cfg: &Config) -> String {
+    if !cfg.shell.inject_enabled {
+        return String::new();
+    }
     build_init_script_with(cfg, load_wallpaper(cfg))
 }
 
@@ -514,6 +645,51 @@ mod tests {
         cfg.mods.launchpad_icon_scale_enabled = true;
         cfg.local.login_wallpaper_file_name = Some("wallpaper.png".into());
         assert!(build_init_script(&cfg).is_empty());
+    }
+
+    /// **Minor 1 的正面证据**：注入关闭时壁纸路径**一次文件 IO 都不做**。
+    ///
+    /// 只断言「脚本是空的」是不够的——旧实现同样返回空脚本，但它已经拿着配置里的名字去
+    /// `Path::join` + `fs::metadata`/`fs::read` 过了（文件缺失时还会打一行「登录壁纸读取失败」
+    /// 的噪声日志）。这里用**读文件尝试计数器**把「有没有走到 `fs::read`」变成可断言的事实：
+    /// 关态必须是 0，而同一个配置把注入打开后必须是 1（否则计数器恒 0，上面的断言没有意义）。
+    ///
+    /// 计数器同样钉住 [`precheck_wallpaper_len`] 这道门在**读之前**：注入开着但壁纸超限时，
+    /// 读尝试次数仍然是 0（见 `load_wallpaper_skips_missing_oversized_and_illegal_files`）。
+    #[test]
+    fn injection_off_does_not_touch_the_wallpaper_file_at_all() {
+        let mut cfg = Config::default();
+        cfg.local.login_wallpaper_file_name = Some("not-there-at-all.png".into());
+        cfg.shell.inject_enabled = false;
+
+        reset_wallpaper_io_counters();
+        assert!(build_init_script(&cfg).is_empty());
+        assert_eq!(
+            wallpaper_stat_attempts(),
+            0,
+            "注入关闭时不得对壁纸文件做任何系统调用（连 metadata 都不做）"
+        );
+        assert_eq!(wallpaper_read_attempts(), 0, "更不得读文件");
+
+        // 反证：同一份配置打开注入（文件不存在）→ 真的做了一次 metadata，读失败被跳过
+        cfg.shell.inject_enabled = true;
+        let script = build_init_script(&cfg);
+        assert!(!script.is_empty(), "注入打开后必须产出载荷");
+        assert_eq!(
+            wallpaper_stat_attempts(),
+            1,
+            "注入打开时必须真的碰一次这个路径（否则上面那 0 是恒真的空断言）"
+        );
+        assert_eq!(
+            wallpaper_read_attempts(),
+            0,
+            "文件不存在：预检就该挡住，没到 fs::read"
+        );
+        // 读不到的壁纸不得进载荷（配置段里当然还有那个文件名——那是配置值本身，不是资产）
+        assert!(
+            payload_json(&script).get("binaryAssets").is_none(),
+            "读不到的壁纸不得让载荷多出 binaryAssets"
+        );
     }
 
     #[test]
@@ -852,21 +1028,45 @@ mod tests {
         std::fs::write(dir.join("huge.png"), vec![0u8; MAX_WALLPAPER_BYTES + 1]).unwrap();
         let mut huge = Config::default();
         huge.local.login_wallpaper_file_name = Some("huge.png".into());
+        reset_wallpaper_io_counters();
         assert!(load_wallpaper_from(&dir, &huge).is_none());
-        // 正好等于上限：允许（上限是「含」上限）
+        assert_eq!(wallpaper_stat_attempts(), 1, "预检必须看一次 metadata");
+        assert_eq!(
+            wallpaper_read_attempts(),
+            0,
+            "超限文件一个字节都不许读（旧实现是整份读进内存再比长度）"
+        );
+        // 正好等于上限：允许（上限是「含」上限）——这一条同时是上面那条的反证：真的读了
         std::fs::write(dir.join("exact.png"), vec![7u8; MAX_WALLPAPER_BYTES]).unwrap();
         let mut exact = Config::default();
         exact.local.login_wallpaper_file_name = Some("exact.png".into());
+        reset_wallpaper_io_counters();
         assert_eq!(
             load_wallpaper_from(&dir, &exact).map(|a| a.bytes.len()),
             Some(MAX_WALLPAPER_BYTES)
         );
+        assert_eq!(wallpaper_stat_attempts(), 1);
+        assert_eq!(wallpaper_read_attempts(), 1, "上限之内必须真的读出来");
 
         // 空文件
         std::fs::write(dir.join("empty.png"), []).unwrap();
         let mut empty = Config::default();
         empty.local.login_wallpaper_file_name = Some("empty.png".into());
+        reset_wallpaper_io_counters();
         assert!(load_wallpaper_from(&dir, &empty).is_none());
+        assert_eq!(
+            wallpaper_read_attempts(),
+            0,
+            "空文件同样在预检里被挡住（不必读一次才知道它是空的）"
+        );
+
+        // 不是一个普通文件（名字指向目录）：预检的 is_file() 分支，优雅跳过而不是读失败
+        std::fs::create_dir_all(dir.join("adir.png")).unwrap();
+        let mut adir = Config::default();
+        adir.local.login_wallpaper_file_name = Some("adir.png".into());
+        reset_wallpaper_io_counters();
+        assert!(load_wallpaper_from(&dir, &adir).is_none());
+        assert_eq!(wallpaper_read_attempts(), 0, "目录不得被 fs::read");
 
         // 扩展名不在允许表内（文件确实存在也不读）
         std::fs::write(dir.join("anim.gif"), b"GIF89a").unwrap();
@@ -907,5 +1107,27 @@ mod tests {
         assert_eq!(asset.key, "my wall 壁纸.png", "键只做 ASCII 小写化");
         assert_eq!(asset.mime, "image/png");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 读文件**之前**那道门的边界值（纯函数，直接驱动，不造 8 MiB 文件）。
+    ///
+    /// 上限的两个方向都要钉住：恰好 8 MiB 必须放行（「含」上限），8 MiB + 1 必须挡住；
+    /// 非普通文件与空文件也在这道门里（而不是等 `fs::read` 去失败——那对目录/设备是另一套语义）。
+    #[test]
+    fn precheck_rejects_oversize_empty_and_non_files() {
+        let cap = MAX_WALLPAPER_BYTES as u64;
+        assert_eq!(precheck_wallpaper_len(cap, true), Precheck::Readable);
+        assert_eq!(precheck_wallpaper_len(1, true), Precheck::Readable);
+        assert_eq!(precheck_wallpaper_len(cap + 1, true), Precheck::TooLarge);
+        assert_eq!(
+            precheck_wallpaper_len(u64::MAX, true),
+            Precheck::TooLarge,
+            "离谱的大值同样只是「跳过」，不得溢出/panic"
+        );
+        assert_eq!(precheck_wallpaper_len(0, true), Precheck::Empty);
+        assert_eq!(precheck_wallpaper_len(0, false), Precheck::NotAFile);
+        assert_eq!(precheck_wallpaper_len(1, false), Precheck::NotAFile);
+        // 非普通文件优先于长度判定：一个巨大的目录项也只想说「这不是普通文件」
+        assert_eq!(precheck_wallpaper_len(cap + 1, false), Precheck::NotAFile);
     }
 }

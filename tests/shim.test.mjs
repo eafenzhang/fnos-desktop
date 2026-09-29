@@ -474,9 +474,15 @@ test('超过 8 片能装下的上报在页面侧就不发（宿主侧有同样�
     [],
     '装不下就一片都不发（半条上报没有任何意义）'
   );
-  // 只有「请求本身」那一条单条上报（dir:'out'）
-  assert.equal(writes.length, 1);
+  // 两条单条上报：①「请求本身」（dir:'out'）；② shunt 在确定装不下之后回的**诊断**
+  // （fix round 1 / Minor 5：不能只是静默停止，否则设置窗永远不知道发生了什么）。
+  assert.equal(writes.length, 2, `请求 + 过大诊断：${JSON.stringify(writes.map((t) => t.slice(0, 40)))}`);
   assert.equal(JSON.parse(writes[0].slice(REPORT_PREFIX.length)).dir, 'out');
+  const diag = JSON.parse(writes[1].slice(REPORT_PREFIX.length));
+  assert.equal(diag.dir, 'response');
+  assert.equal(diag.payload.tooLarge, true);
+  assert.equal(diag.payload.itemCount, 400);
+  assert.deepEqual(diag.payload.items, []);
 });
 
 test('应用项列表只在配置真的启用完美图标时才自动向页面要一次', async () => {
@@ -582,4 +588,107 @@ test('iconSrc 缺失/不是字符串的应用项也不会让上报变成畸形',
     '每项都要变成 {key, title} 两个字符串字段；非对象项直接丢弃（null 不许让上报炸掉）'
   );
 });
+
+// -------------------------------- Task 13b fix round 1 / Minor 4：两个 type 同属一条通道
+
+test('FNOS_GET_LAUNCHPAD_APP_TITLES 与 ITEMS 走同一条上报通道（上游同一个 if、同一个形状）', async () => {
+  // 上游 cs:2853-2868：两个 type 在同一个分支里，`sendResponse({items,titles})` 逐字相同。
+  // 本壳必须一视同仁：剥 iconSrc、上报、分流都由 isAppItemsType 判据覆盖（Minor 4）。
+  const { w, writes } = loadShimWithTitleLog(HOST_SHELL);
+  const items = [{ key: '/app/icon_1.png', title: '甲', iconSrc: 'data:image/png;base64,AAAA' }];
+  w.chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+    if (msg && msg.type === 'FNOS_GET_LAUNCHPAD_APP_TITLES') {
+      sendResponse({ items, titles: items.map((x) => x.title) });
+    }
+  });
+  w.chrome.runtime.sendMessage({ type: 'FNOS_GET_LAUNCHPAD_APP_TITLES' });
+  await new Promise((r) => setTimeout(r, 200));
+  const reports = writes.filter((t) => t.startsWith(REPORT_PREFIX));
+  assert.equal(reports.length, 2, '请求 + 应答都该上报');
+  const out = JSON.parse(reports[0].slice(REPORT_PREFIX.length));
+  const resp = JSON.parse(reports[1].slice(REPORT_PREFIX.length));
+  assert.equal(out.type, 'FNOS_GET_LAUNCHPAD_APP_TITLES');
+  assert.equal(out.dir, 'out');
+  assert.equal(resp.dir, 'response');
+  assert.deepEqual(
+    resp.payload.items,
+    [{ key: '/app/icon_1.png', title: '甲' }],
+    'titles 的应答同样要剥掉 iconSrc（否则 91KB 的 data URL 又会撑爆通道）'
+  );
+});
+
+// -------------------------------- Task 13b fix round 1 / Minor 5：装不下要说出来、且不谎报
+
+test('列表大到装不下：停止重试，并回一条「列表过大」诊断而不是让 UI 干等（Minor 5）', async () => {
+  const PERFECT_ON = { ...HOST_SHELL, mods: { ...HOST_SHELL.mods, launchpadIconScaleEnabled: true } };
+
+  // 200 项 × 每项 20 个汉字标题：剥掉 iconSrc 之后仍然**超过 8 片 × 3000 字节**的预算，
+  // 但正文还在 32Ki 字符的早退闸门**之内**——这样命中的正是「分片预算」这条路径，
+  // 而不是 `body.length > REPORT_MAX_CHARS` 那一条（`titles` 会把标题再算一遍，所以不能取太大）。
+  const huge = Array.from({ length: 200 }, (_, i) => ({
+    key: `/app-center-static/serviceicon/app${i}/ui/images/icon_1.png`,
+    title: `应用 ${i} · ${'中'.repeat(20)}`,
+    iconSrc: '',
+  }));
+  const trimmed = JSON.stringify({
+    type: 'FNOS_GET_LAUNCHPAD_APP_ITEMS',
+    dir: 'response',
+    payload: { items: huge.map(({ key, title }) => ({ key, title })), titles: huge.map((x) => x.title) },
+  });
+  assert.ok(trimmed.length < 32768, `必须还在单条早退闸门之内：${trimmed.length}`);
+  assert.ok(
+    Buffer.byteLength(trimmed, 'utf8') > 8 * 3000,
+    `剥掉 iconSrc 之后仍必须超过分片预算：${Buffer.byteLength(trimmed, 'utf8')}`
+  );
+
+  // ---- 情形 1：装不下 → 停止重试（自动请求只发了一次），并回一条诊断
+  const tooBig = loadShimWithTitleLog(PERFECT_ON);
+  let bigAsks = 0;
+  const rawSend = tooBig.w.chrome.runtime.sendMessage;
+  tooBig.w.chrome.runtime.sendMessage = function (...args) { bigAsks += 1; return rawSend.apply(this, args); };
+  tooBig.w.chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+    if (msg && msg.type === 'FNOS_GET_LAUNCHPAD_APP_ITEMS') {
+      sendResponse({ items: huge, titles: huge.map((x) => x.title) });
+    }
+  });
+
+  // ---- 情形 2（对照）：送不出去（写标题抛）→ **不**停止重试，下一轮还会再问
+  let failAsks = 0;
+  const failing = { __FNOS_SHELL__: PERFECT_ON };
+  failing.window = failing;
+  failing.document = {
+    get title() { return '页面自己的标题'; },
+    set title(_v) { throw new Error('title write blocked'); },
+  };
+  const loadFailing = new Function('window', 'TextEncoder', 'queueMicrotask', 'btoa', SHIM + '\nreturn window;');
+  const failingWin = loadFailing(failing, TextEncoder, queueMicrotask, (s) => Buffer.from(s, 'binary').toString('base64'));
+  const rawFailSend = failingWin.chrome.runtime.sendMessage;
+  failingWin.chrome.runtime.sendMessage = function (...args) { failAsks += 1; return rawFailSend.apply(this, args); };
+  failingWin.chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+    if (msg && msg.type === 'FNOS_GET_LAUNCHPAD_APP_ITEMS') sendResponse({ items: appItems(1), titles: ['x'] });
+  });
+
+  // 自动请求在 2.5s 发出，重试间隔 6s：等到 9.6s 就能看出「有没有第二轮」
+  await new Promise((r) => setTimeout(r, 9600));
+
+  assert.equal(bigAsks, 1, '列表装不下时重试必须停下（旧实现是「见过非空列表」就停，但从不说明原因）');
+  assert.ok(failAsks >= 2, `与大小无关的失败必须继续重试，实得 ${failAsks} 次`);
+  assert.equal(
+    tooBig.writes.filter((t) => t.startsWith(CHUNK_PREFIX)).length,
+    0,
+    '装不下的列表一片都不发（越界即拒）'
+  );
+  const diag = tooBig.writes.filter((t) => t.startsWith(REPORT_PREFIX)).pop();
+  const envelope = JSON.parse(diag.slice(REPORT_PREFIX.length));
+  assert.equal(envelope.type, 'FNOS_GET_LAUNCHPAD_APP_ITEMS');
+  assert.equal(envelope.dir, 'response');
+  assert.deepEqual(
+    envelope.payload,
+    { items: [], titles: [], tooLarge: true, itemCount: 200 },
+    '必须沿同一条通道回一条小到装得下的诊断（设置窗据此说「列表过大」）'
+  );
+  // 诊断本身必须远小于通道上限（否则它自己也会被丢，用户又回到「不知道发生了什么」）
+  assert.ok(Buffer.byteLength(diag, 'utf8') < 4096, `诊断必须能单条送达：${diag.length}`);
+});
+
 

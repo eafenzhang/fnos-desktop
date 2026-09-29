@@ -803,10 +803,10 @@ fn document_identity<R: Runtime>(window: &WebviewWindow<R>) -> (Option<String>, 
 ///
 /// ## 分流（T13b；见 [`report::is_app_items_report`]）
 ///
-/// 「应用项列表」那一种 `type` 进 [`AppState::app_items_report`]，**其余**进
-/// [`AppState::page_report`]。这样 T13a 的强态判据（最近一次状态槽上报是不是
-/// `FNOS_INJECTION_TRIGGERED`）不会被 T13b 自己发起的列表拉取冲掉。两个槽位在
-/// [`document_identity`] 上的门完全一致，读取口 [`get_page_report`] 一并返回。
+/// 「应用项列表」那一类 `type`（`report::APP_ITEMS_TYPES`：`ITEMS` 与上游同一分支的 `TITLES`）
+/// 进 [`AppState::app_items_report`]，**其余**进 [`AppState::page_report`]。这样 T13a 的强态判据
+/// （最近一次状态槽上报是不是 `FNOS_INJECTION_TRIGGERED`）不会被 T13b 自己发起的列表拉取冲掉。
+/// 两个槽位在 [`document_identity`] 上的门完全一致，读取口 [`get_page_report`] 一并返回。
 ///
 /// 日志只能打印白名单里的字段：`type` / `dir` 不在允许表里时渲染成固定串
 /// （[`report::accepted_log_line`]），`origin` 由宿主解析、再折成一行（`log_safe`）。

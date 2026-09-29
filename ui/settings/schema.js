@@ -7,15 +7,16 @@
 // 无前缀的键按 `mods.` 处理（`app.js::resolvePath`），与上游 popup 的写法兼容。
 //
 // 与 spec §8.2 的差异（有意，逐条在报告里说明）：
-// - 站点组补 `shell.injectEnabled`：§7 里它是托盘勾选项，但托盘勾选与设置窗必须写同一份配置；
-//   放在设置窗才能在不点托盘的情况下翻转它（也是「needsReload 路径」唯一的手动入口）。
+// - 站点组补 `shell.injectEnabled`：§7 里它曾是托盘勾选项，但那个勾选项随托盘精简被删除
+//   （T13b fix round 1 订正注释：`tray::sync_menus` 与 `commands::set_inject_enabled` 都没了），
+//   现在设置窗的这一项就是唯一的开关入口（也是「needsReload 路径」唯一的手动入口）。
 // - 主题色按 §8.2 给「取色器 + 重置」，并在旁边显示**归一化后**的值（§8.4）。
 // - Task 13b 补上完美图标的**逐项** UI（`appList`）与登录壁纸（`imageFile`）：这两项的
 //   「逐项 / 导入」控件在 T13b 才落地（`appList` 的数据来自主窗口页面的上报，见 app.js）。
 export const SCHEMA = [
   {
     id: 'site', title: '站点', items: [
-      { key: 'shell.injectEnabled', label: '注入 mods（总开关）', type: 'bool', hint: '与托盘「注入 mods」勾选项同一份配置；改动会重建主窗口以换用新载荷' },
+      { key: 'shell.injectEnabled', label: '注入 mods（总开关）', type: 'bool', hint: '开关注入的总闸（唯一的入口在设置窗）；改动会重建主窗口以换用新载荷' },
       { key: 'mods.enabledOrigins', label: '注入白名单', type: 'originList', hint: '命中白名单的站点免 1.5s 探测直接注入；填 NAS 地址保存时会自动并入其 origin' },
       { key: 'shell.nasUrl', label: 'NAS WebUI 地址', type: 'text', hint: '填你自己的 NAS 地址（如 http://192.168.1.10:8000）；保存后自动进入注入白名单' },
       { key: 'mods.autoEnableSuspectedFnOS', label: '自动对疑似飞牛站点启用', type: 'bool' }
