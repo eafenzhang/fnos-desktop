@@ -1,30 +1,41 @@
 /* fnOS Desktop Shell — Dock 自动隐藏（T14c，本壳自己的页面功能，不是上游 mod）
  *
- * 做什么：把 fnOS WebUI 的 Dock（任务栏）平时滑出屏幕边缘，鼠标顶到它所在的边缘时滑回。
+ * 做什么：把 fnOS WebUI 的 Dock（任务栏）平时滑出屏幕边缘，鼠标顶到它所在的边缘时滑回，
+ * 并把 Dock 让出来的那条宽度**还给桌面与窗口**。
  *
- * 定位（多策略，全部锚定上游已知特征；T14c 修复轮 4 起策略化——上游的根选择器在部分
- * fnOS 版本上匹配 0 个元素，实测反馈见诊断角标）：
+ * 定位（多策略，全部锚定上游已知特征）：
  *   S1 上游类名策略   —— 逐字复用上游 mod.js 的 TASKBAR_ROOT_SELECTOR（+ TASKBAR_LIST_SELECTOR
- *                        验证），命中即用；这是与上游行为完全一致的首选路径。
- *   S2 上游任务栏项策略 —— 用上游的 TASKBAR_ITEM_SELECTOR 找到任务栏图标项，沿祖先向上爬到
- *                        最外层「Dock 形状」的容器（窄长条）。图标项与上游 isTaskbarAppItem
- *                        同源，所以爬出来的就是上游认定的任务栏所在。
- *   S3 贴边容器策略   —— Tailwind `.fixed` 元素里，贴屏幕边缘 + Dock 形状（窄长条）+
- *                        含 ≥3 个图标（img/svg）的容器。
- *   S4 全量扫描策略   —— S3 失败后的兜底：扫描 `body *` 的计算样式 position:fixed
- *                        （贵，只在需要时做一次；locate 本就有 150ms 合并窗）。
- *   全部失败          —— 左下角诊断角标报告每种策略的计数（绝不静默失效）；登录页
- *                        （存在密码输入框）不弹诊断——那里本来就没有 Dock。
+ *                        验证），命中即用。
+ *   S2 上游任务栏项策略 —— 用上游的 TASKBAR_ITEM_SELECTOR 找到任务栏图标项，从它的父层沿
+ *                        祖先向上爬到最外层「Dock 形状」的容器（窄长条）。
+ *   S3 贴边容器策略   —— Tailwind `.fixed` 元素里，贴屏幕边缘 + Dock 形状 + 含 ≥3 个图标。
+ *   S4 全量扫描策略   —— S3 失败后的兜底：扫 `body *` 的计算样式 position:fixed（贵，
+ *                        只在需要时做一次；locate 本就有 150ms 合并窗）。
+ *   找不到            —— 静默（不向页面画任何提示；状态可在控制台用 `__FNOS_DOCK_STATE__()`
+ *                        读，那里也带着各策略的候选计数）。
  *
- * 显隐规则（T14c 修复轮 3 定稿）：
+ * 只在**顶层文档**工作：注入脚本会跑进每一个 iframe（fnOS 的应用窗口就是 iframe），
+ * 子框架里既没有 Dock，也可能把应用自己的侧栏误判成 Dock 藏掉（T14c 修复轮 7）。
+ *
+ * 显隐规则：
  *   唤出   —— 指针顶到 Dock 所在的屏幕边缘热区（EDGE_PX）。**不是**「进入 Dock 的脚印」：
  *            藏在 Dock 底下的应用按钮就在那条带里，一靠近就唤出会把要点的按钮盖住。
  *   保持   —— 唤出后指针留在 Dock 脚印（自身尺寸 + 余量）内就一直显示，离开即藏（迟滞）。
  *   藏起   —— 指针离开脚印 / 离开窗口 / 窗口失焦 / **无操作超过 IDLE_MS** / 接管时。
- *            指针进入 iframe（fnOS 的应用窗口）之后顶层文档收不到 pointermove——纯事件
- *            驱动的显隐会卡在「显示」，所以必须有 idle 兜底。
+ *            指针进入 iframe（应用窗口）之后顶层文档收不到 pointermove——纯事件驱动的
+ *            显隐会卡在「显示」，所以必须有 idle 兜底。
  *   离场   —— 滑出动画结束后 `display:none`：transform 藏得住视觉，藏不住按 rect 做的
- *            工作区计算（全屏应用给 Dock 让出的那条宽度）。
+ *            工作区计算。
+ *
+ * 空间回收（T14c 修复轮 7）：只把 Dock 藏起来**不等于**把左侧那条预留宽度还回来——实测
+ * 「桌面与应用全屏左侧仍有空白」。那条约 68px 的空白可能来自四种布局机制，本层按「谁在
+ * 预留」逐一识别并中和（都只在识别到「宽度≈Dock 宽」时动手，teardown 时逐条还原）：
+ *   ① Dock 被一个**贴左缘、几乎满高、宽度≈Dock 宽**的窄列包着（列本身在流内占位）
+ *      → 把该列一并藏掉（`columnAncestors`）；
+ *   ② 某个祖先用 `padding-left` / `margin-left` 预留 → 置 0；
+ *   ③ 某个祖先用 grid 的第一轨预留 → 该轨置 0px；
+ *   ④ 宽度是 JS 常量（与 DOM 无关）→ 本层无法回收，只能由窗口管理器自己重算
+ *      （Dock 离场时会派发一次 resize，尽力触发它）。
  *
  * 开关链路：
  *   初始态   —— 注入载荷 `__FNOS_SHELL__.shell.dockAutoHide`（injector.rs 只发页面消费的键）
@@ -35,6 +46,12 @@
 (function () {
   var W = typeof window !== 'undefined' ? window : globalThis;
   var D = W.document;
+
+  // 只在顶层文档工作（见文件头）。跨源访问 top 会抛异常 —— 那就是子框架。
+  var isTopFrame = false;
+  try { isTopFrame = W.top === W.self; } catch (e) { isTopFrame = false; }
+  if (!isTopFrame) return;
+
   var SHELL = W.__FNOS_SHELL__ || {};
   var SHELL_CFG = SHELL.shell || {};
 
@@ -55,11 +72,14 @@
   var LOCATE_DELAY_MS = 150; // SPA 重渲染的合并窗口：一批变更只查一次选择器
   var TRANSITION_MS = 320;   // 与 CSS 的 .28s 过渡对齐（略留余量）；到点后真正 display:none
   var IDLE_MS = 3000;        // 「无操作」判定：这么久没有任何指针事件就藏
-  var DIAG_DELAY_MS = 5000;  // 开启后这么久还没找到 Dock → 页面角标给出诊断（不静默失效）
   var DOCK_SIDE_MAX = 140;   // 「Dock 形状」的窄边上限 / 长边下限（像素）
+  var STRIP_MIN = 24;        // 预留宽度识别区间：窄于此不值得动（不是 Dock 栏宽度）
+  var STRIP_MAX = 200;       // 宽于此不是 Dock 栏（可能是内容区），一律不动手
 
   var enabled = SHELL_CFG.dockAutoHide === true;
-  var dock = null;       // 当前接管的 Dock 元素（可能被 SPA 换掉，observer 会重新找）
+  var dock = null;       // 当前接管的 Dock 本体（可能被 SPA 换掉，observer 会重新找）
+  var targets = [];      // 接管元素集合：第 0 项是 Dock 本体，之后是承载它的窄列
+  var reclaimed = [];    // 被中和的预留（{el, prop, prev}，prev = 原内联值，'' = 原本没有）
   var observer = null;   // MutationObserver：Dock 出现 / 被替换时重新接管
   var locateScheduled = false;
   var axis = 'x';        // Dock 贴边方向：'x'（左右缘）或 'y'（上下缘）
@@ -67,19 +87,12 @@
   var shown = false;     // 显隐意图（与 HIDDEN_CLASS 互斥）；接管默认 false = 平时是藏着的
   var idleTimer = null;  // 无操作兜底定时器（armIdle）
   var displayTimer = null; // 滑出动画结束后真正 display:none 的定时器
-  var diagTimer = null;  // 「还没找到 Dock」诊断角标的定时器
-  var lastMiss = '';     // 最近一次「全部策略落空」的计数快照（诊断角标用）
+  var lastMiss = '';     // 最近一次「全部策略落空」的计数快照（控制台诊断用）
 
   var CSS =
     '.' + HOST_CLASS + '{transition:transform .28s cubic-bezier(.4,0,.2,1);}' +
     '.' + HOST_CLASS + '.' + HIDDEN_CLASS + '{transform:var(--fnos-dock-hide-tf,translateX(-105%));}' +
-    '@media (prefers-reduced-motion: reduce){.' + HOST_CLASS + '{transition:none;}}' +
-    // 诊断/提示角标（本壳命名空间；pointer-events:none 不挡任何点击）
-    '.fnos-shell-dock-badge{position:fixed;left:10px;bottom:10px;z-index:2147483000;max-width:460px;' +
-    'padding:7px 11px;border-radius:8px;background:rgba(20,20,22,.82);color:#d8dadd;' +
-    'font:12px/1.6 system-ui,"Segoe UI","Microsoft YaHei",sans-serif;pointer-events:none;' +
-    'box-shadow:0 2px 10px rgba(0,0,0,.35);white-space:pre-wrap;}' +
-    '.fnos-shell-dock-badge.warn{color:#ffd479;}';
+    '@media (prefers-reduced-motion: reduce){.' + HOST_CLASS + '{transition:none;}}';
 
   /** 样式只装一次；优先可构造样式表（CSP 对 inline <style> 收紧时仍然可用），否则 <style>。 */
   function ensureStyle() {
@@ -115,9 +128,15 @@
     try { return el.querySelectorAll('img,svg').length >= 3; } catch (e) { return false; }
   }
 
-  /** 本壳自己的元素（诊断角标等）绝不能被当成 Dock。 */
+  /** 本壳自己的元素绝不能被当成 Dock。 */
   function isOwnEl(el) {
     return !!(el && el.id && String(el.id).indexOf('fnos-shell') === 0);
+  }
+
+  function nodeWidth(el) {
+    var w = el.offsetWidth || 0;
+    if (w > 0) return w;
+    try { return el.getBoundingClientRect().width || 0; } catch (e) { return 0; }
   }
 
   // ---------- 多策略定位（S1 → S2 → S3 → S4；全部落空时把计数写进 lastMiss） ----------
@@ -137,13 +156,12 @@
     return fallback;
   }
 
-  /** S2：上游任务栏项 → 沿祖先向上爬到最外层「Dock 形状」的容器。 */
+  /** S2：上游任务栏项 → 从父层沿祖先向上爬到最外层「Dock 形状」的容器。 */
   function s2FromItems() {
     var items;
     try { items = D.querySelectorAll(DOCK_ITEM_SELECTOR); } catch (e) { return null; }
     if (!items || !items.length) return null;
     for (var i = 0; i < items.length; i++) {
-      // 从图标项的**父层**开始爬（图标项本身 47×40，不是「Dock 形状」）
       var cur = items[i].parentElement;
       var best = null;
       for (var depth = 0; cur && depth < 10; depth++) {
@@ -151,7 +169,6 @@
         best = cur;
         cur = cur.parentElement;
       }
-      // 爬到了至少一层 shaped 容器才算「找到了 Dock 所在」
       if (best) return best;
     }
     return null;
@@ -205,7 +222,6 @@
         lastMiss = ''; // 找到了：旧的落空计数不再有诊断意义
         return el;
       }
-      // 记录该策略的候选规模（诊断用）：前两条是选择器匹配数，后两条是扫描节点数
       var n = 0;
       try {
         if (i === 0) n = D.querySelectorAll(DOCK_ROOT_SELECTOR).length;
@@ -213,7 +229,7 @@
         else if (i === 2) n = D.querySelectorAll('.fixed').length;
         else n = -1;
       } catch (e) { /* 保持 0 */ }
-      counts.push(STRATEGIES[i][0] + ' ' + (i === 3 ? '未执行/未命中' : n));
+      counts.push(STRATEGIES[i][0] + ' ' + (i === 3 ? '未命中' : n));
     }
     lastMiss = counts.join('；');
     return null;
@@ -248,14 +264,119 @@
     dock.style.setProperty('--fnos-dock-hide-tf', measure(rect));
   }
 
+  // ---------- 空间回收：把「谁预留了左侧那条宽度」找出来中和掉 ----------
+
+  /**
+   * 承载 Dock 的窄列：贴左缘、几乎满高、宽度不超过 Dock 的两倍（可能有多级）。
+   * 这些列本身在流内占位，只藏 Dock 藏不掉它们预留的宽度。
+   */
+  function columnAncestors(from, stripW) {
+    var out = [];
+    var vh = W.innerHeight || 0;
+    var el = from;
+    var maxW = Math.max(stripW * 2, stripW + 24);
+    for (var i = 0; el && i < 6; i++) {
+      var p = el.parentElement;
+      if (!p || p === D.body || p === D.documentElement) break;
+      var r;
+      try { r = p.getBoundingClientRect(); } catch (e) { break; }
+      var w = r.width || 0;
+      var fullHeight = vh ? r.height >= vh * 0.8 : false;
+      if (fullHeight && w > 0 && w <= maxW && r.left <= 8) {
+        out.push(p);
+        el = p;
+      } else break;
+    }
+    return out;
+  }
+
+  function isNear(value, target, tol) {
+    return isFinite(value) && Math.abs(value - target) <= tol;
+  }
+
+  /** 把某个祖先的「预留属性」置为 !important 的新值，并记账以便还原（同一属性只记一次）。 */
+  function override(el, prop, value) {
+    for (var i = 0; i < reclaimed.length; i++) {
+      if (reclaimed[i].el === el && reclaimed[i].prop === prop) return;
+    }
+    var prev = '';
+    try { prev = el.style.getPropertyValue(prop) || ''; } catch (e) { prev = ''; }
+    reclaimed.push({ el: el, prop: prop, prev: prev });
+    try { el.style.setProperty(prop, value, 'important'); } catch (e) { /* 不支持就算了 */ }
+  }
+
+  /** grid 第一轨的数值（`gridTemplateColumns` 可能是 "68px 1132px" 或含 minmax(...)）。 */
+  function firstTrack(template) {
+    var s = String(template == null ? '' : template).trim();
+    if (!s) return NaN;
+    // 按「括号外的空白」切分，避免把 minmax(0px, 1fr) 切开
+    var parts = s.split(/\s+(?![^()]*\))/);
+    var m = /^(-?\d*\.?\d+)px$/.exec(parts[0] || '');
+    return m ? parseFloat(m[1]) : NaN;
+  }
+
+  /** 中和一个祖先的预留：padding-left / margin-left / grid 第一轨，值≈stripW 才动手。 */
+  function neutralize(el, stripW, tol) {
+    var cs = null;
+    try { cs = W.getComputedStyle ? W.getComputedStyle(el) : null; } catch (e) { cs = null; }
+    if (!cs) return;
+    if (isNear(parseFloat(cs.paddingLeft), stripW, tol)) override(el, 'padding-left', '0px');
+    if (isNear(parseFloat(cs.marginLeft), stripW, tol)) override(el, 'margin-left', '0px');
+    if (cs.display === 'grid') {
+      var template = String(cs.gridTemplateColumns || '');
+      if (isNear(firstTrack(template), stripW, tol)) {
+        var parts = template.trim().split(/\s+(?![^()]*\))/);
+        parts[0] = '0px';
+        override(el, 'grid-template-columns', parts.join(' '));
+      }
+    }
+  }
+
+  /**
+   * 回收 Dock 让出的那条宽度：从 Dock 沿祖先链找出「用 padding / margin / grid 第一轨
+   * 预留了 ≈ Dock 宽」的容器并中和（只处理贴左缘的形态；每条都记账，teardown 还原）。
+   */
+  function reclaimReservedSpace(stripW) {
+    if (!(stripW >= STRIP_MIN && stripW <= STRIP_MAX)) return;
+    if (!(axis === 'x' && edgeMin)) return; // 只处理最左缘的形态
+    var tol = Math.max(2, stripW * 0.15);
+    var el = dock;
+    for (var depth = 0; el && depth < 10; el = el.parentElement, depth++) {
+      var parent = el.parentElement;
+      if (!parent || parent === D.documentElement) break;
+      neutralize(parent, stripW, tol);
+    }
+  }
+
+  function restoreReclaimed() {
+    for (var i = 0; i < reclaimed.length; i++) {
+      var item = reclaimed[i];
+      try {
+        if (item.prev) item.el.style.setProperty(item.prop, item.prev);
+        else item.el.style.removeProperty(item.prop);
+      } catch (e) { /* 元素没了就算了 */ }
+    }
+    reclaimed = [];
+  }
+
+  // ---------- 接管与还原 ----------
+
   /** 释放一个曾接管的元素：class、内联变量、display 全部还原（不留下孤儿状态）。 */
-  function release(el) {
+  function releaseOne(el) {
     if (!el) return;
     el.classList.remove(HOST_CLASS, HIDDEN_CLASS);
     try {
       el.style.removeProperty('--fnos-dock-hide-tf');
       el.style.display = '';
     } catch (e) { /* 不支持就算了 */ }
+  }
+
+  /** 释放全部接管元素 + 还原所有被中和的预留。 */
+  function releaseAll() {
+    for (var i = 0; i < targets.length; i++) releaseOne(targets[i]);
+    targets = [];
+    dock = null;
+    restoreReclaimed();
   }
 
   /**
@@ -268,26 +389,29 @@
     try { W.dispatchEvent(new W.Event('resize')); } catch (e) { /* 老内核缺 Event 构造器就算了 */ }
   }
 
-  /** 把 `shown` 的意图落到当前 Dock 上（幂等；接管后无条件调一次以防换元素后状态漂移）。 */
+  /** 把 `shown` 的意图落到接管元素上（幂等；接管后无条件调一次以防换元素后状态漂移）。 */
   function renderState() {
     if (!dock) return;
     if (displayTimer) { W.clearTimeout(displayTimer); displayTimer = null; }
     if (shown) {
-      try { dock.style.display = ''; } catch (e) { /* 已被上游藏起来就算了 */ }
-      void dock.offsetWidth; // 强制重排：display:none 刚恢复时要有动画起点，否则直接跳到位
+      for (var i = 0; i < targets.length; i++) {
+        try { targets[i].style.display = ''; } catch (e) { /* 已被上游藏起来就算了 */ }
+      }
+      try { void dock.offsetWidth; } catch (e) { /* 强制重排：display:none 刚恢复时要有动画起点 */ }
       dock.classList.remove(HIDDEN_CLASS);
       notifyResize(); // Dock 回到布局：工作区变小，窗口管理器按旧几何收回去
       return;
     }
     syncTransform();
     dock.classList.add(HIDDEN_CLASS);
-    // 滑出动画结束后**真正离场**（transform 挡不住按 rect 的全屏工作区计算，修复轮 2）。
+    // 滑出动画结束后**真正离场**（transform 挡不住按 rect 的工作区计算，修复轮 2）。
     displayTimer = W.setTimeout(function () {
       displayTimer = null;
-      if (dock && !shown) {
-        try { dock.style.display = 'none'; } catch (e) { /* 不支持就算了 */ }
-        notifyResize(); // Dock 离场：工作区变大，已开的窗口借 resize 重排（修复轮 5）
+      if (!dock || shown) return;
+      for (var i = 0; i < targets.length; i++) {
+        try { targets[i].style.display = 'none'; } catch (e) { /* 不支持就算了 */ }
       }
+      notifyResize(); // Dock 离场：工作区变大，已开的窗口借 resize 重排（修复轮 5）
     }, TRANSITION_MS);
   }
 
@@ -297,53 +421,24 @@
     renderState();
   }
 
-  // ---------- 页面角标：只在「找不到 Dock」时出现的诊断（不静默失效；成功不弹提示） ----------
-
-  /** 设置或清除角标；`text` 为空 = 清除。样式走 adoptedStyleSheet（CSP 免疫），不挡点击。 */
-  function badge(text, warn) {
-    var el = D.getElementById('fnos-shell-dock-badge');
-    if (!text) {
-      if (el) el.remove();
-      return;
-    }
-    if (!el) {
-      el = D.createElement('div');
-      el.id = 'fnos-shell-dock-badge';
-      el.className = 'fnos-shell-dock-badge';
-      (D.body || D.documentElement).appendChild(el);
-    }
-    el.className = 'fnos-shell-dock-badge' + (warn ? ' warn' : '');
-    el.textContent = text;
-  }
-
-  /**
-   * 开启后一段时间还没找到 Dock → 诊断角标（选择器失明时绝不悄悄躺平）。
-   * 登录页本来就没有 Dock（用户实测反馈）：页面里有密码输入框时静默顺延，不误报。
-   * （T14c 修复轮 6：接管成功的左下角提示已按用户要求删除——找到即静默接管，
-   * 只清掉可能挂着的失败诊断角标。）
-   */
-  function scheduleDiag() {
-    if (diagTimer) W.clearTimeout(diagTimer);
-    diagTimer = W.setTimeout(function () {
-      diagTimer = null;
-      if (!enabled || dock) return; // 已接管 / 已关闭：不需要诊断
-      var onLogin = false;
-      try { onLogin = !!D.querySelector('input[type="password"]'); } catch (e) { /* 按「不在登录页」处理 */ }
-      if (onLogin) { scheduleDiag(); return; } // 登录页没有 Dock：静默等登录后再判
-      badge('fnOS壳·Dock自动隐藏：仍未找到 Dock 元素。各策略计数——' + lastMiss
-        + '。找到后本提示自动消失；若登录后仍持续显示，请截图反馈。', true);
-    }, DIAG_DELAY_MS);
-  }
-
   /** 重新找 Dock 并接管。已接管的元素不变；旧元素被换掉时把自己加的东西清干净。 */
   function locate() {
     locateScheduled = false;
     var found = findDock();
     if (!found) return;
     if (found !== dock) {
-      release(dock);
+      releaseAll();
       dock = found;
-      dock.classList.add(HOST_CLASS);
+      // 先定贴边方向：空间回收（只处理贴左缘）与滑出方向都依赖它，而它只能从**当前可见**
+      // 的 Dock 几何量出来——晚于这一步量就会拿到默认值（修复轮 7 的实现次序）。
+      syncTransform();
+      // 接管集合：Dock 本体 + 承载它的窄列（列在流内占位，必须一并藏，见文件头的①②）
+      var stripW = nodeWidth(found);
+      targets = [found].concat(columnAncestors(found, stripW));
+      for (var i = 0; i < targets.length; i++) targets[i].classList.add(HOST_CLASS);
+      // 预留宽度按**最外层接管元素**的宽度算（窄列比 Dock 本体宽时以列为准）
+      var outer = targets[targets.length - 1];
+      reclaimReservedSpace(nodeWidth(outer) || stripW);
       // 接管即按当前意图落态（默认 = 藏）：不等第一次 pointermove，否则用户在设置里
       // 打开开关、切回主窗口，鼠标不动就永远看不到效果（修复轮 2）。
       // 指针恰好在 Dock 上时先不藏（:hover 读的是当前真实悬停链）。
@@ -351,7 +446,6 @@
       try { hovered = dock.matches(':hover'); } catch (e) { /* 老内核不支持就照藏 */ }
       if (hovered) shown = true;
       renderState();
-      badge(null); // 找到了：清掉可能挂着的「找不到 Dock」诊断角标（不再弹任何成功提示）
     }
   }
 
@@ -406,7 +500,6 @@
     D.addEventListener('pointerleave', onHideSignal);
     W.addEventListener('blur', onHideSignal);
     armIdle();
-    scheduleDiag();
     locate();
   }
 
@@ -414,13 +507,11 @@
     if (observer) { observer.disconnect(); observer = null; }
     if (idleTimer) { W.clearTimeout(idleTimer); idleTimer = null; }
     if (displayTimer) { W.clearTimeout(displayTimer); displayTimer = null; }
-    if (diagTimer) { W.clearTimeout(diagTimer); diagTimer = null; }
     D.removeEventListener('pointermove', onPointerMove);
     D.removeEventListener('pointerleave', onHideSignal);
     W.removeEventListener('blur', onHideSignal);
-    release(dock);
-    dock = null;
-    badge(null); // 功能关了，角标也不该留着
+    releaseAll();
+    notifyResize(); // 空间还原了，也让窗口管理器重排一次
   }
 
   /** set_config 的免刷新入口（shim 的 `__FNOS_APPLY_CONFIG__` 转调；幂等）。 */
@@ -434,11 +525,14 @@
     else teardown();
   };
 
-  /** 诊断口：控制台里 `__FNOS_DOCK_STATE__()` 即可看到接管状态（不携带任何页面数据）。 */
+  /**
+   * 诊断口（控制台可见，**不向页面画任何东西**；T14c 修复轮 7 起页面上不再有提示）：
+   * `__FNOS_DOCK_STATE__()` 返回接管状态、预留中和记账与各策略的候选计数。
+   */
   W.__FNOS_DOCK_STATE__ = function () {
     return {
-      enabled: enabled, found: !!dock, axis: axis, edgeMin: edgeMin, shown: shown,
-      lastMiss: lastMiss,
+      enabled: enabled, found: !!dock, targets: targets.length, axis: axis, edgeMin: edgeMin,
+      shown: shown, reclaimed: reclaimed.map(function (r) { return r.prop; }), lastMiss: lastMiss,
     };
   };
 

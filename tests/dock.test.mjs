@@ -1,8 +1,8 @@
-// dock.js（T14c）的行为契约：多策略定位（全锚定上游特征）+ 本壳命名空间 + 免刷新切换 +
-// 显隐状态机 + 页面内诊断。
+// dock.js（T14c）的行为契约：多策略定位（全锚定上游特征）+ 顶层文档守卫 + 空间回收 +
+// 本壳命名空间 + 免刷新切换 + 显隐状态机。页面上**不得**出现任何本壳提示。
 //
-// dock.js 在 document-start 注入，逻辑全在 DOM 上（观察器 / 指针 / class / 定时器），
-// 所以和 bootstrap.test.mjs 一样用**假 DOM**跑真实源码；选择器与纪律用源码级断言锁。
+// dock.js 在 document-start 注入，逻辑全在 DOM 上（观察器 / 指针 / class / 内联样式 /
+// 定时器），所以和 bootstrap.test.mjs 一样用**假 DOM**跑真实源码；选择器与纪律用源码级断言锁。
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
@@ -15,14 +15,22 @@ const UPSTREAM_ROOT = '.h-screen.fixed.left-0';
 const UPSTREAM_LIST =
   '.scrollbar-hidden.absolute.inset-0.flex.flex-col.items-end.justify-start.gap-2.overflow-y-auto.pt-2';
 
-/** 假 Dock 元素：classList 是真实的加减集合，rect/offset 由调用方给定。 */
-function fakeDock(rect, opts = {}) {
+/** 假元素：class、内联样式、几何、计算样式、父链都可控。 */
+function fakeEl(opts = {}) {
   const classes = new Set();
-  // 真实 DOMRect 恒有 width/height；桩补全，免得 dock.js 的零尺寸守卫把桩误判成未布局
-  rect.width = rect.right - rect.left;
-  rect.height = rect.bottom - rect.top;
-  return {
+  const inline = {}; // prop -> {value, priority}
+  const w = opts.w ?? 68;
+  const h = opts.h ?? 800;
+  const left = opts.left ?? 0;
+  const top = opts.top ?? 0;
+  const el = {
     _classes: classes,
+    _inline: inline,
+    _computed: Object.assign({
+      display: 'block', position: 'static',
+      paddingLeft: '0px', marginLeft: '0px', gridTemplateColumns: 'none',
+    }, opts.computed || {}),
+    id: opts.id || '',
     classList: {
       add: (...cs) => cs.forEach((c) => classes.add(c)),
       remove: (...cs) => cs.forEach((c) => classes.delete(c)),
@@ -30,24 +38,22 @@ function fakeDock(rect, opts = {}) {
       contains: (c) => classes.has(c),
     },
     style: {
-      _props: {},
-      _display: '',
-      setProperty(k, v) { this._props[k] = v; },
-      removeProperty(k) { delete this._props[k]; },
-      set display(v) { this._display = v; },
-      get display() { return this._display; },
+      getPropertyValue: (p) => (inline[p] ? inline[p].value : ''),
+      setProperty: (p, v, prio) => { inline[p] = { value: v, priority: prio || '' }; },
+      removeProperty: (p) => { delete inline[p]; },
+      get display() { return inline.display ? inline.display.value : ''; },
+      set display(v) { if (v === '') delete inline.display; else inline.display = { value: v, priority: '' }; },
     },
-    offsetWidth: rect.right - rect.left,
-    offsetHeight: rect.bottom - rect.top,
-    getBoundingClientRect: () => rect,
+    offsetWidth: w,
+    offsetHeight: h,
+    getBoundingClientRect: () => ({ left, top, right: left + w, bottom: top + h, width: w, height: h }),
     matches: (sel) => (sel === ':hover' ? !!opts.hovered : false),
-    // S1 的上游同款验证：根里能找到任务栏列表才算数
     querySelector: (sel) => (sel === UPSTREAM_LIST && opts.hasList ? {} : null),
-    // S3 的图标丰富度：容器内 img/svg 的数量
     querySelectorAll: (sel) => (sel === 'img,svg' ? { length: opts.icons ?? 0 } : []),
     parentElement: opts.parent || null,
     isConnected: true,
   };
+  return el;
 }
 
 /** 假的任务栏图标项（S2 的爬升起点）：只需要几何与父链。 */
@@ -56,6 +62,7 @@ function fakeItem(w, h, parent) {
 }
 
 function fakeDom(opts = {}) {
+  const body = opts.body || fakeEl({ w: 1200, h: 800, computed: { position: 'static' } });
   const doc = {
     _listeners: {},
     _styles: [],
@@ -63,12 +70,12 @@ function fakeDom(opts = {}) {
     _items: [],      // querySelectorAll(上游任务栏项选择器) 的返回
     _fixed: [],      // querySelectorAll('.fixed') 的返回
     _all: [],        // querySelectorAll('body *') 的返回
-    _pwInput: null,  // querySelector('input[type="password"]') 的返回（登录页判定）
+    body,
+    documentElement: fakeEl({ w: 1200, h: 800 }),
     adoptedStyleSheets: [],
     head: { appendChild: (n) => doc._styles.push(n) },
-    documentElement: { appendChild: (n) => doc._styles.push(n) },
     createElement: (tag) => {
-      const node = { tag, textContent: '', className: '', remove() {
+      const node = { tag, textContent: '', className: '', id: '', remove() {
         const i = doc._styles.indexOf(node);
         if (i >= 0) doc._styles.splice(i, 1);
       } };
@@ -82,10 +89,6 @@ function fakeDom(opts = {}) {
       // 上游任务栏项选择器（含 w-[47px] 与 !border-l-[3px] 的转义，桩按特征识别）
       if (sel.indexOf('\\[47px\\]') >= 0 && sel.indexOf('border-l') >= 0) return doc._items;
       return [];
-    },
-    querySelector: (sel) => {
-      if (sel === 'input[type="password"]') return doc._pwInput;
-      return null;
     },
     addEventListener(ev, fn) { this._listeners[ev] = fn; },
     removeEventListener(ev) { delete this._listeners[ev]; },
@@ -111,6 +114,7 @@ function fakeDom(opts = {}) {
     CSSStyleSheet: opts.noCSSOM ? undefined : CSSStyleSheetStub,
     innerWidth: opts.vw ?? 1200,
     innerHeight: opts.vh ?? 800,
+    getComputedStyle: (el) => (el && el._computed) || null,
     _winListeners: {},
     _resized: 0,
     Event: function (type) { this.type = type; },
@@ -120,9 +124,11 @@ function fakeDom(opts = {}) {
     _timers: new Map(),
     setTimeout(fn) { const id = Math.random(); this._timers.set(id, fn); return id; },
     clearTimeout(id) { this._timers.delete(id); },
-    // 排空全部待触发定时器（display:none 延迟 + idle 兜底 + 诊断都会用它；守卫内部自查状态）
+    // 排空全部待触发定时器（display:none 延迟 + idle 兜底都会用它；守卫内部自查状态）
     drainTimers() { const fns = [...this._timers.values()]; this._timers.clear(); fns.forEach((fn) => fn()); },
   };
+  win.top = win;   // 默认当成顶层文档（与真实浏览器一致）
+  win.self = win;
   doc._win = win;
   return doc;
 }
@@ -150,18 +156,36 @@ test('DOCK_ROOT/ITEM/LIST 选择器逐字取自上游 mod.js（上游类名策�
   assert.ok(root, '上游 mod.js 必须仍有 TASKBAR_ROOT_SELECTOR 常量');
   assert.ok(item, '上游 mod.js 必须仍有 TASKBAR_ITEM_SELECTOR 常量');
   assert.ok(list, '上游 mod.js 必须仍有 TASKBAR_LIST_SELECTOR 常量');
-  // dock.js 里三条选择器必须与上游逐字相同——自造选择器会在上游改类名时静默失明
   assert.ok(DOCK.includes(`var DOCK_ROOT_SELECTOR = '${root[1]}';`));
   assert.ok(DOCK.includes(`'${item[1]}'`), 'dock.js 必须逐字复用上游的任务栏项选择器（S2 爬升的锚点）');
   assert.ok(DOCK.includes(`'${list[1]}'`), 'dock.js 必须逐字复用上游的列表选择器（根节点验证）');
 });
 
-test('纪律：dock.js 不开 IPC、不写 innerHTML、只在自己的 class 命名空间里动手', () => {
+test('纪律：不开 IPC、不写 innerHTML、只在自己的 class 命名空间里动手，且页面上没有任何提示', () => {
   assert.ok(!DOCK.includes('invoke('), '不得给页面开命令授权');
   assert.ok(!DOCK.includes('innerHTML'), '只加 class / 注入自己的样式，绝不 innerHTML');
   for (const cls of ['fnos-shell-dock-autohide', 'fnos-shell-dock-hidden']) {
     assert.ok(DOCK.includes(cls), `必须有本壳命名空间的 class：${cls}`);
   }
+  // T14c 修复轮 7：页面上不得再出现任何本壳提示/角标（用户要求）
+  for (const gone of ['fnos-shell-dock-badge', 'function badge(', 'createElement(\'div\')', 'scheduleDiag', 'DIAG_DELAY_MS']) {
+    assert.ok(!DOCK.includes(gone), `dock.js 不得再有页面提示机制：${gone}`);
+  }
+  // 诊断只剩控制台口（不向页面画东西）
+  assert.ok(DOCK.includes('__FNOS_DOCK_STATE__'), '必须保留控制台诊断口');
+});
+
+// ---------- 顶层文档守卫 ----------
+
+test('只在顶层文档工作：子框架（应用窗口 iframe）里什么都不做', () => {
+  const doc = fakeDom();
+  const win = doc._win;
+  win.top = {}; // 子框架：top !== self
+  load(doc, { dockAutoHide: true });
+  assert.equal(doc._moObserved, undefined, '子框架不得观察 DOM');
+  assert.equal(doc._listeners.pointermove, undefined, '子框架不得监听指针');
+  assert.equal(doc.adoptedStyleSheets.length, 0, '子框架不得注入样式');
+  assert.equal(typeof win.__FNOS_APPLY_SHELL__, 'undefined', '子框架不得安装 shell 钩子');
 });
 
 // ---------- 初始态：默认关 ----------
@@ -182,7 +206,7 @@ test('默认关：不装观察器、不监听指针、不注入样式，但 shel
 test('S1：上游根选择器命中（含列表优先、退化取第一个）', () => {
   const doc = fakeDom();
   load(doc, { dockAutoHide: true });
-  const dock = fakeDock({ left: 0, top: 0, right: 68, bottom: 800 }, { hasList: true });
+  const dock = fakeEl({ w: 68, h: 800, left: 0, hasList: true });
   doc._candidates = [dock];
   settle(doc);
   assert.ok(dock._classes.has('fnos-shell-dock-autohide'), 'S1 命中即接管');
@@ -192,8 +216,7 @@ test('S1：上游根选择器命中（含列表优先、退化取第一个）', 
 test('S2：上游根选择器落空时，从任务栏图标项向上爬到最外层 Dock 形状容器', () => {
   const doc = fakeDom();
   load(doc, { dockAutoHide: true });
-  // 真实形态（用户截图）：Dock 是贴左缘的竖条容器（53×218），图标项 47×40 在里面
-  const pill = fakeDock({ left: 15, top: 300, right: 68, bottom: 518 }, { icons: 5 });
+  const pill = fakeEl({ w: 53, h: 218, left: 15, top: 300, icons: 5 });
   const item = fakeItem(47, 40, pill);
   doc._items = [item];
   settle(doc);
@@ -201,76 +224,103 @@ test('S2：上游根选择器落空时，从任务栏图标项向上爬到最外
   assert.ok(pill._classes.has('fnos-shell-dock-hidden'), '接管即藏');
 });
 
-test('S3：S1/S2 落空时，贴边 + Dock 形状 + 图标丰富的固定容器兜底', () => {
+test('S3：S1/S2 落空时，贴边 + Dock 形状 + 图标丰富的固定容器兜底（宽扁悬浮窗不算）', () => {
   const doc = fakeDom();
   load(doc, { dockAutoHide: true });
-  const pill = fakeDock({ left: 15, top: 300, right: 68, bottom: 518 }, { icons: 5 });
+  const pill = fakeEl({ w: 53, h: 218, left: 15, top: 300, icons: 5 });
   doc._fixed = [pill];
   settle(doc);
   assert.ok(pill._classes.has('fnos-shell-dock-autohide'), '贴边固定容器必须被接管');
 
-  // 不像 Dock 的固定元素不得被接管：系统悬浮小部件（宽扁、无图标群）
   const doc2 = fakeDom();
   load(doc2, { dockAutoHide: true });
-  const widget = fakeDock({ left: 920, top: 20, right: 1170, bottom: 75 });
+  const widget = fakeEl({ w: 250, h: 55, left: 920, icons: 0 }); // 右上角资源监控
   doc2._fixed = [widget];
   settle(doc2);
   assert.equal(widget._classes.size, 0, '宽扁无图标的悬浮窗不是 Dock');
 });
 
-test('登录页（有密码输入框）不弹「找不到 Dock」的诊断；登录后照常诊断', () => {
+// ---------- 空间回收（T14c 修复轮 7） ----------
+
+test('承载 Dock 的窄列一并接管（列在流内占位，只藏 Dock 藏不掉它预留的宽度）', () => {
   const doc = fakeDom();
   load(doc, { dockAutoHide: true });
-  doc._pwInput = { type: 'password' }; // 登录页
-  doc._win.drainTimers();
-  assert.equal(doc.getElementById('fnos-shell-dock-badge'), null, '登录页没有 Dock，诊断必须静默顺延');
-
-  doc._pwInput = null; // 登录完成（Dock 出现前的一瞬）
-  doc._win.drainTimers();
-  const badge = doc.getElementById('fnos-shell-dock-badge');
-  assert.ok(badge, '离开登录页后仍找不到 Dock 必须给出诊断');
-  assert.match(badge.textContent, /各策略计数/);
-});
-
-test('诊断角标报告各策略计数；接管成功后诊断被清除（且不再弹任何成功提示）', () => {
-  const doc = fakeDom();
-  load(doc, { dockAutoHide: true });
-  doc._win.drainTimers();
-  const badge = doc.getElementById('fnos-shell-dock-badge');
-  assert.ok(badge, '超时未找到 Dock 必须有诊断角标（不静默失效）');
-  assert.equal(badge.className, 'fnos-shell-dock-badge warn', '诊断是警告样式');
-  assert.match(badge.textContent, /各策略计数/);
-
-  const dock = fakeDock({ left: 0, top: 0, right: 68, bottom: 800 }, { hasList: true, icons: 5 });
+  const column = fakeEl({ w: 68, h: 800, left: 0 });
+  const dock = fakeEl({ w: 53, h: 218, left: 15, top: 300, parent: column, hasList: true, icons: 5 });
   doc._candidates = [dock];
   settle(doc);
-  assert.ok(dock._classes.has('fnos-shell-dock-autohide'), '接管照常');
-  assert.equal(doc.getElementById('fnos-shell-dock-badge'), null,
-    '接管成功后诊断必须清除，且**不弹**任何成功提示（T14c 修复轮 6：左下角提示已按用户要求删除）');
+  assert.ok(dock._classes.has('fnos-shell-dock-autohide'), 'Dock 本体必须接管');
+  assert.ok(column._classes.has('fnos-shell-dock-autohide'), '窄列必须一并接管');
+  doc._win.drainTimers();
+  assert.equal(column.style.display, 'none', '窄列必须真正离场（否则左侧仍有一条空白）');
+  assert.equal(dock.style.display, 'none');
 });
 
-test('接管成功不产生任何页面角标（静默生效）', () => {
+test('祖先的 padding-left / grid 第一轨 ≈ Dock 宽 → 中和为 0（宽度还回桌面与窗口）', () => {
   const doc = fakeDom();
   load(doc, { dockAutoHide: true });
-  const dock = fakeDock({ left: 0, top: 0, right: 68, bottom: 800 }, { hasList: true, icons: 5 });
+  const desktop = fakeEl({
+    w: 1200, h: 800, left: 0,
+    computed: { display: 'grid', gridTemplateColumns: '68px 1132px', paddingLeft: '68px' },
+  });
+  const column = fakeEl({ w: 68, h: 800, left: 0, parent: desktop });
+  const dock = fakeEl({ w: 53, h: 218, left: 15, top: 300, parent: column, hasList: true, icons: 5 });
   doc._candidates = [dock];
   settle(doc);
-  assert.ok(dock._classes.has('fnos-shell-dock-hidden'), '接管即藏照常');
-  assert.equal(doc.getElementById('fnos-shell-dock-badge'), null, '成功路径不得出现任何角标');
-  // SPA 换元素再接管：同样不弹
-  const second = fakeDock({ left: 0, top: 0, right: 68, bottom: 800 }, { hasList: true, icons: 5 });
-  doc._candidates = [second];
+  assert.equal(desktop.style.getPropertyValue('padding-left'), '0px',
+    '预留空间的那个祖先（这里是 grid 容器）的 padding-left 必须归零');
+  assert.equal(desktop._inline['padding-left'].priority, 'important', '必须带 !important（压过上游样式）');
+  assert.equal(desktop.style.getPropertyValue('grid-template-columns'), '0px 1132px',
+    'grid 第一轨必须归零（其余轨保持原样）');
+});
+
+test('空间回收的闸门：宽度对不上的祖先一律不动手', () => {
+  const doc = fakeDom();
+  load(doc, { dockAutoHide: true });
+  const desktop = fakeEl({
+    w: 1200, h: 800, left: 0,
+    computed: { display: 'grid', gridTemplateColumns: '200px 1000px', paddingLeft: '24px' },
+  });
+  const dock = fakeEl({ w: 68, h: 800, left: 0, parent: desktop, hasList: true, icons: 5 });
+  doc._candidates = [dock];
   settle(doc);
-  assert.ok(second._classes.has('fnos-shell-dock-autohide'), '新元素照常接管');
-  assert.equal(doc.getElementById('fnos-shell-dock-badge'), null, '重新接管同样不得弹提示');
-  // 源码级：成功提示机制已整体移除（greet / TOAST_MS 不得借尸还魂）
-  assert.ok(!DOCK.includes('greet('), 'dock.js 不得再有成功提示函数');
-  assert.ok(!DOCK.includes('TOAST_MS'), 'dock.js 不得再有成功提示时长常量');
+  assert.equal(desktop.style.getPropertyValue('padding-left'), '', '≠ Dock 宽的 padding 不得动');
+  assert.equal(desktop.style.getPropertyValue('grid-template-columns'), '', '≠ Dock 宽的轨不得动');
+  assert.ok(dock._classes.has('fnos-shell-dock-autohide'), 'Dock 本体照常接管');
+});
+
+test('免刷新关闭：接管与回收全部还原（含还原原本就存在的内联值）', () => {
+  const doc = fakeDom();
+  const w = load(doc, { dockAutoHide: true });
+  const desktop = fakeEl({
+    w: 1200, h: 800, left: 0,
+    computed: { display: 'grid', gridTemplateColumns: '68px 1132px' },
+  });
+  const column = fakeEl({ w: 68, h: 800, left: 0, parent: desktop });
+  column._inline['padding-left'] = { value: '40px', priority: '' };  // 上游原本就有内联值
+  column._computed.paddingLeft = '68px';
+  const dock = fakeEl({ w: 53, h: 218, left: 15, top: 300, parent: column, hasList: true, icons: 5 });
+  doc._candidates = [dock];
+  settle(doc);
+  assert.equal(column.style.getPropertyValue('padding-left'), '0px', '先中和');
+
+  w.__FNOS_APPLY_SHELL__({ dockAutoHide: false });
+  assert.equal(column.style.getPropertyValue('padding-left'), '40px', '必须还原上游原本的内联值');
+  assert.equal(desktop.style.getPropertyValue('grid-template-columns'), '', '本壳没设过的内联值必须清掉');
+  assert.equal(dock._classes.size, 0, 'Dock 的 class 必须清干净');
+  assert.equal(column._classes.size, 0, '窄列的 class 必须清干净');
+  assert.equal(dock.style.display, '', 'display 必须还原');
+  assert.equal(column.style.display, '', '窄列的 display 必须还原');
+  assert.ok(doc._moDisconnected, '观察器必须断开');
+  assert.deepEqual(w.__FNOS_DOCK_STATE__(), {
+    enabled: false, found: false, targets: 0, axis: 'x', edgeMin: true, shown: false,
+    reclaimed: [], lastMiss: '',
+  }, '诊断口必须如实');
 });
 
 // ---------- 显隐状态机 ----------
 
-test('开启：观察 document、接管即藏且到点真正离场（display:none）', () => {
+test('开启：观察 document、接管即藏且到点真正离场（display:none）+ 派发 resize', () => {
   const doc = fakeDom();
   load(doc, { dockAutoHide: true });
   assert.deepEqual(
@@ -280,51 +330,33 @@ test('开启：观察 document、接管即藏且到点真正离场（display:non
   );
   assert.equal(typeof doc._listeners.pointermove, 'function');
 
-  const dock = fakeDock({ left: 0, top: 0, right: 68, bottom: 800 }, { hasList: true, icons: 5 });
+  const dock = fakeEl({ w: 68, h: 800, left: 0, top: 0, hasList: true, icons: 5 });
   doc._candidates = [dock];
   doc._moCallback();
   doc._win.drainTimers(); // 第一轮排空：locate 执行（接管即藏）
-  assert.ok(dock._classes.has('fnos-shell-dock-autohide'), '必须加本壳的常驻 class');
   assert.ok(dock._classes.has('fnos-shell-dock-hidden'), '接管即藏（自动隐藏的语义就是平时藏着）');
-  assert.equal(dock.style._props['--fnos-dock-hide-tf'], 'translateX(-105%)', '贴左缘 → 向左滑出');
+  assert.equal(dock.style.getPropertyValue('--fnos-dock-hide-tf'), 'translateX(-105%)', '贴左缘 → 向左滑出');
   assert.equal(dock.style.display, '', '滑出动画期间还在布局里');
   doc._win.drainTimers(); // 第二轮排空：display:none 的延迟到点
-  assert.equal(dock.style.display, 'none', '动画结束后真正 display:none（全屏应用的工作区不再让宽度）');
+  assert.equal(dock.style.display, 'none', '动画结束后真正 display:none');
+  assert.ok(doc._win._resized >= 1, 'Dock 离场必须派发 resize（窗口管理器借它重排）');
 
-  // 指针顶到左缘热区 → 唤回（display 恢复 + 藏身 class 撤掉）
   doc._listeners.pointermove({ clientX: 3, clientY: 400 });
   assert.ok(!dock._classes.has('fnos-shell-dock-hidden'), '边缘热区必须唤回');
   assert.equal(dock.style.display, '', '唤回必须先恢复布局');
 });
 
-test('Dock 离场/回归时派发 resize（窗口管理器借它重排已开窗口）', () => {
-  const doc = fakeDom();
-  const win = doc._win;
-  load(doc, { dockAutoHide: true });
-  const dock = fakeDock({ left: 0, top: 0, right: 68, bottom: 800 }, { hasList: true, icons: 5 });
-  doc._candidates = [dock];
-  settle(doc);
-  doc._win.drainTimers(); // display:none 的延迟到点（离场落地）
-  const resizedAfterHide = win._resized;
-  assert.ok(resizedAfterHide >= 1, 'Dock 离场（display:none 落地）必须派发一次 resize');
-
-  doc._listeners.pointermove({ clientX: 3, clientY: 400 }); // 唤回
-  assert.ok(win._resized > resizedAfterHide, 'Dock 回到布局同样派发 resize');
-});
-
 test('迟滞唤出：藏在 Dock 脚印下的应用按钮可以直接点（只有顶到边缘才唤出）', () => {
   const doc = fakeDom();
   load(doc, { dockAutoHide: true });
-  const dock = fakeDock({ left: 0, top: 0, right: 68, bottom: 800 }, { hasList: true, icons: 5 });
+  const dock = fakeEl({ w: 68, h: 800, left: 0, top: 0, hasList: true, icons: 5 });
   doc._candidates = [dock];
   settle(doc);
   doc._win.drainTimers(); // 已 display:none
 
-  // 指针移到 x=30（Dock 脚印内，但没顶到 6px 边缘带）→ 不得唤出，按钮可点
   doc._listeners.pointermove({ clientX: 30, clientY: 400 });
   assert.ok(dock._classes.has('fnos-shell-dock-hidden'), '脚印内不唤出');
 
-  // 顶到边缘（x=3）→ 唤出；在脚印内移动保持；离开脚印即藏
   doc._listeners.pointermove({ clientX: 3, clientY: 400 });
   assert.ok(!dock._classes.has('fnos-shell-dock-hidden'), '边缘热区唤出');
   doc._listeners.pointermove({ clientX: 40, clientY: 400 });
@@ -336,11 +368,10 @@ test('迟滞唤出：藏在 Dock 脚印下的应用按钮可以直接点（只�
 test('无操作兜底：3 秒没有任何指针事件就藏（iframe 吞事件时只有它能救）', () => {
   const doc = fakeDom();
   load(doc, { dockAutoHide: true });
-  const dock = fakeDock({ left: 0, top: 0, right: 68, bottom: 800 }, { hasList: true, icons: 5 });
+  const dock = fakeEl({ w: 68, h: 800, left: 0, top: 0, hasList: true, icons: 5 });
   doc._candidates = [dock];
   settle(doc);
 
-  // 唤出后再无任何事件 → 排空定时器（idle 兜底）→ 回到隐藏态；再排空一轮 → display:none
   doc._listeners.pointermove({ clientX: 3, clientY: 400 });
   assert.ok(!dock._classes.has('fnos-shell-dock-hidden'));
   doc._win.drainTimers();
@@ -348,18 +379,18 @@ test('无操作兜底：3 秒没有任何指针事件就藏（iframe 吞事件�
   doc._win.drainTimers();
   assert.equal(dock.style.display, 'none');
 
-  // 每次 pointermove 都会重置 idle 计时：持续操作不该被打断
+  // 连续指针事件重置 idle（不得累积多个兜底定时器）
   doc._listeners.pointermove({ clientX: 3, clientY: 400 });
   const pendingBefore = doc._win._timers.size;
   doc._listeners.pointermove({ clientX: 4, clientY: 400 });
-  assert.ok(doc._win._timers.size <= pendingBefore, '连续指针事件重置 idle（不得累积多个兜底定时器）');
+  assert.ok(doc._win._timers.size <= pendingBefore, '未离开引脚时不得新增兜底定时器');
 });
 
 test('指针离开窗口 / 窗口失焦：立即藏（auto-hide 的通用语义）', () => {
   const doc = fakeDom();
   const win = doc._win;
   load(doc, { dockAutoHide: true });
-  const dock = fakeDock({ left: 0, top: 0, right: 68, bottom: 800 }, { hasList: true, icons: 5 });
+  const dock = fakeEl({ w: 68, h: 800, left: 0, top: 0, hasList: true, icons: 5 });
   doc._candidates = [dock];
   settle(doc);
   doc._listeners.pointermove({ clientX: 3, clientY: 400 });
@@ -373,13 +404,15 @@ test('指针离开窗口 / 窗口失焦：立即藏（auto-hide 的通用语义�
   assert.ok(dock._classes.has('fnos-shell-dock-hidden'), '失焦必须藏');
 });
 
-test('贴右缘的 Dock 向右滑出，热区在右缘（不硬编码左缘）', () => {
+test('贴右缘的 Dock 向右滑出，热区在右缘（不硬编码左缘，也不做空间回收）', () => {
   const doc = fakeDom({ vw: 1200 });
   load(doc, { dockAutoHide: true });
-  const dock = fakeDock({ left: 1132, top: 0, right: 1200, bottom: 800 }, { hasList: true, icons: 5 });
+  const holder = fakeEl({ w: 1200, h: 800, left: 0, computed: { paddingLeft: '68px' } });
+  const dock = fakeEl({ w: 68, h: 800, left: 1132, top: 300, parent: holder, hasList: true, icons: 5 });
   doc._candidates = [dock];
   settle(doc);
-  assert.equal(dock.style._props['--fnos-dock-hide-tf'], 'translateX(105%)');
+  assert.equal(dock.style.getPropertyValue('--fnos-dock-hide-tf'), 'translateX(105%)');
+  assert.equal(holder.style.getPropertyValue('padding-left'), '', '贴右缘时不得改左内边距');
   doc._listeners.pointermove({ clientX: 600, clientY: 400 });
   assert.ok(dock._classes.has('fnos-shell-dock-hidden'));
   doc._listeners.pointermove({ clientX: 1196, clientY: 400 });
@@ -389,80 +422,47 @@ test('贴右缘的 Dock 向右滑出，热区在右缘（不硬编码左缘）',
 test('零尺寸 rect（SPA 未布局）不改写贴边结论', () => {
   const doc = fakeDom({ vw: 1200 });
   load(doc, { dockAutoHide: true });
-  const dock = fakeDock({ left: 1132, top: 0, right: 1200, bottom: 800 }, { hasList: true, icons: 5 });
+  const dock = fakeEl({ w: 68, h: 800, left: 1132, top: 300, hasList: true, icons: 5 });
   doc._candidates = [dock];
   settle(doc);
-  assert.equal(dock.style._props['--fnos-dock-hide-tf'], 'translateX(105%)', '先量到有效几何 = 右缘');
-  // 同一元素换成全零 rect（重新布局前的瞬间）：不得被判成「贴左缘」
+  assert.equal(dock.style.getPropertyValue('--fnos-dock-hide-tf'), 'translateX(105%)', '先量到有效几何 = 右缘');
   dock.getBoundingClientRect = () => ({ left: 0, top: 0, right: 0, bottom: 0, width: 0, height: 0 });
   doc._listeners.pointermove({ clientX: 600, clientY: 400 }); // 远处 → 藏（藏前重测）
-  assert.equal(dock.style._props['--fnos-dock-hide-tf'], 'translateX(105%)', '零 rect 沿用右缘结论');
+  assert.equal(dock.style.getPropertyValue('--fnos-dock-hide-tf'), 'translateX(105%)', '零 rect 沿用右缘结论');
 });
 
-test('Dock 被 SPA 换掉时重新接管：旧元素完全还原，新元素接管', () => {
+test('Dock 被 SPA 换掉时重新接管：旧元素与旧回收完全还原，新元素接管', () => {
   const doc = fakeDom();
   load(doc, { dockAutoHide: true });
-  const first = fakeDock({ left: 0, top: 0, right: 68, bottom: 800 }, { hasList: true, icons: 5 });
+  const holder = fakeEl({ w: 1200, h: 800, left: 0, computed: { paddingLeft: '68px' } });
+  const first = fakeEl({ w: 68, h: 800, left: 0, top: 0, parent: holder, hasList: true, icons: 5 });
   doc._candidates = [first];
   settle(doc);
+  assert.equal(holder.style.getPropertyValue('padding-left'), '0px');
 
-  const second = fakeDock({ left: 0, top: 0, right: 68, bottom: 800 }, { hasList: true, icons: 5 });
+  const second = fakeEl({ w: 68, h: 800, left: 0, top: 0, hasList: true, icons: 5 });
   doc._candidates = [second];
   settle(doc);
   assert.ok(!first._classes.has('fnos-shell-dock-autohide') && !first._classes.has('fnos-shell-dock-hidden'),
     '被换掉的旧元素必须清掉本壳加的 class（不留下孤儿状态）');
-  assert.equal(first.style._props['--fnos-dock-hide-tf'], undefined, '内联变量也要清干净');
   assert.equal(first.style.display, '', '被换掉的旧元素不得残留 display:none');
+  assert.equal(holder.style.getPropertyValue('padding-left'), '', '旧的一轮回收必须还原（避免叠加）');
   assert.ok(second._classes.has('fnos-shell-dock-autohide'));
   assert.ok(second._classes.has('fnos-shell-dock-hidden'), '新元素接管即藏');
 });
 
-// ---------- 免刷新切换（shim 转调 __FNOS_APPLY_SHELL__） ----------
-
-test('免刷新切换：关 → 完全还原 / 断观察器 / 摘监听；再开 → 重新接管并立即藏', () => {
-  const doc = fakeDom();
-  const w = load(doc, { dockAutoHide: true });
-  const dock = fakeDock({ left: 0, top: 0, right: 68, bottom: 800 }, { hasList: true, icons: 5 });
-  doc._candidates = [dock];
-  settle(doc);
-
-  w.__FNOS_APPLY_SHELL__({ dockAutoHide: false });
-  assert.ok(doc._moDisconnected, '关闭必须断开观察器');
-  assert.equal(doc._listeners.pointermove, undefined, '关闭必须摘掉指针监听');
-  assert.equal(doc._listeners.pointerleave, undefined, '关闭必须摘掉离窗监听');
-  assert.equal(dock._classes.size, 0, '关闭必须清掉本壳的 class');
-  assert.equal(dock.style._props['--fnos-dock-hide-tf'], undefined, '关闭不留下样式残留');
-  assert.equal(dock.style.display, '', '关闭必须恢复 display（哪怕之前正在隐藏）');
-  assert.equal(doc.getElementById('fnos-shell-dock-badge'), null, '功能关闭时角标必须清除');
-  assert.deepEqual(
-    w.__FNOS_DOCK_STATE__(),
-    { enabled: false, found: false, axis: 'x', edgeMin: true, shown: false, lastMiss: '' },
-    '诊断口必须如实'
-  );
-
-  // 再开：重新接管（observer 重新装上，Dock 出现后照常工作，且立即藏）
-  w.__FNOS_APPLY_SHELL__({ dockAutoHide: true });
-  assert.ok(doc._moObserved && !doc._moDisconnected, '重新开启必须重新观察');
-  const again = fakeDock({ left: 0, top: 0, right: 68, bottom: 800 }, { hasList: true, icons: 5 });
-  doc._candidates = [again];
-  settle(doc);
-  assert.ok(again._classes.has('fnos-shell-dock-autohide'));
-  assert.ok(again._classes.has('fnos-shell-dock-hidden'), '重新开启后立即藏（不依赖第一次指针移动）');
-});
+// ---------- 免刷新切换的形状闸 ----------
 
 test('免刷新切换的形状闸：非 boolean 不动手、同值幂等、非法形状不炸', () => {
   const doc = fakeDom();
   const w = load(doc, {});
-  // 从默认关切到字符串 "true"：形状不对 → 仍然关（观察器都没装）
   w.__FNOS_APPLY_SHELL__({ dockAutoHide: 'true' });
-  assert.equal(doc._moObserved, undefined);
-  // 正常开 → 同值再发一次必须幂等（不能把观察器装两份）
+  assert.equal(doc._moObserved, undefined, '非 boolean 不得开启');
   w.__FNOS_APPLY_SHELL__({ dockAutoHide: true });
   const observed = doc._moObserved;
   w.__FNOS_APPLY_SHELL__({ dockAutoHide: true });
   assert.equal(doc._moObserved, observed, '同值幂等：观察器不得重复安装');
   assert.ok(!doc._moDisconnected, '同值幂等：不得误断观察器');
-  // null / 缺键 / 原始值：什么都不发生
   w.__FNOS_APPLY_SHELL__(null);
   w.__FNOS_APPLY_SHELL__({});
   w.__FNOS_APPLY_SHELL__(42);
