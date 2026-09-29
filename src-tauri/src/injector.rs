@@ -25,6 +25,7 @@ pub const MAX_WALLPAPER_BYTES: usize = config::MAX_WALLPAPER_BYTES;
 const SHIM_JS: &str = include_str!("../inject/shim.js");
 const BOOTSTRAP_JS: &str = include_str!("../inject/bootstrap.js");
 const DOCK_JS: &str = include_str!("../inject/dock.js");
+const KEEPALIVE_JS: &str = include_str!("../inject/keepalive.js");
 const CONTENT_SCRIPT_JS: &str = include_str!("../assets/fnos-mods/content-script.js");
 
 struct Assets {
@@ -485,7 +486,11 @@ pub fn build_init_script_with(cfg: &Config, wallpaper: Option<WallpaperAsset>) -
     // `__FNOS_APPLY_SHELL__`（免刷新态，`commands::apply_to_page`）。
     payload.insert(
         "shell".into(),
-        json!({ "dockAutoHide": cfg.shell.dock_auto_hide }),
+        json!({
+            "dockAutoHide": cfg.shell.dock_auto_hide,
+            // T14c：登录保活心跳的间隔（分钟；0 = 关闭）。消费方 `inject/keepalive.js`。
+            "keepAliveMinutes": cfg.shell.keep_alive_minutes,
+        }),
     );
     payload.insert("assets".into(), Value::Object(asset_map));
     if !binary_map.is_empty() {
@@ -499,6 +504,7 @@ pub fn build_init_script_with(cfg: &Config, wallpaper: Option<WallpaperAsset>) -
          {shim}\n\
          {boot}\n\
          {dock}\n\
+         {keepalive}\n\
          {content}\n",
         ver = SHELL_VERSION,
         commit = MODS_COMMIT,
@@ -507,6 +513,7 @@ pub fn build_init_script_with(cfg: &Config, wallpaper: Option<WallpaperAsset>) -
         shim = SHIM_JS,
         boot = BOOTSTRAP_JS,
         dock = DOCK_JS,
+        keepalive = KEEPALIVE_JS,
         content = wrap_upstream(CONTENT_SCRIPT_JS),
     )
 }
@@ -554,17 +561,26 @@ mod tests {
         // dock 段的锚点用它的 class 名：shim 对 `__FNOS_APPLY_SHELL__` 的**引用**在 shim
         // 段里就出现了，不能当 dock 段的锚点（否则 dock 挪到上游之后本测试仍绿）。
         let i_dock = s.find("fnos-shell-dock-autohide").expect("dock section");
+        // keepalive 段的锚点用它的诊断口名（dock 段里没有这个名字）
+        let i_keep = s
+            .find("__FNOS_KEEPALIVE_TICK__")
+            .expect("keepalive section");
         let i_cs = s.find("hasFnOSSignature").expect("upstream content-script");
         assert!(
-            i_cfg < i_shim && i_shim < i_boot && i_boot < i_dock && i_dock < i_cs,
-            "段落顺序必须是 配置→shim→bootstrap→dock→上游"
+            i_cfg < i_shim
+                && i_shim < i_boot
+                && i_boot < i_dock
+                && i_dock < i_keep
+                && i_keep < i_cs,
+            "段落顺序必须是 配置→shim→bootstrap→dock→keepalive→上游"
         );
     }
 
     #[test]
     fn shell_section_is_narrow_and_defaults_off() {
-        // T14c：shell 段是**手写的窄对象**，只带页面消费的 dockAutoHide；把整个
-        // ShellConfig 序列化下去会把宿主私有的 homeUrl / nasUrl / window 一并交给页面。
+        // T14c：shell 段是**手写的窄对象**，只带页面消费的两个键（dockAutoHide /
+        // keepAliveMinutes）；把整个 ShellConfig 序列化下去会把宿主私有的
+        // homeUrl / nasUrl / window 一并交给页面。
         let v = payload_json(&script(&Config::default()));
         let shell = v
             .get("shell")
@@ -575,19 +591,24 @@ mod tests {
             Some(false),
             "Dock 自动隐藏默认关（config.rs::ShellConfig::default）"
         );
-        assert_eq!(shell.len(), 1, "shell 段只允许 dockAutoHide 一个键");
+        assert_eq!(
+            shell.get("keepAliveMinutes").and_then(|n| n.as_u64()),
+            Some(10),
+            "保活心跳默认 10 分钟（config.rs::ShellConfig::default）"
+        );
+        assert_eq!(shell.len(), 2, "shell 段只允许这两个键");
         assert!(
             v.get("homeUrl").is_none() && v.get("nasUrl").is_none() && v.get("window").is_none(),
             "宿主私有的 shell 字段不得出现在载荷顶层"
         );
 
-        // 打开后经同一通道下发；camelCase 键名（dock.js 读 SHELL.shell.dockAutoHide）
+        // 打开/改间隔后经同一通道下发；camelCase 键名（dock.js / keepalive.js 读 SHELL.shell.*）
         let mut on = Config::default();
         on.shell.dock_auto_hide = true;
-        assert_eq!(
-            payload_json(&script(&on))["shell"]["dockAutoHide"],
-            json!(true)
-        );
+        on.shell.keep_alive_minutes = 0; // 0 = 关闭心跳
+        let payload = payload_json(&script(&on));
+        assert_eq!(payload["shell"]["dockAutoHide"], json!(true));
+        assert_eq!(payload["shell"]["keepAliveMinutes"], json!(0));
     }
 
     #[test]

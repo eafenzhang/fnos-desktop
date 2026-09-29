@@ -164,6 +164,13 @@ cargo tauri build --bundles nsis
   滑出动画结束后 `display:none` 真正离场（全屏应用不再让出 Dock 宽度）、只有指针顶到所在
   边缘的热区才唤出（藏在 Dock 底下的应用按钮可直接点击）、指针离开脚印/离开窗口/窗口失焦
   /无操作 3 秒都会自动隐藏（指针进入 iframe 后顶层收不到事件，靠 idle 兜底）。
+- **登录保活心跳**（T14c，`inject/keepalive.js`）：fnOS 的登录态是**会话级 cookie**
+  （`entry-token`，服务端按访问滑动续期），而桌面顶层文档**自己完全不轮询**（实测 75 秒零请求）
+  ——闲置久了登录会失效。本壳登录后按 `shell.keepAliveMinutes`（默认 **10 分钟**，0 = 关闭）
+  在**同源**上请求一次 SPA 启动时自己也会调的令牌接口（`/app/token`，实测 200 / ~28ms / 空体）。
+  安全边界：路径写死为常量、发请求前校验协议（http/https）与**同源**，因此**不存在用户可控 URL**、
+  也没有 SSRF 面；登录页（有密码输入框）不发，不打扰登录流程。诊断口
+  `__FNOS_KEEPALIVE_STATE__()`（控制台，页面上不画任何东西）。
 - 上游 UI 装在一个 372×522 的 iframe 里（那正是上游 popup 自己写死的 body 尺寸），因此它的样式
   与本壳的区域互不影响。帧在**配置快照就位之后**才创建——上游在脚本开头就同步读版本号。
 - 上游 UI 里没有、也不该有的东西，本壳不会假装有：字体文件导入被如实拒绝（见「已知限制」），
@@ -288,7 +295,7 @@ cargo tauri icon .ref\fnOS_UI_Mods\icons\icon128.png
 |---|---|
 | `src-tauri/src/` | Rust 侧：`paths`（配置/资源路径）、`config`（配置与归一化）、`injector`（注入载荷）、`tray`（托盘）、`commands`（IPC + 窗口/错误页/加载观测） |
 | `src-tauri/assets/fnos-mods/` | 上游 vendored 资源 + `LICENSE` + `NOTICE`（含上游 popup 的 `popup.html` / `popup.js`） |
-| `src-tauri/inject/` | `shim.js`（页面侧 chrome.* 兼容层 + 上报通道）、`bootstrap.js`（配置装配与注入闸门） |
+| `src-tauri/inject/` | `shim.js`（页面侧 chrome.* 兼容层 + 上报通道）、`bootstrap.js`（配置装配与注入闸门）、`dock.js`（Dock 自动隐藏 + 空间回收）、`keepalive.js`（登录保活心跳） |
 | `ui/settings/` | 设置窗前端（零依赖、零构建链）：`settings.html` + `app.js`（本壳区域与宿主桥）、`chrome-shim.js`（iframe 里的 chrome.* 兼容层）、`popup.html`/`popup.js`（上游 UI 的逐字节副本 + 一行标签）、内置错误页 `error.html` |
 | `tests/` | Node 契约测试 |
 | `docs/superpowers/specs/` | 设计文档 |

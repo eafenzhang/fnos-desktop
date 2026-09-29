@@ -152,6 +152,15 @@ pub struct ShellConfig {
     /// （不在 `needs_reload` 判据里——它不是 initialization_script 的静态内容，
     /// 活窗口上就能换）。
     pub dock_auto_hide: bool,
+    /// T14c：登录保活心跳的间隔（**分钟**；0 = 关闭，默认 10）。
+    ///
+    /// 为什么需要：fnOS 的登录态是会话级 cookie（`entry-token`），服务端按访问滑动续期，
+    /// 而桌面顶层文档自己完全不轮询（实测 75 秒零请求）——闲置久了登录失效。注入层的
+    /// `inject/keepalive.js` 按这个间隔在同源上打一拍（`GET /app/token`）。
+    ///
+    /// 上限 1440（一天）：手改配置写成天文数字没有意义，`normalize` 会夹住。
+    /// 与 `dock_auto_hide` 同一条通道下发（载荷 + 免刷新推送），不需要重建窗口。
+    pub keep_alive_minutes: u32,
     pub window: WindowGeom,
 }
 
@@ -163,6 +172,7 @@ impl Default for ShellConfig {
             inject_enabled: true,
             close_to_tray: true,
             dock_auto_hide: false,
+            keep_alive_minutes: 10,
             window: WindowGeom::default(),
         }
     }
@@ -825,6 +835,7 @@ fn sanitize_config_value(raw: Value) -> Value {
     for key in ["injectEnabled", "closeToTray", "dockAutoHide"] {
         sanitize_bool_field(&mut shell, key);
     }
+    sanitize_u32_field(&mut shell, "keepAliveMinutes");
     sanitize_window_field(&mut shell, "window");
     root.insert("shell".into(), Value::Object(shell));
 
@@ -883,6 +894,10 @@ impl Config {
         // `commands::build_main_window` 的 `inner_size(cfg.shell.window.w, h)` 拿到的
         // 一定是可用几何——历史遗留的 `0x0` 不会再建出 0 尺寸窗口。
         self.shell.window.clamp_to_usable();
+        // 保活心跳间隔的上限（T14c）：手改配置写成天文数字没有意义，夹到一天。
+        if self.shell.keep_alive_minutes > 1440 {
+            self.shell.keep_alive_minutes = 1440;
+        }
         // 保存 NAS WebUI 地址时自动把其 origin 并入注入白名单（跳过 1.5s 探测），幂等。
         // `nas_target()` 先做完整校验：非法的 `nasUrl`（如 `javascript:…`）不得混进白名单，
         // 否则会往非飞牛页面注入。
@@ -1011,9 +1026,26 @@ mod tests {
         assert!(c.shell.inject_enabled);
         assert!(c.shell.close_to_tray);
         assert!(!c.shell.dock_auto_hide);
+        assert_eq!(c.shell.keep_alive_minutes, 10, "保活心跳默认 10 分钟");
     }
 
     #[test]
+    /// T14c：保活心跳间隔的夹取（手改配置写成天文数字没有意义）。
+    #[test]
+    fn keep_alive_minutes_is_clamped_to_a_day() {
+        let mut c = Config::default();
+        c.shell.keep_alive_minutes = 5000;
+        c.normalize();
+        assert_eq!(c.shell.keep_alive_minutes, 1440, "上限夹到一天");
+        // 0（关闭）与正常值原样保留
+        c.shell.keep_alive_minutes = 0;
+        c.normalize();
+        assert_eq!(c.shell.keep_alive_minutes, 0, "0 = 关闭，必须保留");
+        c.shell.keep_alive_minutes = 45;
+        c.normalize();
+        assert_eq!(c.shell.keep_alive_minutes, 45);
+    }
+
     fn brand_color_lightness_is_clamped() {
         // 纯白明度 100% → 夹到 70%；纯黑 0% → 夹到 30%
         assert_eq!(normalize_brand_color("#ffffff"), "#b3b3b3"); // L=70%
@@ -1250,10 +1282,12 @@ mod tests {
         let mut c = Config::default();
         c.mods.brand_color = "#336699".into();
         c.shell.dock_auto_hide = true; // T14c：shell 新键随同一份往返
+        c.shell.keep_alive_minutes = 30;
         c.save(&p).unwrap();
         let back = load(&p);
         assert_eq!(back.mods.brand_color, "#336699");
         assert!(back.shell.dock_auto_hide);
+        assert_eq!(back.shell.keep_alive_minutes, 30);
         assert_eq!(back.schema_version, SCHEMA_VERSION);
 
         // 旧版本（无 schemaVersion / 缺字段）应能补齐。
@@ -1294,6 +1328,7 @@ mod tests {
         assert!(c.shell.inject_enabled);
         assert!(c.shell.close_to_tray);
         assert!(!c.shell.dock_auto_hide);
+        assert_eq!(c.shell.keep_alive_minutes, 10, "保活心跳默认 10 分钟");
         assert_eq!(c.shell.window.w, 1200.0);
         assert_eq!(c.schema_version, SCHEMA_VERSION);
 
@@ -1698,6 +1733,7 @@ mod tests {
                 "injectEnabled": "true",
                 "closeToTray": "false",
                 "dockAutoHide": "true",
+                "keepAliveMinutes": "25",
                 "window": { "w": "1200", "h": 900, "x": null, "y": "30" }
               }
             }"##,
@@ -1737,6 +1773,8 @@ mod tests {
         assert!(!c.shell.close_to_tray);
         // T14c："true" → true（默认关，故 true 只能来自强制转换，不是回落默认）
         assert!(c.shell.dock_auto_hide);
+        // T14c：数字字符串 → 数字（默认 10，故 25 只能来自强制转换）
+        assert_eq!(c.shell.keep_alive_minutes, 25);
         // window：数字字符串 / 数字 / null / 数字字符串
         assert_eq!(c.shell.window.w, 1200.0);
         assert_eq!(c.shell.window.h, 900.0);

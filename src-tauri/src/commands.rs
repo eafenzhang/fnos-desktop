@@ -558,8 +558,11 @@ fn apply_to_page<R: Runtime>(app: &AppHandle<R>, cfg: &Config) {
         "local": &cfg.local,
         // T14c：shell 段只发页面消费的键（与 injector 载荷同一条窄化原则——
         // homeUrl/nasUrl/window 是宿主私有，不得借免刷新通道发给页面）。
-        // 消费方：shim 的 `__FNOS_APPLY_CONFIG__` → `__FNOS_APPLY_SHELL__`（dock.js）。
-        "shell": { "dockAutoHide": cfg.shell.dock_auto_hide },
+        // 消费方：shim 的 `__FNOS_APPLY_CONFIG__` → `__FNOS_APPLY_SHELL__`（dock.js / keepalive.js）。
+        "shell": {
+            "dockAutoHide": cfg.shell.dock_auto_hide,
+            "keepAliveMinutes": cfg.shell.keep_alive_minutes,
+        },
     });
     match serde_json::to_string(&payload) {
         Ok(json) => {
