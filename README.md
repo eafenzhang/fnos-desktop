@@ -128,18 +128,45 @@ cargo tauri build --bundles nsis
 配置路径由 `src-tauri/src/paths.rs` 的 `config_dir()` 决定（`%APPDATA%\<identifier>`），
 `config.rs::config_path()` 在其下取 `config.json`；设置窗「关于」页显示的 `配置文件` 就是它。
 
-## 托盘菜单（6 个动作项 + 1 条分隔线）
+## 托盘菜单（4 个动作项 + 1 条分隔线）
 
-1. **注入 mods**（勾选项，与设置窗的总开关同一份配置；改动会重建主窗口以换用新载荷）
-2. **打开 NAS**（未配置 `nasUrl` 时置灰；配置了就直接导航主窗口过去）
-3. **显示 / 隐藏主窗口**
-4. **重新加载主窗口**（从错误页恢复的正路之一）
-5. **系统设置**（打开设置窗）
-6. —— 分隔线 ——
-7. **退出**（保存窗口几何后结束进程）
+1. **显示窗口**（显示 + 前置主窗口；最小化的先还原。**不是**显示/隐藏开关）
+2. **重新加载**（按当前配置重建主窗口，从错误页恢复的正路之一）
+3. **系统设置**（打开设置窗）
+4. —— 分隔线 ——
+5. **退出**（保存窗口几何后结束进程）
 
+> **T14a 变更**：移除了「注入 mods」勾选项（该总开关只在设置窗，配置项
+> `shell.injectEnabled` 与改动后重建主窗口的行为完全不变）与「打开 NAS」项。
+> 菜单不再有勾选态或置灰态，因此宿主侧「把配置推给菜单」的同步通路
+> （原 `tray::sync_menus`）已整体删除——不存在「菜单状态与 `config.json` 不一致」这一类缺陷。
+>
 > Windows 11 默认把托盘图标收进「显示隐藏的图标」的折叠区里；验收脚本走的就是
 > UIAutomation 展开折叠区 → 键盘导航（`↓`×N + `Enter`，每步回读 `accFocus`）这条通路。
+
+## 应用与托盘图标
+
+托盘图标与 `bundle.icon` 用的都是上游 fnOS 品牌图标（`.ref/fnOS_UI_Mods/icons/icon*.png`，
+渐变圆角方块 + 白色牛头），**不是**手绘占位图：
+
+| 用途 | 文件 | 来源 |
+|---|---|---|
+| 托盘通知区域图标（32×32） | `src-tauri/assets/fnos-mods/icons/icon32.png` | `include_bytes!` 进 `tray.rs` |
+| Windows 可执行文件图标 | `src-tauri/icons/icon.ico`（内含 16/24/32/48/64/256 六个尺寸） | `cargo tauri icon` 由 128 px 源生成 |
+| 安装包 / 其它平台兜底 | `src-tauri/icons/icon.png`（512×512） | 同上 |
+
+四枚 PNG 全部经 `tools/vendor-mods.ps1` 逐字节 vendor 进 `src-tauri/assets/fnos-mods/icons/`，
+SHA-256 记在 `assets/fnos-mods/NOTICE`（连同包装改动第 6 条）。重新生成：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\vendor-mods.ps1
+cargo tauri icon .ref\fnOS_UI_Mods\icons\icon128.png
+```
+
+`cargo tauri icon` 会额外产出 Android / iOS / Windows Store 资产与本项目用不到的尺寸
+（`icon.icns`、`Square*Logo.png` 等）。本项目只打 NSIS、只引用 `icon.ico` 与 `icon.png`，
+所以那批产物在生成后即删除（另见 `tools/vendor-mods.ps1` 的 NOTICE 第 6 条）。
+
 
 ## 失败模式与恢复（实际行为）
 
@@ -161,7 +188,8 @@ cargo tauri build --bundles nsis
   **修改版必须明确说明做过改动**。
 - 因此：`src-tauri/assets/fnos-mods/` 内保留上游 `LICENSE` 原文，并新增 `NOTICE`
   （来源仓库 + 锁定 commit `483c3e2` + 各文件 SHA-256 + **本壳的包装性改动清单**：chrome shim、
-  `getURL` 改写为 data URL、`mod.js` 兜底执行、配置改由宿主提供、`content-script.js` 的包装执行）。
+  `getURL` 改写为 data URL、`mod.js` 兜底执行、配置改由宿主提供、`content-script.js` 的包装执行、
+  **T14a 起把上游品牌图标 `icons/icon{16,32,48,128}.png` 用作本应用自身图标**）。
 - 这两个文件通过 `bundle.resources` **随安装包分发**到安装目录的 `fnos-mods\`
   （`LICENSE` → `<安装目录>\fnos-mods\LICENSE`，`NOTICE` → `<安装目录>\fnos-mods\NOTICE`，卸载时一并删除）。
   普通 `cargo build` 也会在 `src-tauri\target\<profile>\fnos-mods\` 放一份（`tauri-build` 的 `copy_resources`），

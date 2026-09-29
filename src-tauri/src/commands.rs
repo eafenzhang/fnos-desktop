@@ -515,9 +515,6 @@ pub fn set_config<R: Runtime>(
     cfg.save(&path).map_err(|e| e.to_string())?;
 
     apply_to_page(&app, &cfg);
-    if let Err(e) = tray::sync_menus(&app, &cfg) {
-        eprintln!("[fnos] 托盘同步失败: {e}");
-    }
     Ok(SetResult {
         config: config_view(
             &cfg,
@@ -595,7 +592,7 @@ fn build_main_window_with<R: Runtime>(
         .title("fnOS")
         // 不变式（Item 2）：`cfg.shell.window` 已经由 `Config::normalize`
         //（`WindowGeom::clamp_to_usable`）夹成可用几何，而所有进入 `AppState` 的 `Config`
-        // 都经过它（`load` / `set_config` / `reset_config` / `set_inject_enabled` /
+        // 都经过它（`load` / `set_config` / `reset_config` / `reload_main` /
         // `save_window_geom`），所以这里不会再拿到 `0x0` 或负数。
         .inner_size(cfg.shell.window.w, cfg.shell.window.h)
         // spec §7「主窗口：标题跟随页面」。tauri/wry **不会**自动把 `document.title`
@@ -895,8 +892,8 @@ fn on_page_chunk<R: Runtime>(window: &WebviewWindow<R>, payload: &str) {
 
 /// 新文档与最近一次上报**不是同一个文档**（origin 或 URL 不同）→ 丢掉旧上报。
 ///
-/// 主窗口可以在不改任何配置的情况下换页面（页内链接、托盘「打开 NAS」、重定向，甚至是同一
-/// 个白名单 origin 下的另一个文档）。旧页面上报的「已注入」不能拿来描述新页面——
+/// 主窗口可以在不改任何配置的情况下换页面（页内链接、`reload_main` 的显式地址、重定向，
+/// 甚至是同一个白名单 origin 下的另一个文档）。旧页面上报的「已注入」不能拿来描述新页面——
 /// `get_page_report` 也会再判一次，这里是「新文档到达时顺手清掉」，免得一条过期证据一直
 /// 躺在内存里。
 ///
@@ -1019,7 +1016,7 @@ pub fn on_page_event<R: Runtime>(
         return;
     }
     eprintln!("[fnos] 主窗口页面已加载: {url}");
-    // Task 13a：页内导航（托盘「打开 NAS」的 `navigate`、页面里的链接、重定向）**不走**
+    // Task 13a：页内导航（`reload_main` 的 `navigate`、页面里的链接、重定向）**不走**
     // `begin_load`，所以上面那段带世代闸门的代码会直接 return——清理必须放在闸门**之前**，
     // 否则新文档与旧上报不同文档（换 origin，或同一个 origin 下的另一篇文档）时那条证据会
     // 一直留着。`get_page_report` 读取时还会再判一次（那时的 URL 已经是新文档），两层都必要：
@@ -1221,9 +1218,6 @@ fn rebuild_main<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     }
     .map_err(|e| e.to_string());
     state.recreating.store(false, Ordering::SeqCst);
-    if let Err(e) = tray::sync_menus(app, &cfg) {
-        eprintln!("[fnos] 托盘同步失败: {e}");
-    }
     let window = built?;
     // Item 3：隐藏态保持隐藏、最小化态保持最小化（不抢前台）、最大化态还原最大化。
     // 三者都不做 `set_focus()`——重建是配置变更的副作用，不该替用户切换前台窗口。
@@ -1236,7 +1230,7 @@ fn rebuild_main<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
 /// 调用方负责先把这一轮的目标摆好（`recreate_url` / `recreate_error`）。
 /// 时序：置 `recreating` → 记下显示态（可见 / 最小化 / 最大化）+ 存几何 → `close()` 旧窗口
 /// → 关闭请求这次不再被拦 → `Destroyed` 回调（`on_main_destroyed`）里建同 label 新窗口
-/// → 套回显示态 → 清标志 → `sync_menus`。
+/// → 套回显示态 → 清标志（T14a 前这里还要 `sync_menus`，菜单改为无状态后已删除）。
 /// **不能**在 `close()` 之后立刻建：label 注册表在 `Destroyed` 才释放，否则
 /// `WindowLabelAlreadyExists`。
 fn trigger_recreate<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
@@ -1275,7 +1269,7 @@ fn trigger_recreate<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
 /// 替换；`__FNOS_APPLY_CONFIG__` 只能推 `mods` / `local`。round 0 的
 /// `location.reload()` 因此永远关不掉注入。
 ///
-/// Task 11：这条路径也是**唯一**的「重试」实现（设置窗状态条、托盘「重新加载主窗口」、
+/// Task 11：这条路径也是**唯一**的「重试」实现（设置窗状态条、托盘「重新加载」、
 /// 错误页自动重试都走它）。它显式清掉待建的错误页目标——用户/调度要的是真实页面。
 pub fn recreate_main_window<R: Runtime>(
     app: &AppHandle<R>,
@@ -1293,7 +1287,7 @@ pub fn recreate_main_window<R: Runtime>(
     trigger_recreate(app)
 }
 
-/// 托盘「重新加载主窗口」：按配置的 `homeUrl` 重建主窗口（从错误页恢复的正路之一）。
+/// 托盘「重新加载」：按配置的 `homeUrl` 重建主窗口（从错误页恢复的正路之一）。
 pub fn reload_main_window<R: Runtime>(app: &AppHandle<R>) {
     if let Err(e) = recreate_main_window(app, None) {
         eprintln!("[fnos] 重新加载主窗口失败: {e}");
@@ -1470,11 +1464,8 @@ pub fn reset_config<R: Runtime>(app: AppHandle<R>, scope: String) -> Result<Conf
         .map_err(|e| e.to_string())?;
     *app.state::<AppState>().config.lock().unwrap() = cfg.clone();
     apply_to_page(&app, &cfg);
-    if let Err(e) = tray::sync_menus(&app, &cfg) {
-        eprintln!("[fnos] 托盘同步失败: {e}");
-    }
-    // 与 `set_config` 同一判据：reset 也可能把 `injectEnabled` / `homeUrl` 拉回默认值
-    // （round 0 只在这里补了 `sync_menus`），同样必须重建主窗口才算生效。
+    // 与 `set_config` 同一判据：reset 也可能把 `injectEnabled` / `homeUrl` 拉回默认值，
+    // 同样必须重建主窗口才算生效。
     if cfg.shell.inject_enabled != prev_shell.inject_enabled
         || cfg.shell.home_url != prev_shell.home_url
     {
@@ -1586,42 +1577,6 @@ pub fn open_settings<R: Runtime>(app: &AppHandle<R>) {
     }
 }
 
-/// 托盘「注入 mods」勾选项（gap (a)）。
-///
-/// round 0 是 `location.reload()`：重载后跑的仍是建窗时注册的那份初始化脚本，取消勾选
-/// 关不掉注入。现在改成**重建主窗口**——新窗口只注册 `build_init_script`（关闭时为空串），
-/// 旧窗口连同它的注入脚本一起被销毁。
-pub fn set_inject_enabled<R: Runtime>(app: &AppHandle<R>, enabled: bool) {
-    let mut cfg = current(app);
-    cfg.shell.inject_enabled = enabled;
-    cfg.normalize();
-    let _ = cfg.save(&Config::config_path());
-    *app.state::<AppState>().config.lock().unwrap() = cfg.clone();
-    if let Err(e) = tray::sync_menus(app, &cfg) {
-        eprintln!("[fnos] 托盘同步失败: {e}");
-    }
-    if let Err(e) = recreate_main_window(app, None) {
-        eprintln!("[fnos] 注入开关重建主窗口失败: {e}");
-    }
-}
-
-pub fn open_nas<R: Runtime>(app: &AppHandle<R>) {
-    let cfg = current(app);
-    // Finding 1：`nas_target()` 是唯一判据（与托盘置灰同源）。未配置**或填错**都去设置窗，
-    // 不再像 round 0 那样对非法 URL 静默什么都不做。
-    let Some(url) = cfg.shell.nas_url_parsed() else {
-        eprintln!("[fnos] nasUrl 未配置或非法，改为打开设置窗");
-        open_settings(app);
-        return;
-    };
-    if let Some(w) = app.get_webview_window(MAIN_WINDOW) {
-        let _ = w.navigate(url);
-        let _ = w.show();
-        let _ = w.unminimize();
-        let _ = w.set_focus();
-    }
-}
-
 /// 挂载托管状态并落盘（首启调用一次）。
 ///
 /// round 0 里叫 `apply_home_url`，但名字与行为不符——它不「应用」任何地址，只是
@@ -1657,7 +1612,7 @@ pub fn save_window_geom<R: Runtime>(app: &AppHandle<R>) {
     // 最小化时**不能**保存几何：Windows 对最小化窗口报 `inner_size = 0x0`、
     // `outer_position = -32000,-32000`，存下去就把下一次启动的窗口放到屏幕外
     //（实测：最小化后 WM_CLOSE → config 里留下 w=0/h=0/x=-32000/y=-32000）。
-    // 跳过保存即保留上一次的合法几何。这是本轮验证 `toggle_main` 的最小化分支时发现的
+    // 跳过保存即保留上一次的合法几何。这是本轮验证托盘「显示窗口」的最小化分支时发现的
     // 附带缺陷（见 task-7-8-fix1-report.md）。
     if win.is_minimized().unwrap_or(false) {
         return;

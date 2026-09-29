@@ -14,6 +14,11 @@ Packaging changes made by this project (upstream files themselves are UNMODIFIED
      bytes are embedded in a generated wrapper (src-tauri/src/injector.rs) that runs them only
      once document.documentElement exists (MutationObserver on document, DOMContentLoaded
      fallback) and records a synchronous throw as window.__FNOS_UPSTREAM_ERROR__
+  6. the upstream brand marks icons/icon{16,32,48,128}.png are used as this application's own
+     icon: `cargo tauri icon` is run on the 128 px source to produce src-tauri/icons/icon.ico
+     (multi-size) and src-tauri/icons/icon.png, and icons/icon32.png is embedded with
+     include_bytes! as the tray icon. No upstream pixel is altered; tool-generated sizes above
+     128 px are upscales of that same 128 px source (the largest size upstream ships).
 
 File SHA-256:
   0b2783e045934f8b71bb2419ad45c04afb610c7f291cc1e5086df346029b867f       1390  LICENSE
@@ -26,6 +31,10 @@ File SHA-256:
   e780f1a3ff1e919c2ca2dd6f2dc5582dcf168915d0d80f1576dddb825967b845       2746  spotlight_launchpad_mod.css
   d60a498f3c2c291c388c0b251326df00165d0fa40d3a4b49d69c204fb5c454c1       5108  desktop_icon_mod.css
   51d8e233684c44af2b8f73de011248e440ee27b5c9df34e0f5eb67799eecbb57      12213  lockscreen_mod.css
+  7ee6d7e0be43b16e81d2a213b4e744a4ff29b3396c7fe9de3cbfe13a00254f9e        884  icons/icon16.png
+  58dac5d0256b5be447881bbc9e1308512399f1105d7ed73a8a8d19d9f65b92d9       2402  icons/icon32.png
+  1eb584c7daf487bd36f0d318cf1d38b7ee9457e69eb06c1096326755dbbfb810       4433  icons/icon48.png
+  4c1328aa7bc159430bb186d102e9c0a13962360045e9dfc06c912de0d64dd2f8      21195  icons/icon128.png
   3aec53babc7ffc524f1cd604c71ba71f4a0a08cf07883b83432f1d302e49e003        750  prefect_icon/icon-map.json
   848a1dae653f7a947f40f2b1b9dc2da5a53027963d659a11e7d224196b77d077      66978  prefect_icon/alist.png
   8b09b764127f722724dba1511b321d11d18e3fc30144f810a61ca66b73fc114e      68339  prefect_icon/emby.png

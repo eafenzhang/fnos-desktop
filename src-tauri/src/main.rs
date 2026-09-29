@@ -40,11 +40,9 @@ fn main() {
             commands::build_main_window(app.handle(), url, &cfg)?;
 
             tray::install(app.handle())?;
-            // Task 8 Step 3 的合并结果：菜单状态跟随配置。`sync_menus` 是唯一机制
-            //（否则勾选态恒为 true、`打开 NAS` 恒为可点，与 config.json 不一致）。
-            if let Err(e) = tray::sync_menus(app.handle(), &cfg) {
-                eprintln!("[fnos] 托盘同步失败: {e}");
-            }
+            // T14a：托盘菜单只剩 4 个无状态动作项（显示窗口 / 重新加载 / 系统设置 / 退出），
+            // 没有勾选态也没有置灰态，原先「把配置推给菜单」的 `sync_menus` 通路随之删除
+            // ——不再存在「菜单状态与 config.json 不一致」这一类缺陷。
             Ok(())
         })
         .on_window_event(|window, event| {

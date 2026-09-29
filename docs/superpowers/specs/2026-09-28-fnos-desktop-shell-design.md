@@ -106,7 +106,7 @@ config (纯数据) ──► injector (纯函数) ──► main/tray/commands (
 |---|---|---|---|
 | `config` | 读写 `config.json`，归一化，迁移 | `Config::load() -> Result<Config>`、`config.save()` | 仅文件系统 |
 | `injector` | 把 `Config` + vendored 资源拼成一段 JS | `build_init_script(&Config, &Assets) -> String`（**纯函数，可快照测试**） | `config` 只读 |
-| `tray` | 建托盘、发菜单事件 | `tray::install(app, &Config)` | `config`、`commands` |
+| `tray` | 建托盘（图标 + 菜单）、发菜单事件 | `tray::install(app)` | `config`、`commands` |
 | `commands` | 设置窗 IPC | `invoke("get_config")` 等，见 §8.3 | `config`、`injector` |
 | `ui/settings` | 呈现配置、发起 IPC | 只通过 §8.3 契约与 Rust 通信 | 无（浏览器环境） |
 | `inject/shim.js` | 伪装 `chrome.*` 子集 | 被 `injector` 串进注入载荷；也可被 Node 测试直接加载 | 无 |
@@ -255,7 +255,7 @@ Tauri initialization_script（每次顶层文档导航、HTML 解析前）
 |---|---|---|
 | `homeUrl` | 主窗口启动地址 | 默认 `https://fnos.net/` |
 | `nasUrl` | NAS WebUI 地址 | 保存时**自动把其 origin 并入 `mods.enabledOrigins`**，从而跳过 1.5s 探测 |
-| `injectEnabled` | 总开关（托盘勾选项） | 关闭时不注入 `content-script.js`，仅保留空壳 |
+| `injectEnabled` | 总开关（设置窗；T14a 前托盘也有一个勾选项） | 关闭时不注入 `content-script.js`，仅保留空壳 |
 | `closeToTray` | 关窗隐藏 | D5 默认 `true` |
 | `window` | 窗口几何 | 关闭时保存、启动时恢复 |
 
@@ -287,18 +287,26 @@ Tauri initialization_script（每次顶层文档导航、HTML 解析前）
 - **托盘菜单**：
 
 ```
-✓ 注入 mods                      → 翻转 shell.injectEnabled，即时重注入
-  打开 NAS                       → 有 nasUrl 则主窗口导航过去；未配置则置灰
-  显示 / 隐藏主窗口
-  重新加载主窗口                  → 以当前配置重建主窗口（错误页/卡死后的手动重试入口）
+  显示窗口                       → show + set_focus；最小化的先 unminimize（不是显示/隐藏开关）
+  重新加载                       → 以当前配置重建主窗口（错误页/卡死后的手动重试入口）
   系统设置                       → 打开设置窗
   ──────────────
   退出
 ```
 
 > **勘误（2026-09-28，T11）**：菜单在原文 5 项之外新增「重新加载主窗口」（T11 修复轮落地），运行时 HMENU 实测 **6 个可点击项 + 1 条分隔线**。新增项是错误页之外的第二条重试入口（错误页处于应用来源，capability 故意不授权它调用 IPC）。
-
-- 托盘图标：内存生成的 32×32 RGBA（探针已验证 `Image::new_owned`），正式版换成 `icons/` 里的设计图标
+>
+> **勘误（2026-09-29，T14a）**：按用户要求收敛为 **4 个动作项 + 1 条分隔线**（上面的菜单块已改为现状）：
+> 「注入 mods」勾选项移出托盘（该总开关只在设置窗，配置项 `shell.injectEnabled` 与
+> `set_config` 的「变了就重建主窗口」行为不变），「打开 NAS」整项删除（连同它的
+> `nasUrl` 置灰逻辑与 `commands::open_nas`）；「显示 / 隐藏主窗口」改为只显示 + 前置的
+> 「显示窗口」，「重新加载主窗口」改名为「重新加载」。菜单不再有勾选态/置灰态，因此
+> 宿主侧「把配置推给菜单」的同步通路（原 `tray::sync_menus`）整体删除。
+> 本段之上的 T11 勘误与 §12.2 的历史读数仍是当时 revision 的事实，未回改。
+>
+> - 托盘图标：上游品牌图标的 32×32 那一枚（`assets/fnos-mods/icons/icon32.png`，
+>   `include_bytes!`），不再是内存手绘的 32×32 RGBA 占位图；`bundle.icon` 的
+>   `icon.ico` / `icon.png` 由 `cargo tauri icon` 从同一来源的 128 px 图生成
 - 单实例：重复启动只唤起已有窗口
 
 ---
@@ -421,11 +429,11 @@ Tauri initialization_script（每次顶层文档导航、HTML 解析前）
 ### 12.2 端到端验收清单（M1–M3 完成时逐条执行，需 D7 的 FN ID `ea121314`）
 
 1. 启动 → 主窗口打开 `https://fnos.net/`，**页面无任何 mods 注入痕迹**（官网被正确跳过）
-2. 托盘右键菜单 **6 个可点击项 + 1 条分隔线** 存在，勾选项渲染为 ✓（勘误 2026-09-28：原文误写「四项」；T11 又补了「重新加载主窗口」，见 §7 的菜单块与勘误）
+2. 托盘右键菜单 **4 个可点击项 + 1 条分隔线** 存在（显示窗口 / 重新加载 / 系统设置 / 退出；勘误 2026-09-28：原文误写「四项」；T11 补了「重新加载主窗口」变 6 项；**勘误 2026-09-29 T14a**：按用户要求收敛为 4 项并去掉勾选项与「打开 NAS」，见 §7 的菜单块与 T14a 勘误）
 3. 设置窗填 NAS WebUI 地址（或走 FN ID 登录后取当前页）→ 保存后 `enabledOrigins` 含该 origin
 4. 在 NAS WebUI 页面：`basic_mod.css` 生效（外观变化）、`mod.js` 行为生效（窗口动画/squircle）
 5. 切换 `titlebarStyle` / `launchpadStyle` / 主题色 → **不刷新页面即时生效**
-6. 关闭主窗口 → 进程仍在托盘；`显示/隐藏` 可恢复
+6. 关闭主窗口 → 进程仍在托盘；托盘「显示窗口」可恢复
 7. 退出 → 进程结束，配置持久化
 8. 安全项：外部页面 console 调用 `invoke('set_config')` 被拒
 9. 安装包：NSIS 安装 → 桌面/开始菜单入口 → 卸载干净
@@ -437,7 +445,7 @@ Tauri initialization_script（每次顶层文档导航、HTML 解析前）
 | 页面未通过签名判定（上游不注入） | 设置窗顶部状态条提示「未检测到 fnOS WebUI」，并提供「把当前页加入白名单」一键操作。**已落地形态（T11）**：设置窗通过**仅它可用**的只读命令 `get_page_state` 取主窗口当前 URL 与最近一次加载结果，据此判定；判定只看「是否 fnos.net / 是否在 `enabledOrigins` 或 `nasUrl` 的 origin 内」，因此弱态文案只声明「注入脚本已注册」而不谎称已生效。双向页面上报通道仍留待 P1 |
 | 外链 CSS 被 CSP 拦截 | §5.3 兜底 B 自动接管（`adoptedStyleSheets`） |
 | `mod.js` data URL 被拦 | §5.4 兜底执行 |
-| 主窗口加载失败/离线 | 切到内置错误页（显示失败地址、原因、重试指引与自动退避 15s→30s→60s→120s），重试入口有三处：设置窗按钮、托盘「重新加载主窗口」、错误页自动退避。**勘误（2026-09-28，T11 实测）**：原文设想的「`on_page_load` 失败时」**不可行** —— wry 0.57 丢弃了 `NavigationCompleted` 的 `IsSuccess`（`wry-0.57.0/src/webview2/mod.rs:726-737`），且 `ICoreWebView2::Source` 在失败后仍返回请求地址，Chromium 的错误页也不会以 `chrome-error` 形式出现。实际实现为三层：① URL 短路（非 http(s) 直接判失败）；② **页面自检探针** —— 初始化脚本检测 Chromium 错误页特征（`#main-frame-error` / `body.neterror`）并以可打印 ASCII 前缀 `FNOSPROBE:` 经 `document.title` 回传（复用既有的标题跟随机制，**不经 IPC，因此不违反 R2，也不给远程页任何授权**）；③ **20s 看门狗**兜底「能连上但永不完成」的情况 |
+| 主窗口加载失败/离线 | 切到内置错误页（显示失败地址、原因、重试指引与自动退避 15s→30s→60s→120s），重试入口有三处：设置窗按钮、托盘「重新加载」（T14a 前叫「重新加载主窗口」）、错误页自动退避。**勘误（2026-09-28，T11 实测）**：原文设想的「`on_page_load` 失败时」**不可行** —— wry 0.57 丢弃了 `NavigationCompleted` 的 `IsSuccess`（`wry-0.57.0/src/webview2/mod.rs:726-737`），且 `ICoreWebView2::Source` 在失败后仍返回请求地址，Chromium 的错误页也不会以 `chrome-error` 形式出现。实际实现为三层：① URL 短路（非 http(s) 直接判失败）；② **页面自检探针** —— 初始化脚本检测 Chromium 错误页特征（`#main-frame-error` / `body.neterror`）并以可打印 ASCII 前缀 `FNOSPROBE:` 经 `document.title` 回传（复用既有的标题跟随机制，**不经 IPC，因此不违反 R2，也不给远程页任何授权**）；③ **20s 看门狗**兜底「能连上但永不完成」的情况 |
 | WebView2 运行时缺失 | 启动时检测，缺失则提示并给微软运行时下载入口（不静默失败） |
 | WebView2 版本过低（< 139） | 「关于」页提示 `corner-shape` 效果退化（版本取 `tauri::webview_version()`，不做注册表探测） |
 | `config.json` 损坏 | 回退默认 + 保留 `.bak` + 设置窗状态条回显「配置文件损坏，已回退默认并保留 config.json.bak」（`meta.recoveredFromBackup`） |
