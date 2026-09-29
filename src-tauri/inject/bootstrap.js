@@ -121,7 +121,16 @@
     // rgb(38,77,143)，只占 1px）。裁掉壁纸顶部 1px，那条线就没有了；下方由页面底色承接，
     // 视觉无缝。
     '#root .absolute.inset-0.z-0.object-contain' +
-    '{clip-path:inset(1px 0 0 0) !important;}';
+    '{clip-path:inset(1px 0 0 0) !important;}' +
+    // Dock 宽度预留（T14c 修复轮 14）：fnOS 用 Tailwind 自定义值类 `pl-[66px]` 给内容区
+    // 留出 Dock 的宽度。此前只在 JS 里事后中和——fnOS 一旦（悬浮唤出 Dock、经典启动台
+    // 重渲染等时机）重新生成这个容器，就会有一帧带着预留，表现为「左侧空白闪一下」。
+    // 样式层没有这个中间帧：元素一出现就是 0。
+    // 只钉死这个**具体值**的类（66px 就是本机 Dock 宽，见实测），其余取值仍由
+    // `inject/dock.js` 的 `reclaimLayoutPadding` 兜（它按「满尺寸容器 + 预留值落在
+    // 24–200px」判定，覆盖别的 fnOS 版本）。
+    '.pl-\\[66px\\]' +
+    '{padding-left:0 !important;}';
   var shellCssInstalled = false;
 
   function installShellCss() {

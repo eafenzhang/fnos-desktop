@@ -705,12 +705,15 @@ fn open_app_window<R: Runtime>(
     // 标题栏样式跟随配置（`mods.titlebarStyle`）：桌面里的窗口长什么样，应用窗口就长什么样
     let style = current(app).mods.titlebar_style.clone();
     let spec = serde_json::json!({ "style": style, "label": label, "title": title });
-    // 嵌套弹窗（应用自己再开小窗）同样走这条裁定
+    // 默认摆在**主窗口（桌面）中间**：用户要的是「在应用内居中显示」——窗口可能不在屏幕中央，
+    // 那就相对桌面居中；桌面窗口取不到时退回屏幕居中。
+    let size = (APP_WINDOW_W, APP_WINDOW_H);
+    let centered = desktop_centered_position(app, size);
+    // 嵌套弹窗（应用自己再自己开小窗）同样走这条裁定
     let app_for_nested = app.clone();
-    WebviewWindowBuilder::new(app, &label, WebviewUrl::External(url))
+    let mut builder = WebviewWindowBuilder::new(app, &label, WebviewUrl::External(url))
         .title(title)
-        .inner_size(1100.0, 700.0)
-        .center()
+        .inner_size(size.0, size.1)
         // 无边框：标题栏由 `inject/appchrome.js` 自绘（Windows 保留可缩放边框，拖边缘仍能改大小）
         .decorations(false)
         .initialization_script(format!(
@@ -718,8 +721,33 @@ fn open_app_window<R: Runtime>(
             spec = spec,
             script = injector::APP_CHROME_JS
         ))
-        .on_new_window(move |url, _features| new_window_verdict(&app_for_nested, url))
-        .build()
+        .on_new_window(move |url, _features| new_window_verdict(&app_for_nested, url));
+    builder = match centered {
+        Some((x, y)) => builder.position(x, y),
+        None => builder.center(),
+    };
+    builder.build()
+}
+
+/// 应用窗口的默认尺寸（逻辑像素）。
+const APP_WINDOW_W: f64 = 1100.0;
+const APP_WINDOW_H: f64 = 700.0;
+
+/// 「在主窗口（桌面）里居中」的位置（逻辑坐标）；主窗口不在时返回 `None`（调用方退回屏幕居中）。
+///
+/// 取的是主窗口的**外框**位置与尺寸：应用窗口比桌面大时按 0 偏移（左上对齐），
+/// 免得算出屏幕外的负坐标。
+fn desktop_centered_position<R: Runtime>(
+    app: &AppHandle<R>,
+    size: (f64, f64),
+) -> Option<(f64, f64)> {
+    let main = app.get_webview_window(MAIN_WINDOW)?;
+    let scale = main.scale_factor().ok()?;
+    let pos = main.outer_position().ok()?.to_logical::<f64>(scale);
+    let outer = main.outer_size().ok()?.to_logical::<f64>(scale);
+    let x = pos.x + ((outer.width - size.0) / 2.0).max(0.0);
+    let y = pos.y + ((outer.height - size.1) / 2.0).max(0.0);
+    Some((x, y))
 }
 
 /// 建**内置错误页**窗口（Task 11 / spec §12.3「主窗口加载失败/离线」）。
@@ -2794,6 +2822,22 @@ mod tests {
         assert!(
             body.contains(".decorations(false)"),
             "应用窗口必须无边框（否则原生标题栏与桌面窗口样式不统一）"
+        );
+        // 默认位置：相对**主窗口（桌面）**居中，取不到主窗口才退回屏幕居中
+        assert!(
+            body.contains("desktop_centered_position(app, size)")
+                && body.contains("builder.center()"),
+            "应用窗口必须相对主窗口居中（退回屏幕居中）"
+        );
+        let center_fn = src
+            .find("fn desktop_centered_position")
+            .expect("居中函数必须存在");
+        // 按函数结尾（第一个 `\n}\n`）切，避免按字节切到多字节字符中间
+        let tail = &src[center_fn..];
+        let center_body = &tail[..tail.find("\n}\n").unwrap_or(tail.len())];
+        assert!(
+            center_body.contains("outer_position()") && center_body.contains("outer_size()"),
+            "居中必须取主窗口的外框位置与尺寸"
         );
         assert!(
             body.contains("mods.titlebar_style"),
