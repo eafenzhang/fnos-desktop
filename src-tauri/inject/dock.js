@@ -27,15 +27,17 @@
  *   离场   —— 滑出动画结束后 `display:none`：transform 藏得住视觉，藏不住按 rect 做的
  *            工作区计算。
  *
- * 空间回收（T14c 修复轮 7）：只把 Dock 藏起来**不等于**把左侧那条预留宽度还回来——实测
- * 「桌面与应用全屏左侧仍有空白」。那条约 68px 的空白可能来自四种布局机制，本层按「谁在
- * 预留」逐一识别并中和（都只在识别到「宽度≈Dock 宽」时动手，teardown 时逐条还原）：
- *   ① Dock 被一个**贴左缘、几乎满高、宽度≈Dock 宽**的窄列包着（列本身在流内占位）
- *      → 把该列一并藏掉（`columnAncestors`）；
- *   ② 某个祖先用 `padding-left` / `margin-left` 预留 → 置 0；
- *   ③ 某个祖先用 grid 的第一轨预留 → 该轨置 0px；
- *   ④ 宽度是 JS 常量（与 DOM 无关）→ 本层无法回收，只能由窗口管理器自己重算
- *      （Dock 离场时会派发一次 resize，尽力触发它）。
+ * 空间回收（T14c 修复轮 7～8）：只把 Dock 藏起来**不等于**把左侧那条预留宽度还回来——实测
+ * 「桌面与应用全屏左侧仍有空白」。在用户的 fnOS 上实测到**两条**互不相同的机制，本层分别中和
+ * （都只在识别到「预留宽度」时动手，teardown 时逐条还原）：
+ *   ① 布局容器用**内边距**预留：桌面根 `<div class="relative flex …">` 里，内容区
+ *      `<div class="… pl-[66px]">` 把 Dock 宽写成左内边距 → 中和该内边距（含 margin / grid
+ *      首轨两种同族变体）。它同时修正了桌面图标区与一切流内内容。
+ *   ② 应用窗口用**工具类**预留：fnOS 的窗口管理器给「最大化到工作区」的窗口加
+ *      `!left-[66px]` / `!right-0` / `!w-[calc(100%-66px)]`（均 `!important`，66 = Dock 宽，
+ *      三处同数）。绝对定位元素不吃父级 padding，所以 ① 对窗口无效，必须按同一签名覆盖
+ *      `left`/`width`（窗口回到自由尺寸时类消失，覆盖随即撤回）。
+ *   两种机制的宽度都以**类名/计算样式里读到的实际预留值**为准，不写死 66。
  *
  * 开关链路：
  *   初始态   —— 注入载荷 `__FNOS_SHELL__.shell.dockAutoHide`（injector.rs 只发页面消费的键）
@@ -75,6 +77,7 @@
   var DOCK_SIDE_MAX = 140;   // 「Dock 形状」的窄边上限 / 长边下限（像素）
   var STRIP_MIN = 24;        // 预留宽度识别区间：窄于此不值得动（不是 Dock 栏宽度）
   var STRIP_MAX = 200;       // 宽于此不是 Dock 栏（可能是内容区），一律不动手
+  var LAYOUT_PASS_MIN_MS = 1500; // 布局预留扫描的节流间隔（覆盖一旦写上就一直在）
 
   var enabled = SHELL_CFG.dockAutoHide === true;
   var dock = null;       // 当前接管的 Dock 本体（可能被 SPA 换掉，observer 会重新找）
@@ -88,6 +91,7 @@
   var idleTimer = null;  // 无操作兜底定时器（armIdle）
   var displayTimer = null; // 滑出动画结束后真正 display:none 的定时器
   var lastMiss = '';     // 最近一次「全部策略落空」的计数快照（控制台诊断用）
+  var lastPaddingPass = 0; // 上一次布局预留扫描的时间戳（节流）
 
   var CSS =
     '.' + HOST_CLASS + '{transition:transform .28s cubic-bezier(.4,0,.2,1);}' +
@@ -131,12 +135,6 @@
   /** 本壳自己的元素绝不能被当成 Dock。 */
   function isOwnEl(el) {
     return !!(el && el.id && String(el.id).indexOf('fnos-shell') === 0);
-  }
-
-  function nodeWidth(el) {
-    var w = el.offsetWidth || 0;
-    if (w > 0) return w;
-    try { return el.getBoundingClientRect().width || 0; } catch (e) { return 0; }
   }
 
   // ---------- 多策略定位（S1 → S2 → S3 → S4；全部落空时把计数写进 lastMiss） ----------
@@ -266,35 +264,7 @@
 
   // ---------- 空间回收：把「谁预留了左侧那条宽度」找出来中和掉 ----------
 
-  /**
-   * 承载 Dock 的窄列：贴左缘、几乎满高、宽度不超过 Dock 的两倍（可能有多级）。
-   * 这些列本身在流内占位，只藏 Dock 藏不掉它们预留的宽度。
-   */
-  function columnAncestors(from, stripW) {
-    var out = [];
-    var vh = W.innerHeight || 0;
-    var el = from;
-    var maxW = Math.max(stripW * 2, stripW + 24);
-    for (var i = 0; el && i < 6; i++) {
-      var p = el.parentElement;
-      if (!p || p === D.body || p === D.documentElement) break;
-      var r;
-      try { r = p.getBoundingClientRect(); } catch (e) { break; }
-      var w = r.width || 0;
-      var fullHeight = vh ? r.height >= vh * 0.8 : false;
-      if (fullHeight && w > 0 && w <= maxW && r.left <= 8) {
-        out.push(p);
-        el = p;
-      } else break;
-    }
-    return out;
-  }
-
-  function isNear(value, target, tol) {
-    return isFinite(value) && Math.abs(value - target) <= tol;
-  }
-
-  /** 把某个祖先的「预留属性」置为 !important 的新值，并记账以便还原（同一属性只记一次）。 */
+  /** 把某个元素的「预留属性」置为 !important 的新值，并记账以便还原（同一属性只记一次）。 */
   function override(el, prop, value) {
     for (var i = 0; i < reclaimed.length; i++) {
       if (reclaimed[i].el === el && reclaimed[i].prop === prop) return;
@@ -305,7 +275,7 @@
     try { el.style.setProperty(prop, value, 'important'); } catch (e) { /* 不支持就算了 */ }
   }
 
-  /** grid 第一轨的数值（`gridTemplateColumns` 可能是 "68px 1132px" 或含 minmax(...)）。 */
+  /** grid 第一轨的数值（`gridTemplateColumns` 可能是 "66px 1134px" 或含 minmax(...)）。 */
   function firstTrack(template) {
     var s = String(template == null ? '' : template).trim();
     if (!s) return NaN;
@@ -315,16 +285,26 @@
     return m ? parseFloat(m[1]) : NaN;
   }
 
-  /** 中和一个祖先的预留：padding-left / margin-left / grid 第一轨，值≈stripW 才动手。 */
-  function neutralize(el, stripW, tol) {
+  /**
+   * 机制①：某个容器用**内边距/外边距/grid 首轨**预留了左侧宽度 → 中和掉。
+   * 判据是「满尺寸容器 + 预留值落在合理区间（[`STRIP_MIN`, `STRIP_MAX`]）」，不写死具体数值
+   * （用户机上实测是 Tailwind 的 `pl-[66px]`，66 = Dock 宽）。
+   */
+  function neutralizeSpacer(el, vw, vh) {
+    var rect;
+    try { rect = el.getBoundingClientRect(); } catch (e) { return; }
+    if (!(rect.width >= vw - 4 && rect.height >= vh * 0.8)) return; // 只有满尺寸容器才是内容区
     var cs = null;
     try { cs = W.getComputedStyle ? W.getComputedStyle(el) : null; } catch (e) { cs = null; }
     if (!cs) return;
-    if (isNear(parseFloat(cs.paddingLeft), stripW, tol)) override(el, 'padding-left', '0px');
-    if (isNear(parseFloat(cs.marginLeft), stripW, tol)) override(el, 'margin-left', '0px');
+    var pl = parseFloat(cs.paddingLeft);
+    if (isFinite(pl) && pl >= STRIP_MIN && pl <= STRIP_MAX) override(el, 'padding-left', '0px');
+    var ml = parseFloat(cs.marginLeft);
+    if (isFinite(ml) && ml >= STRIP_MIN && ml <= STRIP_MAX) override(el, 'margin-left', '0px');
     if (cs.display === 'grid') {
       var template = String(cs.gridTemplateColumns || '');
-      if (isNear(firstTrack(template), stripW, tol)) {
+      var track = firstTrack(template);
+      if (isFinite(track) && track >= STRIP_MIN && track <= STRIP_MAX) {
         var parts = template.trim().split(/\s+(?![^()]*\))/);
         parts[0] = '0px';
         override(el, 'grid-template-columns', parts.join(' '));
@@ -332,20 +312,116 @@
     }
   }
 
+  /** 在 root 及其后代里**有界**地找预留容器（深度 ≤ 4、每层 ≤ 40、总数 ≤ 400）。 */
+  function neutralizeIn(root, vw, vh, depth, budget) {
+    if (!root || depth > 4 || budget.n <= 0) return;
+    budget.n -= 1;
+    neutralizeSpacer(root, vw, vh);
+    var kids = root.children;
+    if (!kids) return;
+    for (var i = 0; i < kids.length && i < 40; i++) {
+      neutralizeIn(kids[i], vw, vh, depth + 1, budget);
+    }
+  }
+
   /**
-   * 回收 Dock 让出的那条宽度：从 Dock 沿祖先链找出「用 padding / margin / grid 第一轨
-   * 预留了 ≈ Dock 宽」的容器并中和（只处理贴左缘的形态；每条都记账，teardown 还原）。
+   * 机制①的入口。fnOS 实测结构：
+   *   <div class="relative flex …">            ← 桌面根（flex 行）
+   *     <div class="fixed inset-y-0 left-0">    ← Dock（本壳接管；fixed 不占位）
+   *     <div class="… pl-[66px]">               ← 内容区：桌面图标与窗口都在里面
+   *   </div>
+   * 所以预留写在 Dock 的**同级内容区**上（也从 Dock 的祖先链兜一层），本函数两处都扫。
+   *
+   * 有界 + 节流：一次最多 400 个节点，且两次之间至少 [`LAYOUT_PASS_MIN_MS`]——容器是稳定的，
+   * 覆盖一旦写上就一直在（除非容器被 SPA 换掉，那时下一轮会补上）。
    */
-  function reclaimReservedSpace(stripW) {
-    if (!(stripW >= STRIP_MIN && stripW <= STRIP_MAX)) return;
-    if (!(axis === 'x' && edgeMin)) return; // 只处理最左缘的形态
-    var tol = Math.max(2, stripW * 0.15);
-    var el = dock;
-    for (var depth = 0; el && depth < 10; el = el.parentElement, depth++) {
+  function reclaimLayoutPadding() {
+    if (!(axis === 'x' && edgeMin)) return; // 只处理贴左缘的形态
+    var now = Date.now();
+    if (now - lastPaddingPass < LAYOUT_PASS_MIN_MS) return;
+    lastPaddingPass = now;
+    var vw = W.innerWidth || 0;
+    var vh = W.innerHeight || 0;
+    var budget = { n: 400 };
+    var host = dock && dock.parentElement;
+    if (host && host.children) {
+      for (var i = 0; i < host.children.length; i++) {
+        if (host.children[i] === dock) continue;
+        neutralizeIn(host.children[i], vw, vh, 1, budget);
+      }
+    }
+    for (var el = dock, depth = 0; el && depth < 10; el = el.parentElement, depth++) {
       var parent = el.parentElement;
       if (!parent || parent === D.documentElement) break;
-      neutralize(parent, stripW, tol);
+      neutralizeSpacer(parent, vw, vh);
     }
+  }
+
+  // ---------- 机制②：应用窗口的工作区偏移（fnOS 把 Dock 宽写死在工具类里） ----------
+
+  /**
+   * fnOS 的窗口管理器用 Tailwind 工具类把「工作区 = 视口 − Dock 宽」写死，三处**同数**且都带
+   * `!important`：`!left-[66px]` / `!right-0` / `!w-[calc(100%-66px)]`。绝对定位元素不吃父级
+   * padding，所以机制①动不了窗口——必须按同一签名覆盖 `left`/`width`。签名里三处的数字必须
+   * 一致，否则不动手（宁可不动，也不误伤别的定位）。
+   */
+  var MAXIMIZED_LEFT = /(?:^|\s)!left-\[(\d+)px\](?:\s|$)/;
+  var MAXIMIZED_WIDTH = /(?:^|\s)!w-\[calc\(100%-(\d+)px\)\](?:\s|$)/;
+
+  /** 返回预留宽度（px）——只有「三处同数 + `!right-0`」齐备时才算「最大化到工作区」的窗口。 */
+  function maximizedSignature(el) {
+    var cls = '';
+    try { cls = String(el.className || ''); } catch (e) { return null; }
+    if (cls.indexOf('!right-0') < 0) return null;
+    var left = MAXIMIZED_LEFT.exec(cls);
+    var width = MAXIMIZED_WIDTH.exec(cls);
+    if (!left || !width || left[1] !== width[1]) return null;
+    var n = parseInt(left[1], 10);
+    return isFinite(n) && n >= STRIP_MIN && n <= STRIP_MAX ? n : null;
+  }
+
+  var windowFixes = [];   // 被覆盖过定位的窗口（签名消失时逐条撤回）
+
+  /** 撤回签名已消失的窗口覆盖（用户把窗口改回自由尺寸时，定位权还给窗口管理器）。 */
+  function revertWindowFixes() {
+    for (var i = windowFixes.length - 1; i >= 0; i--) {
+      var el = windowFixes[i];
+      if (maximizedSignature(el)) continue; // 仍是最大化形态：保持覆盖
+      try {
+        el.style.removeProperty('left');
+        el.style.removeProperty('width');
+      } catch (e) { /* 元素没了就算了 */ }
+      windowFixes.splice(i, 1);
+    }
+  }
+
+  /** 把「最大化到工作区」的窗口拉回满宽（Dock 已让位；覆盖只到签名消失为止）。 */
+  function reclaimWorkspaceWindows() {
+    revertWindowFixes();
+    if (!(axis === 'x' && edgeMin)) return;
+    var nodes;
+    // 候选用 fnOS 自己的窗口类（语义明确、数量少）；签名仍是最终判据
+    try { nodes = D.querySelectorAll('[class*="app-layout--window"]'); } catch (e) { return; }
+    for (var i = 0; nodes && i < nodes.length; i++) {
+      var el = nodes[i];
+      if (!maximizedSignature(el)) continue;
+      try {
+        el.style.setProperty('left', '0px', 'important');
+        el.style.setProperty('width', '100%', 'important');
+      } catch (e) { /* 不支持就算了 */ }
+      if (windowFixes.indexOf(el) < 0) windowFixes.push(el);
+    }
+  }
+
+  /** teardown 用：撤回全部窗口覆盖（无条件）。 */
+  function releaseWindowFixes() {
+    for (var i = 0; i < windowFixes.length; i++) {
+      try {
+        windowFixes[i].style.removeProperty('left');
+        windowFixes[i].style.removeProperty('width');
+      } catch (e) { /* 元素没了就算了 */ }
+    }
+    windowFixes = [];
   }
 
   function restoreReclaimed() {
@@ -371,11 +447,13 @@
     } catch (e) { /* 不支持就算了 */ }
   }
 
-  /** 释放全部接管元素 + 还原所有被中和的预留。 */
+  /** 释放全部接管元素 + 还原所有被中和的预留与窗口覆盖。 */
   function releaseAll() {
     for (var i = 0; i < targets.length; i++) releaseOne(targets[i]);
     targets = [];
     dock = null;
+    lastPaddingPass = 0; // 覆盖刚被还原：下一轮立刻补扫（节流窗口不作数）
+    releaseWindowFixes();
     restoreReclaimed();
   }
 
@@ -425,20 +503,14 @@
   function locate() {
     locateScheduled = false;
     var found = findDock();
-    if (!found) return;
-    if (found !== dock) {
+    if (found && found !== dock) {
       releaseAll();
       dock = found;
+      targets = [found];
+      found.classList.add(HOST_CLASS);
       // 先定贴边方向：空间回收（只处理贴左缘）与滑出方向都依赖它，而它只能从**当前可见**
       // 的 Dock 几何量出来——晚于这一步量就会拿到默认值（修复轮 7 的实现次序）。
       syncTransform();
-      // 接管集合：Dock 本体 + 承载它的窄列（列在流内占位，必须一并藏，见文件头的①②）
-      var stripW = nodeWidth(found);
-      targets = [found].concat(columnAncestors(found, stripW));
-      for (var i = 0; i < targets.length; i++) targets[i].classList.add(HOST_CLASS);
-      // 预留宽度按**最外层接管元素**的宽度算（窄列比 Dock 本体宽时以列为准）
-      var outer = targets[targets.length - 1];
-      reclaimReservedSpace(nodeWidth(outer) || stripW);
       // 接管即按当前意图落态（默认 = 藏）：不等第一次 pointermove，否则用户在设置里
       // 打开开关、切回主窗口，鼠标不动就永远看不到效果（修复轮 2）。
       // 指针恰好在 Dock 上时先不藏（:hover 读的是当前真实悬停链）。
@@ -447,6 +519,11 @@
       if (hovered) shown = true;
       renderState();
     }
+    if (!dock) return;
+    // 空间回收每一批变更都重跑（窗口会动态开关/最大化）：机制①（内边距）幂等，
+    // 机制②（窗口工具类）自带「签名消失即撤回」。
+    reclaimLayoutPadding();
+    reclaimWorkspaceWindows();
   }
 
   /** observer 回调的合并入口：SPA 一批变更只安排一次重找。 */
@@ -527,12 +604,16 @@
 
   /**
    * 诊断口（控制台可见，**不向页面画任何东西**；T14c 修复轮 7 起页面上不再有提示）：
-   * `__FNOS_DOCK_STATE__()` 返回接管状态、预留中和记账与各策略的候选计数。
+   * `__FNOS_DOCK_STATE__()` 返回接管状态、空间回收记账与各策略的候选计数。
    */
   W.__FNOS_DOCK_STATE__ = function () {
+    var props = [];
+    for (var i = 0; i < reclaimed.length; i++) {
+      if (props.indexOf(reclaimed[i].prop) < 0) props.push(reclaimed[i].prop);
+    }
     return {
       enabled: enabled, found: !!dock, targets: targets.length, axis: axis, edgeMin: edgeMin,
-      shown: shown, reclaimed: reclaimed.map(function (r) { return r.prop; }), lastMiss: lastMiss,
+      shown: shown, reclaimed: props, windowsFixed: windowFixes.length, lastMiss: lastMiss,
     };
   };
 

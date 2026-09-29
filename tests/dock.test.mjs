@@ -70,6 +70,7 @@ function fakeDom(opts = {}) {
     _items: [],      // querySelectorAll(上游任务栏项选择器) 的返回
     _fixed: [],      // querySelectorAll('.fixed') 的返回
     _all: [],        // querySelectorAll('body *') 的返回
+    _queryAll: {},   // 其余选择器（机制②的窗口候选）由用例直接喂
     body,
     documentElement: fakeEl({ w: 1200, h: 800 }),
     adoptedStyleSheets: [],
@@ -88,7 +89,7 @@ function fakeDom(opts = {}) {
       if (sel === 'body *') return doc._all;
       // 上游任务栏项选择器（含 w-[47px] 与 !border-l-[3px] 的转义，桩按特征识别）
       if (sel.indexOf('\\[47px\\]') >= 0 && sel.indexOf('border-l') >= 0) return doc._items;
-      return [];
+      return doc._queryAll[sel] || [];
     },
     addEventListener(ev, fn) { this._listeners[ev] = fn; },
     removeEventListener(ev) { delete this._listeners[ev]; },
@@ -242,79 +243,127 @@ test('S3：S1/S2 落空时，贴边 + Dock 形状 + 图标丰富的固定容器�
 
 // ---------- 空间回收（T14c 修复轮 7） ----------
 
-test('承载 Dock 的窄列一并接管（列在流内占位，只藏 Dock 藏不掉它预留的宽度）', () => {
+test('机制①：同级内容区的 pl-[66px]（fnOS 实测形态）→ 中和为 0', () => {
   const doc = fakeDom();
   load(doc, { dockAutoHide: true });
-  const column = fakeEl({ w: 68, h: 800, left: 0 });
-  const dock = fakeEl({ w: 53, h: 218, left: 15, top: 300, parent: column, hasList: true, icons: 5 });
+  // 桌面根：flex 行，两个子节点 —— Dock（fixed，不占位）与内容区（pl-[66px] 预留）
+  const root = fakeEl({ w: 1200, h: 800, left: 0 });
+  const dock = fakeEl({ w: 66, h: 800, left: 0, top: 0, parent: root, hasList: true, icons: 5 });
+  const content = fakeEl({
+    w: 1200, h: 800, left: 0, parent: root,
+    computed: { paddingLeft: '66px' },
+  });
+  root.children = [dock, content];
   doc._candidates = [dock];
   settle(doc);
-  assert.ok(dock._classes.has('fnos-shell-dock-autohide'), 'Dock 本体必须接管');
-  assert.ok(column._classes.has('fnos-shell-dock-autohide'), '窄列必须一并接管');
-  doc._win.drainTimers();
-  assert.equal(column.style.display, 'none', '窄列必须真正离场（否则左侧仍有一条空白）');
-  assert.equal(dock.style.display, 'none');
+  assert.equal(content.style.getPropertyValue('padding-left'), '0px',
+    '内容区的预留内边距必须归零（桌面图标与流内内容都在它里面）');
+  assert.equal(content._inline['padding-left'].priority, 'important', '必须带 !important（压过 Tailwind 类）');
+  assert.equal(dock._classes.has('fnos-shell-dock-autohide'), true, 'Dock 本体照常接管');
 });
 
-test('祖先的 padding-left / grid 第一轨 ≈ Dock 宽 → 中和为 0（宽度还回桌面与窗口）', () => {
+test('机制①：预留写在祖先链上时同样中和；子节点深处也能找到', () => {
   const doc = fakeDom();
   load(doc, { dockAutoHide: true });
   const desktop = fakeEl({
     w: 1200, h: 800, left: 0,
-    computed: { display: 'grid', gridTemplateColumns: '68px 1132px', paddingLeft: '68px' },
+    computed: { display: 'grid', gridTemplateColumns: '66px 1134px', paddingLeft: '66px' },
   });
-  const column = fakeEl({ w: 68, h: 800, left: 0, parent: desktop });
-  const dock = fakeEl({ w: 53, h: 218, left: 15, top: 300, parent: column, hasList: true, icons: 5 });
+  const dock = fakeEl({ w: 66, h: 800, left: 0, top: 0, parent: desktop, hasList: true, icons: 5 });
   doc._candidates = [dock];
   settle(doc);
-  assert.equal(desktop.style.getPropertyValue('padding-left'), '0px',
-    '预留空间的那个祖先（这里是 grid 容器）的 padding-left 必须归零');
-  assert.equal(desktop._inline['padding-left'].priority, 'important', '必须带 !important（压过上游样式）');
-  assert.equal(desktop.style.getPropertyValue('grid-template-columns'), '0px 1132px',
+  assert.equal(desktop.style.getPropertyValue('padding-left'), '0px', '祖先的 padding-left 必须归零');
+  assert.equal(desktop.style.getPropertyValue('grid-template-columns'), '0px 1134px',
     'grid 第一轨必须归零（其余轨保持原样）');
 });
 
-test('空间回收的闸门：宽度对不上的祖先一律不动手', () => {
+test('机制①的闸门：非满尺寸容器、过小/过大的预留一律不动手', () => {
   const doc = fakeDom();
   load(doc, { dockAutoHide: true });
-  const desktop = fakeEl({
-    w: 1200, h: 800, left: 0,
-    computed: { display: 'grid', gridTemplateColumns: '200px 1000px', paddingLeft: '24px' },
-  });
-  const dock = fakeEl({ w: 68, h: 800, left: 0, parent: desktop, hasList: true, icons: 5 });
+  const root = fakeEl({ w: 1200, h: 800, left: 0 });
+  const dock = fakeEl({ w: 66, h: 800, left: 0, top: 0, parent: root, hasList: true, icons: 5 });
+  const small = fakeEl({ w: 400, h: 300, left: 0, parent: root, computed: { paddingLeft: '66px' } });
+  const tiny = fakeEl({ w: 1200, h: 800, left: 0, parent: root, computed: { paddingLeft: '8px' } });
+  const huge = fakeEl({ w: 1200, h: 800, left: 0, parent: root, computed: { paddingLeft: '320px' } });
+  root.children = [dock, small, tiny, huge];
   doc._candidates = [dock];
   settle(doc);
-  assert.equal(desktop.style.getPropertyValue('padding-left'), '', '≠ Dock 宽的 padding 不得动');
-  assert.equal(desktop.style.getPropertyValue('grid-template-columns'), '', '≠ Dock 宽的轨不得动');
-  assert.ok(dock._classes.has('fnos-shell-dock-autohide'), 'Dock 本体照常接管');
+  assert.equal(small.style.getPropertyValue('padding-left'), '', '非满尺寸容器不是内容区，不得动');
+  assert.equal(tiny.style.getPropertyValue('padding-left'), '', '过小的内边距不是 Dock 预留');
+  assert.equal(huge.style.getPropertyValue('padding-left'), '', '过大的内边距不是 Dock 预留');
 });
 
-test('免刷新关闭：接管与回收全部还原（含还原原本就存在的内联值）', () => {
+test('机制②：窗口的 !left-[66px] / !right-0 / !w-[calc(100%-66px)] → left/width 被拉回满宽', () => {
+  const doc = fakeDom();
+  load(doc, { dockAutoHide: true });
+  const dock = fakeEl({ w: 66, h: 800, left: 0, top: 0, hasList: true, icons: 5 });
+  doc._candidates = [dock];
+  const win = fakeEl({ w: 1134, h: 800, left: 66, top: 0 });
+  win.className = 'trim-ui__app-layout--window !inset-y-0 !left-[66px] !right-0 !w-[calc(100%-66px)]';
+  doc._queryAll['[class*="app-layout--window"]'] = [win];
+  settle(doc);
+  assert.equal(win.style.getPropertyValue('left'), '0px', '窗口左偏移必须归零');
+  assert.equal(win.style.getPropertyValue('width'), '100%', '窗口宽度必须补回满宽');
+  assert.equal(win._inline.left.priority, 'important', '必须带 !important（压过 Tailwind 类）');
+});
+
+test('机制②：签名不完整/数字不一致时不动手；签名消失后覆盖被撤回（用户改回自由尺寸）', () => {
   const doc = fakeDom();
   const w = load(doc, { dockAutoHide: true });
-  const desktop = fakeEl({
-    w: 1200, h: 800, left: 0,
-    computed: { display: 'grid', gridTemplateColumns: '68px 1132px' },
-  });
-  const column = fakeEl({ w: 68, h: 800, left: 0, parent: desktop });
-  column._inline['padding-left'] = { value: '40px', priority: '' };  // 上游原本就有内联值
-  column._computed.paddingLeft = '68px';
-  const dock = fakeEl({ w: 53, h: 218, left: 15, top: 300, parent: column, hasList: true, icons: 5 });
+  const dock = fakeEl({ w: 66, h: 800, left: 0, top: 0, hasList: true, icons: 5 });
   doc._candidates = [dock];
+  // ① 缺 !right-0 → 不是最大化签名
+  const partial = fakeEl({ w: 1134, h: 800, left: 66 });
+  partial.className = 'trim-ui__app-layout--window !left-[66px] !w-[calc(100%-66px)]';
+  // ② 三处数字不一致 → 不动手
+  const mixed = fakeEl({ w: 1134, h: 800, left: 66 });
+  mixed.className = 'trim-ui__app-layout--window !left-[66px] !right-0 !w-[calc(100%-80px)]';
+  // ③ 正常签名 → 覆盖
+  const win = fakeEl({ w: 1134, h: 800, left: 66 });
+  win.className = 'trim-ui__app-layout--window !left-[66px] !right-0 !w-[calc(100%-66px)]';
+  doc._queryAll['[class*="app-layout--window"]'] = [partial, mixed, win];
   settle(doc);
-  assert.equal(column.style.getPropertyValue('padding-left'), '0px', '先中和');
+  assert.equal(partial.style.getPropertyValue('left'), '', '缺 !right-0 不得动手');
+  assert.equal(mixed.style.getPropertyValue('width'), '', '三处数字不一致不得动手');
+  assert.equal(win.style.getPropertyValue('left'), '0px', '完整签名必须覆盖');
+
+  // 用户把窗口改回自由尺寸：类消失 → 下一轮把定位权还给窗口管理器
+  win.className = 'trim-ui__app-layout--window';
+  win._inline.left = { value: '240px', priority: '' }; // 窗口管理器随后写入的自由位置
+  doc._moCallback();
+  doc._win.drainTimers();
+  assert.ok(!win.style.getPropertyValue('left') || win.style.getPropertyValue('left') === '240px',
+    '签名消失后本壳必须撤回覆盖（定位权还给窗口管理器）');
+  assert.equal(win.style.getPropertyValue('width'), '', 'width 覆盖同样撤回');
+  assert.equal(w.__FNOS_DOCK_STATE__().windowsFixed, 0, '诊断口必须如实');
+});
+
+test('免刷新关闭：接管、内边距中和与窗口覆盖全部还原（含还原原本就存在的内联值）', () => {
+  const doc = fakeDom();
+  const w = load(doc, { dockAutoHide: true });
+  const root = fakeEl({ w: 1200, h: 800, left: 0 });
+  const dock = fakeEl({ w: 66, h: 800, left: 0, top: 0, parent: root, hasList: true, icons: 5 });
+  const content = fakeEl({ w: 1200, h: 800, left: 0, parent: root, computed: { paddingLeft: '66px' } });
+  content._inline['padding-left'] = { value: '40px', priority: '' }; // 上游原本就有内联值
+  const win = fakeEl({ w: 1134, h: 800, left: 66 });
+  win.className = 'trim-ui__app-layout--window !left-[66px] !right-0 !w-[calc(100%-66px)]';
+  root.children = [dock, content];
+  doc._candidates = [dock];
+  doc._queryAll['[class*="app-layout--window"]'] = [win];
+  settle(doc);
+  assert.equal(content.style.getPropertyValue('padding-left'), '0px', '先中和');
+  assert.equal(win.style.getPropertyValue('left'), '0px', '先覆盖');
 
   w.__FNOS_APPLY_SHELL__({ dockAutoHide: false });
-  assert.equal(column.style.getPropertyValue('padding-left'), '40px', '必须还原上游原本的内联值');
-  assert.equal(desktop.style.getPropertyValue('grid-template-columns'), '', '本壳没设过的内联值必须清掉');
+  assert.equal(content.style.getPropertyValue('padding-left'), '40px', '必须还原上游原本的内联值');
+  assert.equal(win.style.getPropertyValue('left'), '', '窗口覆盖必须撤回');
+  assert.equal(win.style.getPropertyValue('width'), '', '窗口宽覆盖必须撤回');
   assert.equal(dock._classes.size, 0, 'Dock 的 class 必须清干净');
-  assert.equal(column._classes.size, 0, '窄列的 class 必须清干净');
   assert.equal(dock.style.display, '', 'display 必须还原');
-  assert.equal(column.style.display, '', '窄列的 display 必须还原');
   assert.ok(doc._moDisconnected, '观察器必须断开');
   assert.deepEqual(w.__FNOS_DOCK_STATE__(), {
     enabled: false, found: false, targets: 0, axis: 'x', edgeMin: true, shown: false,
-    reclaimed: [], lastMiss: '',
+    reclaimed: [], windowsFixed: 0, lastMiss: '',
   }, '诊断口必须如实');
 });
 
