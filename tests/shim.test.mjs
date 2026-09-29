@@ -74,6 +74,22 @@ test('__FNOS_APPLY_CONFIG__ 派发 onChanged 增量', async () => {
   assert.equal(events[0][1].brandColor.oldValue, '#336699');
 });
 
+test('__FNOS_APPLY_CONFIG__ 把 shell 段惰性转调 __FNOS_APPLY_SHELL__（T14c）', () => {
+  // 有钩子：原样转发 shell 段（shim 不解释 shell 键语义，dock.js 接手）
+  const w = loadShim(SHELL);
+  const got = [];
+  w.__FNOS_APPLY_SHELL__ = (patch) => got.push(patch);
+  w.__FNOS_APPLY_CONFIG__({ mods: {}, local: {}, shell: { dockAutoHide: true } });
+  assert.deepEqual(got, [{ dockAutoHide: true }]);
+  // 没有 shell 段：不调用（老宿主只推 mods/local 时零开销）
+  got.length = 0;
+  w.__FNOS_APPLY_CONFIG__({ mods: { brandColor: '#ff0000' } });
+  assert.deepEqual(got, []);
+  // 钩子抛错：被吞掉，storage 通道照常工作（壳功能不得拖累上游配置）
+  w.__FNOS_APPLY_SHELL__ = () => { throw new Error('dock boom'); };
+  w.__FNOS_APPLY_CONFIG__({ mods: {}, local: {}, shell: { dockAutoHide: false } });
+});
+
 test('getManifest 返回 meta.modsVersion，缺 meta 时回落 0.0.0', () => {
   const w = loadShim({ ...SHELL, meta: { modsVersion: '1.2.3' } });
   assert.equal(w.chrome.runtime.getManifest().version, '1.2.3');

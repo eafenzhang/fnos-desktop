@@ -24,6 +24,7 @@ pub const MAX_WALLPAPER_BYTES: usize = config::MAX_WALLPAPER_BYTES;
 
 const SHIM_JS: &str = include_str!("../inject/shim.js");
 const BOOTSTRAP_JS: &str = include_str!("../inject/bootstrap.js");
+const DOCK_JS: &str = include_str!("../inject/dock.js");
 const CONTENT_SCRIPT_JS: &str = include_str!("../assets/fnos-mods/content-script.js");
 
 struct Assets {
@@ -478,6 +479,14 @@ pub fn build_init_script_with(cfg: &Config, wallpaper: Option<WallpaperAsset>) -
     );
     payload.insert("mods".into(), json!(&cfg.mods));
     payload.insert("local".into(), json!(&cfg.local));
+    // shell 段**只发页面真正消费的键**（T14c）。`ShellConfig` 里的 homeUrl / nasUrl /
+    // window 是宿主私有（页面没有理由拿到），所以这里手写一个窄对象，而不是把整个
+    // ShellConfig 序列化下去。消费方：`inject/dock.js`（初始态）与 shim 转调的
+    // `__FNOS_APPLY_SHELL__`（免刷新态，`commands::apply_to_page`）。
+    payload.insert(
+        "shell".into(),
+        json!({ "dockAutoHide": cfg.shell.dock_auto_hide }),
+    );
     payload.insert("assets".into(), Value::Object(asset_map));
     if !binary_map.is_empty() {
         payload.insert("binaryAssets".into(), Value::Object(binary_map));
@@ -489,6 +498,7 @@ pub fn build_init_script_with(cfg: &Config, wallpaper: Option<WallpaperAsset>) -
          window.__FNOS_SHELL__ = {payload};\n\
          {shim}\n\
          {boot}\n\
+         {dock}\n\
          {content}\n",
         ver = SHELL_VERSION,
         commit = MODS_COMMIT,
@@ -496,6 +506,7 @@ pub fn build_init_script_with(cfg: &Config, wallpaper: Option<WallpaperAsset>) -
             .expect("payload is a serde Value and always serializes"),
         shim = SHIM_JS,
         boot = BOOTSTRAP_JS,
+        dock = DOCK_JS,
         content = wrap_upstream(CONTENT_SCRIPT_JS),
     )
 }
@@ -533,17 +544,49 @@ mod tests {
     }
 
     #[test]
-    fn script_has_four_sections_in_order() {
+    fn script_has_five_sections_in_order() {
         let s = script(&Config::default());
         // 锚点必须带 ` = `：shim.js/bootstrap.js 里也有 `W.__FNOS_SHELL__`，只用
         // `__FNOS_SHELL__` 会让载荷整体挪到 shim 之下时本测试仍然通过。
         let i_cfg = s.find("window.__FNOS_SHELL__ = ").expect("config section");
         let i_shim = s.find("fnos-desktop-shell").expect("shim section");
         let i_boot = s.find("__FNOS_BOOTSTRAP__").expect("bootstrap section");
+        // dock 段的锚点用它的 class 名：shim 对 `__FNOS_APPLY_SHELL__` 的**引用**在 shim
+        // 段里就出现了，不能当 dock 段的锚点（否则 dock 挪到上游之后本测试仍绿）。
+        let i_dock = s.find("fnos-shell-dock-autohide").expect("dock section");
         let i_cs = s.find("hasFnOSSignature").expect("upstream content-script");
         assert!(
-            i_cfg < i_shim && i_shim < i_boot && i_boot < i_cs,
-            "段落顺序必须是 配置→shim→bootstrap→上游"
+            i_cfg < i_shim && i_shim < i_boot && i_boot < i_dock && i_dock < i_cs,
+            "段落顺序必须是 配置→shim→bootstrap→dock→上游"
+        );
+    }
+
+    #[test]
+    fn shell_section_is_narrow_and_defaults_off() {
+        // T14c：shell 段是**手写的窄对象**，只带页面消费的 dockAutoHide；把整个
+        // ShellConfig 序列化下去会把宿主私有的 homeUrl / nasUrl / window 一并交给页面。
+        let v = payload_json(&script(&Config::default()));
+        let shell = v
+            .get("shell")
+            .and_then(|s| s.as_object())
+            .expect("载荷必须有 shell 对象");
+        assert_eq!(
+            shell.get("dockAutoHide").and_then(|b| b.as_bool()),
+            Some(false),
+            "Dock 自动隐藏默认关（config.rs::ShellConfig::default）"
+        );
+        assert_eq!(shell.len(), 1, "shell 段只允许 dockAutoHide 一个键");
+        assert!(
+            v.get("homeUrl").is_none() && v.get("nasUrl").is_none() && v.get("window").is_none(),
+            "宿主私有的 shell 字段不得出现在载荷顶层"
+        );
+
+        // 打开后经同一通道下发；camelCase 键名（dock.js 读 SHELL.shell.dockAutoHide）
+        let mut on = Config::default();
+        on.shell.dock_auto_hide = true;
+        assert_eq!(
+            payload_json(&script(&on))["shell"]["dockAutoHide"],
+            json!(true)
         );
     }
 

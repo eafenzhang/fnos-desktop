@@ -120,13 +120,22 @@ export function adoptConfig(raw) {
   snapshot.config = state.config;
 }
 
+/**
+ * `shell.*` 键 → patch 值的形状表：每个可提交的键只有一个入口（`commitShell`），
+ * 布尔键统一 `!!`、字符串键统一 `String`，新增键在这里登记而不是再开一条 if 分支。
+ */
+const SHELL_KEYS = {
+  injectEnabled: (v) => !!v,
+  dockAutoHide: (v) => !!v,
+  nasUrl: (v) => String(v == null ? '' : v),
+};
+
 /** 提交一个 `shell.*` 键；需要时跟随 `reload_main`（与 T13b 的设置窗行为一致）。 */
 async function commitShell(path, value) {
   try {
-    const patch = path === 'injectEnabled'
-      ? { shell: { injectEnabled: !!value } }
-      : { shell: { nasUrl: String(value == null ? '' : value) } };
-    const res = await api.setConfig(patch);
+    const build = SHELL_KEYS[path];
+    if (!build) throw new Error(`未登记的 shell 键：${path}`);
+    const res = await api.setConfig({ shell: { [path]: build(value) } });
     adoptConfig(res.config);
     state.error = null;
     if (res.needsReload) {
@@ -661,19 +670,20 @@ function captureNasEdit(host) {
 }
 
 /**
- * `shell.injectEnabled`（注入总开关）与 `shell.nasUrl`。
+ * `shell.injectEnabled`（注入总开关）、`shell.dockAutoHide`（T14c）与 `shell.nasUrl`。
  *
- * 为什么本壳还要留这两项（T14b 的设计取舍，不是漏删）：上游 popup 是**扩展**的设置界面，
+ * 为什么本壳还要留这几项（T14b 的设计取舍，不是漏删）：上游 popup 是**扩展**的设置界面，
  * 它假设「扩展总是被注入」，所以没有注入总开关，也没有「NAS 地址」这个概念（上游用
- * `enabledOrigins` 白名单表达同一件事的另一半）。而本壳这两个键有真实语义：
+ * `enabledOrigins` 白名单表达同一件事的另一半）。而本壳这几个键有真实语义：
  * `injectEnabled=false` 会让宿主**不注册**任何 mods 初始化脚本（T7+8 的 gap (a)）；
+ * `dockAutoHide` 是本壳自己的页面功能（`inject/dock.js`），上游 UI 里不存在；
  * `nasUrl` 在保存时会把它的 origin 并入白名单，是「一键把 NAS 加进来」的入口。
  * 托盘精简（T14a）之后，注入总开关只剩设置窗这一个入口——把它一起删掉就等于删功能。
  * 因此它们放在**本壳自己的区域**里（与上游界面并列），而不是塞进上游 UI。
  *
  * **值没变就不重建**（fix round 1 / Minor 1）：旧实现在每次 `refresh()`（窗口获得焦点）
  * 都无条件 `host.textContent = ''` 重画，于是 alt-tab 一次就把用户没保存的 NAS 地址清成
- * 配置里的旧值。现在两道闸：① 渲染键（两个键 + 错误条）与上次相同 → 直接返回，DOM 一个
+ * 配置里的旧值。现在两道闸：① 渲染键（三个键 + 错误条）与上次相同 → 直接返回，DOM 一个
  * 字节都不动（焦点与输入都留着）；② 万一必须重建，也先把未保存的输入捞出来再放回去。
  */
 function renderShell() {
@@ -682,10 +692,11 @@ function renderShell() {
   if (!host) return;
   const shell = (state.config && state.config.shell) || {};
   const injected = shell.injectEnabled !== false;
+  const dockAutoHide = shell.dockAutoHide === true;
   const nasValue = typeof shell.nasUrl === 'string' ? shell.nasUrl : '';
 
   const renderKey = JSON.stringify({
-    injectEnabled: injected, nasUrl: nasValue, error: state.error || '',
+    injectEnabled: injected, dockAutoHide, nasUrl: nasValue, error: state.error || '',
   });
   if (renderKey === shellRenderKey && host.childElementCount > 0) return;
 
@@ -706,6 +717,25 @@ function renderShell() {
     text: '关掉之后宿主不再为任何窗口注册 mods 载荷（改这一项会重建主窗口）。',
   }));
   host.appendChild(injectField);
+
+  // T14c：Dock 自动隐藏。注入关闭时页面上没有 dock.js，开关必须诚实地不可用——
+  // 「勾上了却什么都没发生」比「不可用」更糟（失败模式纪律：不谎称功能存在）。
+  const dockField = el('div', { className: 'field' });
+  const dockId = 'f_shell_dockAutoHide';
+  const dockLabel = el('label', { text: '自动隐藏 Dock（任务栏）' });
+  dockLabel.htmlFor = dockId;
+  const dock = el('input', { id: dockId });
+  dock.type = 'checkbox';
+  dock.checked = dockAutoHide;
+  dock.disabled = !injected;
+  dock.addEventListener('change', () => { commitShell('dockAutoHide', dock.checked); });
+  dockField.append(dockLabel, dock, el('p', {
+    className: 'hint',
+    text: injected
+      ? '开启后 Dock 平时滑出屏幕边缘，鼠标移近它所在的边缘时滑回（即时生效，不需要重载页面）。'
+      : '需要先开启「注入 mods」：页面上没有注入的脚本时，Dock 不会被改动。',
+  }));
+  host.appendChild(dockField);
 
   const nasField = el('div', { className: 'field' });
   const nasId = 'f_shell_nasUrl';

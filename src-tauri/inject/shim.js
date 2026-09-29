@@ -432,7 +432,7 @@
     }
   }
 
-  // 宿主（Rust）通过 webview.eval 调用：__FNOS_APPLY_CONFIG__({mods:{...}, local:{...}})
+  // 宿主（Rust）通过 webview.eval 调用：__FNOS_APPLY_CONFIG__({mods:{...}, local:{...}, shell:{...}})
   W.__FNOS_APPLY_CONFIG__ = function (patch) {
     patch = patch || {};
     var pairs = [['sync', syncStore, patch.mods], ['local', localStore, patch.local]];
@@ -452,6 +452,12 @@
     // 登录壁纸的名字变了 → 重新解析一次 data URL（配置是免刷新推送的，资源键却跟着文件名走）
     if (patch.local && Object.prototype.hasOwnProperty.call(patch.local, LOGIN_WALLPAPER_NAME_KEY)) {
       syncLoginWallpaperDataUrl();
+    }
+    // 本壳自己的 shell 键（T14c：dockAutoHide）→ 交给注入侧的 shell 钩子。
+    // shim 不解释 shell 键的语义：dock.js（若已注入）定义 __FNOS_APPLY_SHELL__ 接手；
+    // 没注入时什么都不发生——转发是惰性的，钩子抛错也不拖累上游的配置通道。
+    if (patch.shell && typeof W.__FNOS_APPLY_SHELL__ === 'function') {
+      try { W.__FNOS_APPLY_SHELL__(patch.shell); } catch (e) { /* 壳功能异常不影响上游配置 */ }
     }
   };
 

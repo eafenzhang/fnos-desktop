@@ -141,6 +141,17 @@ pub struct ShellConfig {
     pub nas_url: String,
     pub inject_enabled: bool,
     pub close_to_tray: bool,
+    /// T14c：Dock（fnOS WebUI 的任务栏）自动隐藏，**默认关**。
+    ///
+    /// 归属 `shell` 而不是 `mods`：它不是上游 mod 的某个设置项，而是本壳自己的页面修改
+    /// （`inject/dock.js`，用上游 mod.js 的任务栏选择器找到 Dock 后加本壳自己的 class）。
+    /// 默认关的理由：滑出屏幕是显眼的外观改变，宁可让用户显式打开，也不默认替用户改页面。
+    ///
+    /// 生效通道：注入总开关**开**时由建窗载荷带下去（`injector::build_init_script_with`
+    /// 的 `shell` 段，只发页面消费的键）；改动经 `commands::apply_to_page` 免刷新生效
+    /// （不在 `needs_reload` 判据里——它不是 initialization_script 的静态内容，
+    /// 活窗口上就能换）。
+    pub dock_auto_hide: bool,
     pub window: WindowGeom,
 }
 
@@ -151,6 +162,7 @@ impl Default for ShellConfig {
             nas_url: String::new(),
             inject_enabled: true,
             close_to_tray: true,
+            dock_auto_hide: false,
             window: WindowGeom::default(),
         }
     }
@@ -810,7 +822,7 @@ fn sanitize_config_value(raw: Value) -> Value {
     for key in ["homeUrl", "nasUrl"] {
         sanitize_string_field(&mut shell, key);
     }
-    for key in ["injectEnabled", "closeToTray"] {
+    for key in ["injectEnabled", "closeToTray", "dockAutoHide"] {
         sanitize_bool_field(&mut shell, key);
     }
     sanitize_window_field(&mut shell, "window");
@@ -998,6 +1010,7 @@ mod tests {
         assert_eq!(c.shell.home_url, DEFAULT_HOME_URL);
         assert!(c.shell.inject_enabled);
         assert!(c.shell.close_to_tray);
+        assert!(!c.shell.dock_auto_hide);
     }
 
     #[test]
@@ -1236,9 +1249,11 @@ mod tests {
 
         let mut c = Config::default();
         c.mods.brand_color = "#336699".into();
+        c.shell.dock_auto_hide = true; // T14c：shell 新键随同一份往返
         c.save(&p).unwrap();
         let back = load(&p);
         assert_eq!(back.mods.brand_color, "#336699");
+        assert!(back.shell.dock_auto_hide);
         assert_eq!(back.schema_version, SCHEMA_VERSION);
 
         // 旧版本（无 schemaVersion / 缺字段）应能补齐。
@@ -1278,6 +1293,7 @@ mod tests {
         assert_eq!(c.shell.home_url, DEFAULT_HOME_URL);
         assert!(c.shell.inject_enabled);
         assert!(c.shell.close_to_tray);
+        assert!(!c.shell.dock_auto_hide);
         assert_eq!(c.shell.window.w, 1200.0);
         assert_eq!(c.schema_version, SCHEMA_VERSION);
 
@@ -1681,6 +1697,7 @@ mod tests {
                 "homeUrl": "http://nas.local/",
                 "injectEnabled": "true",
                 "closeToTray": "false",
+                "dockAutoHide": "true",
                 "window": { "w": "1200", "h": 900, "x": null, "y": "30" }
               }
             }"##,
@@ -1718,6 +1735,8 @@ mod tests {
         // shell bool："true" → true（默认值相同，仅证明不丢键）；"false" → false（可区分）
         assert!(c.shell.inject_enabled);
         assert!(!c.shell.close_to_tray);
+        // T14c："true" → true（默认关，故 true 只能来自强制转换，不是回落默认）
+        assert!(c.shell.dock_auto_hide);
         // window：数字字符串 / 数字 / null / 数字字符串
         assert_eq!(c.shell.window.w, 1200.0);
         assert_eq!(c.shell.window.h, 900.0);

@@ -503,6 +503,10 @@ pub fn set_config<R: Runtime>(
         // - 登录壁纸的**文件名**：它决定从配置目录读哪个文件、以什么键嵌进 `binaryAssets`。
         //   导入路径落盘的名字带内容指纹（`config::stored_wallpaper_name`），所以「换了图」
         //   必然表现为「名字变了」，这里比较文件名就够了。
+        //
+        // T14c 的 `dockAutoHide` **不进**判据：dock.js 在活页面上由 `apply_to_page` 的
+        // `shell.dockAutoHide`（shim 转调 `__FNOS_APPLY_SHELL__`）即时切换。建窗载荷里的
+        // `shell.dockAutoHide` 只是新窗口的初始态，活窗口换态不需要重建。
         let needs_reload = next.shell.inject_enabled != prev.shell.inject_enabled
             || next.shell.home_url != prev.shell.home_url
             || injector::perfect_icon_enabled(&next) != injector::perfect_icon_enabled(&prev)
@@ -552,6 +556,10 @@ fn apply_to_page<R: Runtime>(app: &AppHandle<R>, cfg: &Config) {
     let payload = serde_json::json!({
         "mods": &cfg.mods,
         "local": &cfg.local,
+        // T14c：shell 段只发页面消费的键（与 injector 载荷同一条窄化原则——
+        // homeUrl/nasUrl/window 是宿主私有，不得借免刷新通道发给页面）。
+        // 消费方：shim 的 `__FNOS_APPLY_CONFIG__` → `__FNOS_APPLY_SHELL__`（dock.js）。
+        "shell": { "dockAutoHide": cfg.shell.dock_auto_hide },
     });
     match serde_json::to_string(&payload) {
         Ok(json) => {
@@ -2615,6 +2623,44 @@ mod tests {
         assert!(
             ask < count,
             "计数的位置必须在「真的送出去了」判定之后（先加一再看结果 = 旧缺陷）"
+        );
+    }
+
+    /// T14c：`dockAutoHide` **不进** `needs_reload` 判据（免刷新生效）。
+    ///
+    /// 判据本身要 `State`/`AppHandle` 才能跑（`set_config` 是命令，本 crate 的单测不带
+    /// tauri harness），所以按上面几条的同族手法做**源码级**锁：判据表达式的源码区间里
+    /// 不得出现 `dock_auto_hide`。它的生效通道是 `apply_to_page` 的 `shell.dockAutoHide`
+    /// → shim 转调 `__FNOS_APPLY_SHELL__`（`inject/dock.js`）——把它加进判据只会让每次
+    /// 切换白重建一次主窗口。
+    #[test]
+    fn dock_auto_hide_toggles_without_window_rebuild() {
+        let src = include_str!("commands.rs");
+        let start = src
+            .find("let needs_reload = next.shell.inject_enabled")
+            .expect("needs_reload 判据必须还在 set_config 里");
+        let end = src[start..]
+            .find(';')
+            .map(|i| start + i)
+            .expect("判据是一条以分号结尾的表达式");
+        let predicate = &src[start..end];
+        assert!(
+            !predicate.contains("dock_auto_hide"),
+            "dockAutoHide 必须走免刷新通道，不得进 needs_reload 判据：{predicate}"
+        );
+        // 免刷新通道必须带着这个键：apply_to_page 的 shell 段缺了它，开关就只能对下一个
+        // 新窗口生效（对活窗口永远不动手——那不是「即时生效」而是「悄悄不生效」）。
+        let apply = src
+            .find("fn apply_to_page")
+            .expect("apply_to_page 必须存在");
+        let apply_body = &src[apply..];
+        assert!(
+            apply_body.contains("\"dockAutoHide\": cfg.shell.dock_auto_hide"),
+            "apply_to_page 的 shell 段必须带上 dockAutoHide（活窗口的免刷新切换通道）"
+        );
+        assert!(
+            !apply_body.contains("\"homeUrl\"") && !apply_body.contains("\"nasUrl\""),
+            "免刷新通道同样不得把宿主私有的 homeUrl/nasUrl 发给页面"
         );
     }
 }
