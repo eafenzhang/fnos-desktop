@@ -639,11 +639,21 @@
    * 应答照旧经标题通道回报。
    *
    * 仍然是「只发请求、不改页面」；仍是同一个有限次的上限（[`APP_ITEMS_MANUAL_LIMIT`]）。
+   *
+   * **额度按「真的送出的请求」计**（fix round 1 / Minor 5）：旧实现先把 `appItemsManualCalls`
+   * 加一再看结果，于是「完美图标没配 / 桥不在 / `sendMessage` 抛了」这些**什么都没做**的调用
+   * 也照样吃掉一次额度——设置窗那句「先打开启动台再试」在一次交互里就再也兑现不了
+   * （3 次额度被空转耗尽，而用户什么都没改）。现在只有 `askForAppItemsNow()` 真的把请求交给
+   * 页面（返回 `true`）才计数，并把「这次到底有没有送出去」如实返回给调用方。
+   *
+   * 返回值 `eval` 取不到（`WebviewWindow::eval` 是单向的），但它对**页面自己**的调用者
+   * （以及 `tests/shim.test.mjs`）是可读的事实，也是这条钩子唯一诚实的结算方式。
    */
   W.__FNOS_REQUEST_APP_ITEMS__ = function () {
-    if (appItemsManualCalls >= APP_ITEMS_MANUAL_LIMIT) return;
+    if (appItemsManualCalls >= APP_ITEMS_MANUAL_LIMIT) return false;
+    if (!askForAppItemsNow()) return false;
     appItemsManualCalls += 1;
-    askForAppItemsNow();
+    return true;
   };
 
   requestAppItems();

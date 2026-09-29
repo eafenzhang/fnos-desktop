@@ -1,10 +1,12 @@
-// 设置窗的**应用层**行为（Review round 1 的三条修复 + 打磨项）：
+// 设置窗的**应用层**行为（Review round 1 的三条修复 + 打磨项 + T14b fix round 1）：
 //
-// A. `adoptConfig` 不得把 IPC 已归一化的值再夹一次（§8.4 的正面落实）
+// A. `adoptConfig` 不得把 IPC 已归一化的值再夹一次（§8.4 的正面落实）；T14b fix round 1
+//    起设置窗**没有任何 mods 归一化**——镜像函数已删除，本文件用源码级断言锁住
+//    「app.js 不得引用 normalize.js」
 // B. origin 添加只接受 http(s)，拒绝 `"null"` 系（scheme-less / mailto / data / javascript）
 // D. 关于页外链走 `open_url` 命令（命令名与参数形状与 Rust 侧一致）
 //
-// 这些断言依赖「导入 app.js 不需要 DOM」：`boot()` 只在真实页面（有 `#pane`）里自动执行。
+// 这些断言依赖「导入 app.js 不需要 DOM」：`boot()` 只在真实页面（有 `#upstreamHost`）里自动执行。
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readdirSync, readFileSync } from 'node:fs';
@@ -13,9 +15,7 @@ import {
   isTooLargeReport, pageCheckAnswer, reportSlots, state,
 } from '../ui/settings/app.js';
 import * as bridge from '../ui/settings/bridge.js';
-import {
-  clampLightness, normalizeMods, normalizeModsEntry, normalizeOrigin, parseHttpOrigin
-} from '../ui/settings/normalize.js';
+import { PREFECT_ICON_PATH, normalizeOrigin, parseHttpOrigin } from '../ui/settings/normalize.js';
 import { VENDOR_DIR } from '../ui/settings/app.js';
 
 test('导入 app.js 不触发 boot（无 DOM 也能单测内部逻辑）', async () => {
@@ -25,18 +25,13 @@ test('导入 app.js 不触发 boot（无 DOM 也能单测内部逻辑）', async
   assert.equal(state.error, null);
 });
 
-// ---------- A：IPC 值不再二次夹取 ----------
+// ---------- A：IPC 值原样采纳，设置窗没有任何 mods 归一化 ----------
 
 test('A: 已归一化的品牌色原样进入界面（#cec1b2 → #c4b4a2 的回归案例）', () => {
   // Rust `normalize_brand_color("#cec1b2")` 的实际输出——config.json 里存的就是它，
-  // 页面实际生效的也是它。
-  assert.equal(clampLightness('#cec1b2'), '#c4b4a2');
-  // 而 `clampLightness` **不是不动点**：再夹一次变成 #c4b4a1。这正是缺陷 A 的机制，
-  // 也是「任何已归一化的值都不能再过一遍 clampLightness」的原因。
-  assert.equal(clampLightness('#c4b4a2'), '#c4b4a1');
-  // 旧 adoptConfig 路径（`normalizeMods(raw.mods)`）复现缺陷：界面会画成 #c4b4a1
-  assert.equal(normalizeMods({ brandColor: '#c4b4a2' }).brandColor, '#c4b4a1');
-  // 新路径：原样采纳
+  // 页面实际生效的也是它。JS 侧曾经有的一份镜像夹取（`clampLightness`，**不是不动点**：
+  // 再夹一次 `#c4b4a2` → `#c4b4a1`）已随 T14b fix round 1 删除——镜像存在本身就会诱导
+  // 「回包再过一遍」的旧缺陷路径，所以这里只剩「原样采纳」一条事实。
   adoptConfig({ mods: { brandColor: '#c4b4a2' } });
   assert.equal(state.config.mods.brandColor, '#c4b4a2');
   assert.notEqual(state.config.mods.brandColor, '#c4b4a1');
@@ -73,14 +68,30 @@ test('A: 缺 mods / 非对象输入不炸，形状兜底为空对象', () => {
   assert.deepEqual(state.config.mods, {});
 });
 
-test('A: 用户刚输入的值仍在提交前归一化（归一化的唯一入口）', () => {
-  // 与 Rust 同一步的产物：这两条决定「用户输入 → patch」与「Rust 归一化」语义一致。
-  assert.equal(normalizeModsEntry('brandColor', '#cec1b2'), '#c4b4a2');
-  assert.equal(normalizeModsEntry('brandColor', '#ffffff'), '#b3b3b3');
-  assert.equal(normalizeModsEntry('titlebarStyle', 'nope'), 'windows');
-  assert.equal(normalizeModsEntry('desktopIconPerColumn', 999), 16);
-  assert.equal(normalizeModsEntry('enabledOrigins', [' HTTP://A.B ', 'http://a.b'])[0], 'http://a.b');
-  assert.equal(normalizeModsEntry('lockscreenDefaultUsername', 'x'.repeat(90)).length, 80);
+test('A: 设置窗不再有任何 mods 归一化（app.js 不得引用 normalize.js）', () => {
+  // T14b 用上游 popup 取代了 schema 驱动界面，`app.js` 的提交路径只剩 `shell.*` 两键，
+  // mods 归一化没有调用方；镜像函数（`clampLightness` / `normalizeMods` /
+  // `normalizeModsEntry` / `isPrefectIconPath`）已按评审意见从 normalize.js 删除。
+  // 这里用源码级断言防「借尸还魂」：只要 app.js 重新引用 normalize.js，说明有人试图
+  // 在设置窗里恢复归一化——那必须连同 Rust 侧的唯一归一化声明一起重新设计，不许静默加回。
+  const app = readFileSync(new URL('../ui/settings/app.js', import.meta.url), 'utf8');
+  assert.ok(!app.includes("from './normalize.js'"), 'app.js 不得引用 normalize.js');
+  for (const dead of ['clampLightness', 'normalizeMods', 'normalizeModsEntry', 'isPrefectIconPath']) {
+    assert.ok(!app.includes(dead), `app.js 不得出现镜像函数名 ${dead}`);
+  }
+  // normalize.js 里被保留下来的只有两件事：跨语言镜像常量与 origin 整理（含解析）。
+  // 按导出判（注释里提这些名字是允许的——文档要能说清删了什么），按字符串判会误伤。
+  const normalize = readFileSync(new URL('../ui/settings/normalize.js', import.meta.url), 'utf8');
+  for (const gone of ['normalizeMods', 'normalizeModsEntry', 'clampLightness', 'isPrefectIconPath']) {
+    assert.ok(!normalize.includes(`export function ${gone}`), `normalize.js 不得再导出 ${gone}（已按评审意见删除）`);
+    assert.ok(!normalize.includes(`export const ${gone}`), `normalize.js 不得再导出 ${gone}（已按评审意见删除）`);
+  }
+  assert.ok(!normalize.includes('export const MODS_KEYS'), 'normalize.js 不得再导出 MODS_KEYS（已随镜像删除）');
+  assert.deepEqual(
+    (normalize.match(/^export (?:const|function) \w+/gm) || []).sort(),
+    ['export const PREFECT_ICON_PATH', 'export function normalizeOrigin', 'export function parseHttpOrigin'].sort(),
+    'normalize.js 的导出面只剩 PREFECT_ICON_PATH / normalizeOrigin / parseHttpOrigin'
+  );
 });
 
 // ---------- B：origin 校验 ----------
@@ -235,10 +246,11 @@ test('F: 内置图标清单必须与 vendored 目录逐条一致（Task 14b 起�
   // 磁盘上的 camelCase 文件名（panIndex.png）与 icon-map.json 里的小写键并存
   assert.ok(vendoredPngs.includes('panIndex.png'));
   assert.ok(!vendoredPngs.includes('panindex.png'));
-  // 逐项重绘写进配置的值必须过得了 normalize.js 的 `isPrefectIconPath`（R30 的大小写不敏感正则）
+  // 逐项重绘写进配置的值必须过得了 R30 的大小写不敏感正则（normalize.js 的镜像常量；
+  // 合法性的最终收口在 Rust `is_valid_prefect_icon_path`，两侧输入表逐行相同）
   for (const name of vendoredPngs) {
     const path = `prefect_icon/${name}`;
-    assert.equal(normalizeModsEntry('launchpadIconRedrawMap', { k: path }).k, path, path);
+    assert.equal(PREFECT_ICON_PATH.test(path), true, path);
   }
 });
 
@@ -281,14 +293,19 @@ test('F: appItemsAnswer 的三种结局（拿不到 → null；空列表 → nul
   assert.equal(answer.tooLarge, undefined);
 });
 
-test('F: 事件处理器写出的 patch 经 normalizeModsEntry 后仍是同一份（提交路径不会吞掉配置）', () => {
+test('F: 事件处理器写出的 patch 原样转发（提交路径不会吞掉配置；合法性由 Rust 收口）', () => {
   // 上游 popup 写的是 `launchpadIconRedrawMap` / `…RedrawKeys` / `…ScaleSelectedKeys` /
   // `…MaskOnlyKeys` 这四个键（popup.js:559-581），本壳只在 `FNOS_APPLY` 那条路径上转发它们。
+  // T14b fix round 1 起设置窗不再做任何归一化（镜像函数已删除）：patch 原样进 `set_config`，
+  // 由 Rust 的 `Config::normalize` 收口——这里锁「转发不丢键不变形」+「写进的图标路径
+  // 过得了 R30 正则」（camelCase 的 panIndex.png 正是旧全小写正则会吞掉的那个值）。
   const patch = applyPatchFromPopup({
     launchpadIconScaleSelectedKeys: [], launchpadIconMaskOnlyKeys: [],
     launchpadIconRedrawKeys: ['/a.png'], launchpadIconRedrawMap: { '/a.png': 'prefect_icon/panIndex.png' },
   });
-  for (const [k, v] of Object.entries(patch.mods)) assert.deepEqual(normalizeModsEntry(k, v), v, k);
+  assert.deepEqual(patch.mods.launchpadIconRedrawMap, { '/a.png': 'prefect_icon/panIndex.png' });
+  assert.deepEqual(patch.mods.launchpadIconRedrawKeys, ['/a.png']);
+  assert.equal(PREFECT_ICON_PATH.test(patch.mods.launchpadIconRedrawMap['/a.png']), true);
 });
 
 test('F: 上游消息里的每个派生键都落进 patch（白名单），其余一概不进', () => {

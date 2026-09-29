@@ -107,6 +107,29 @@
   /** `chrome.runtime.getURL` 允许的形状：只能指到设置窗资产根下的相对路径。 */
   const ASSET_PATH = /^[A-Za-z0-9][A-Za-z0-9._/-]*$/;
 
+  /**
+   * `getURL` 的**规范化**：整条路径折成小写（= 页面侧 shim 的查表键）。
+   *
+   * 为什么必须折（fix round 1 / Important）：
+   * 1. 上游自己派生的图标路径本来就全小写——`icon-map.json` 的值经
+   *    `popup.js::normalizePrefectIconRelativePath` → `normalizeLaunchpadRedrawName`
+   *    （popup.js:257-283）折成 `prefect_icon/panindex.png`；
+   * 2. 但**已经存下来的** `launchpadIconRedrawMap` 值可能还是旧设置界面（已退休的
+   *    `schema.js`）写下的 camelCase `prefect_icon/panIndex.png`：上游对「形状已经对」的值
+   *    原样保留（popup.js:277-279），于是它照旧拿 camelCase 去 `getURL` + `fetch`；
+   * 3. Tauri 的**内嵌资产表是大小写敏感**的（`generate_context!` 的键就是磁盘文件名），
+   *    `prefect_icon/panIndex.png` 与 `prefect_icon/panindex.png` 只可能命中其中一个。
+   *
+   * 页面侧 shim 早就是这条语义（`inject/shim.js` 的 `assetIndex[String(k).toLowerCase()]`，
+   * 单测 `tests/shim.test.mjs` 锁着「大小写不敏感」），所以这里与它对齐：**两侧等价**，
+   * `prefect_icon/panIndex.png` 与 `prefect_icon/panindex.png` 解析到同一个文件。磁盘上两个
+   * 名字都在（camelCase 是 vendored 原文的逐字节副本，小写是 `tools/vendor-mods.ps1` 派生
+   * 的同字节副本），因此两条路径都真的可取。
+   */
+  function canonicalAssetPath(raw) {
+    return raw.toLowerCase();
+  }
+
   // ---------- 与父 frame 的桥 ----------
 
   let nextRequestId = 1;
@@ -222,11 +245,22 @@
       const box = document.createElement('div');
       box.id = NOTICE_ID;
       box.dataset.fnosShell = '1';
-      // 内联样式，且只用与主题无关的 rgba(currentColor)：上游 popup 自己带一整套
-      // 明暗两套变量，本层不去猜它的类名，也不改它的样式表。
+      // 内联样式，且颜色只用**上游自己**的两个变量（`:root` 的 `--card-bg` / `--text`，
+      // 明暗两套都有定义），取不到时回落到系统色 `Canvas` / `CanvasText`：本层不猜上游的
+      // 类名、也不改它的样式表，但**必须**读出它当前的主题。
+      //
+      // **固定在 iframe 视口底部**（fix round 1 / Minor 3）：说明框原来是追加在 `<body>` 末尾
+      // 的普通流内元素，而上游 popup 的 body 比 iframe 那 522 px 视口高得多、滚动条又被上游
+      // 自己的 CSS 藏掉（`popup.html:44-72` 的 `scrollbar-width:none` + `::-webkit-scrollbar`）
+      // ——于是「拒绝了字体数据写入」这类说明默认落在**屏幕之外**，用户根本看不到。
+      // 拒绝提示不可见等于没有提示，所以改成常驻横幅：高度封顶 42% 并允许自己滚动，
+      // 不随上游内容长短漂移。z-index 高于上游 `.blur-effect` 的 998。
       box.setAttribute('style',
-        'margin:8px;padding:8px 10px;border:1px dashed currentColor;border-radius:8px;' +
-        'font:12px/1.6 system-ui,"Segoe UI",sans-serif;opacity:.85;white-space:pre-wrap;');
+        'position:fixed;left:0;right:0;bottom:0;z-index:1000;box-sizing:border-box;' +
+        'max-height:42%;overflow:auto;margin:0;padding:8px 10px;' +
+        'border-top:1px dashed var(--card-border,currentColor);' +
+        'background:var(--card-bg,Canvas);color:var(--text,CanvasText);' +
+        'font:12px/1.6 system-ui,"Segoe UI",sans-serif;white-space:pre-wrap;');
       const title = document.createElement('div');
       title.textContent = '外壳说明（本应用，非上游界面）';
       title.setAttribute('style', 'font-weight:600;margin-bottom:4px;');
@@ -447,32 +481,43 @@
    *
    * 只给 name（没给 data URL）不是上游的形状，如实报错；data URL 不是
    * `data:<mime>;base64,<载荷>` 也如实报错（不回显用户数据本身）。
+   *
+   * 每一条拒绝都**先挂可见说明再抛**（fix round 1 / Minor 4）：上游对 `storage.local.set`
+   * 失败只有一句固定的「本地存储写入失败」（popup.js:2176-2178），**说不出为什么**；早退的
+   * 几条（扩展名 / base64 形状 / 超过 8 MiB）如果只 `throw`，用户看到的就只是那句泛泛的
+   * 文案，真实原因只留在 console.warn 里——与字体键、未知键两条路径的纪律不一致。
    */
   async function importWallpaperPair(pair) {
     const dataUrl = pair[LOCAL_WALLPAPER_DATA_KEY];
     const name = pair[LOCAL_WALLPAPER_NAME_KEY];
+    const refuse = (reason) => {
+      notice(`壁纸导入被拒绝：${reason}`);
+      throw new Error(reason);
+    };
     if (typeof name !== 'string' || !name) {
-      throw new Error('壁纸导入失败：本外壳需要 png / jpg / jpeg / webp 的文件名');
+      refuse('壁纸导入失败：本外壳需要 png / jpg / jpeg / webp 的文件名');
     }
     const comma = typeof dataUrl === 'string' ? dataUrl.indexOf(',') : -1;
     if (comma < 0) {
-      throw new Error('壁纸导入失败：只接受 data:<mime>;base64,<载荷> 形状的图片数据');
+      refuse('壁纸导入失败：只接受 data:<mime>;base64,<载荷> 形状的图片数据');
     }
     const head = dataUrl.slice(0, comma);
     if (head.indexOf(';base64') < 0) {
-      throw new Error('壁纸导入失败：图片数据不是 base64 data URL');
+      refuse('壁纸导入失败：图片数据不是 base64 data URL');
     }
     const payload = dataUrl.slice(comma + 1);
     const ext = (name.split('.').pop() || '').toLowerCase();
     if (WALLPAPER_EXTS.indexOf(ext) < 0) {
-      throw new Error('壁纸导入失败：只支持 png / jpg / jpeg / webp');
+      refuse('壁纸导入失败：只支持 png / jpg / jpeg / webp');
     }
     // 早退一次：base64 的长度上限 = 字节上限向上取整到 4 的倍数（与宿主同一算法）
     if (payload.length > Math.ceil(MAX_WALLPAPER_BYTES / 3) * 4) {
-      throw new Error(`壁纸导入失败：图片超过 ${MAX_WALLPAPER_BYTES / 1024 / 1024} MiB 上限`);
+      refuse(`壁纸导入失败：图片超过 ${MAX_WALLPAPER_BYTES / 1024 / 1024} MiB 上限`
+        + '（宿主命令 import_wallpaper 只接受 8 MiB 以内的图片，本外壳没有把它写进任何地方）');
     }
     const stored = await callHost('import_wallpaper', { name, dataBase64: payload });
     if (typeof stored !== 'string' || !stored) {
+      notice('壁纸导入失败：宿主没有返回落盘文件名（图片没有写进配置目录）');
       throw new Error('壁纸导入失败：宿主没有返回落盘文件名');
     }
     await afterConfigWrite(await callHost('set_config', {
@@ -633,13 +678,18 @@
        * 所以 `prefect_icon/emby.png` 解析成 `http://tauri.localhost/prefect_icon/emby.png`。
        * 绝对 URL / 协议相对 URL / 带 `..` 的路径一律返回空串——上游对空串的语义正是
        * 「这个资源不存在」（`checkPrefectIconResourceExists`）。
+       *
+       * 路径先过 [`canonicalAssetPath`]（整条折小写，与**页面侧** shim 的查表键同一条语义）：
+       * 内嵌资产表大小写敏感，而 `icon-map.json` 派生的是小写名、旧配置里可能留着 camelCase 名，
+       * 不折的话其中一路必然 404（Important：PanIndex 的「重绘」因此不可选，且旧条目会被
+       * popup 剪掉写回 = 静默丢配置）。
        */
       getURL(path) {
         const raw = typeof path === 'string' ? path.trim() : '';
         if (!raw || raw.indexOf('..') >= 0 || raw.indexOf('//') === 0) return '';
         if (!ASSET_PATH.test(raw)) return '';
         try {
-          return new URL(raw, document.baseURI).href;
+          return new URL(canonicalAssetPath(raw), document.baseURI).href;
         } catch (_error) {
           return '';
         }

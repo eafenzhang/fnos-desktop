@@ -1716,6 +1716,12 @@ pub fn set_local_store(
 ///
 /// 安全性：**无参数**——不接受任何脚本文本，因此它不是注入面（eval 的是本壳自己注入的
 /// 那一行固定代码），也只授设置窗、并在 `remote-deny.json` 里显式 deny。
+///
+/// 日志只说**宿主做过的事**（fix round 1 / Minor 5）：`WebviewWindow::eval` 是单向的，宿主
+/// 拿不到页面里那个钩子的返回值——它可能因为「完美图标没配置 / 页面侧没有钩子 / 3 次额度
+/// 用尽」而**什么都不做**（`inject/shim.js::W.__FNOS_REQUEST_APP_ITEMS__`）。旧文案
+/// 「已请主窗口页面重新汇报启动台应用项列表」在没有钩子时就是一句没发生过的陈述。页面侧
+/// 是否真的把请求送出去，只能由页面自己的上报槽位体现（`get_page_report`）。
 #[tauri::command]
 pub fn request_app_items<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
     let win = app
@@ -1723,8 +1729,11 @@ pub fn request_app_items<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
         .ok_or_else(|| "主窗口未打开".to_string())?;
     win.eval("window.__FNOS_REQUEST_APP_ITEMS__ && window.__FNOS_REQUEST_APP_ITEMS__();")
         .map_err(|e| format!("请求页面汇报应用项失败：{e}"))?;
-    // 运行期证据（与建窗加载日志同风格）：一行证明设置窗的请求真的走到了页面。
-    eprintln!("[fnos] 已请主窗口页面重新汇报启动台应用项列表");
+    // 运行期证据（与建窗加载日志同风格）：证明设置窗的请求真的**下发到了页面**。
+    // 「页面有没有真的送出去」不在这里断言（宿主观测不到），见上面的注释。
+    eprintln!(
+        "[fnos] 已向主窗口页面下发重新汇报应用项的钩子调用（页面侧无钩子/无请求可发时不会送出）"
+    );
     Ok(())
 }
 
@@ -1861,14 +1870,17 @@ mod tests {
     /// finding A 的算术前提：Rust 把 `#cec1b2` 夹成什么，以及那个值是不是不动点。
     ///
     /// 设置窗「显示值 = 生效值」的不变式就靠「Rust 已归一化、JS 不再夹一次」成立，
-    /// 所以这里把 Rust 的实际输出钉住；JS 侧的对应断言（`clampLightness('#cec1b2')`
-    /// 与 `clampLightness(那个值)`）在 tests/settings.test.mjs。
+    /// 所以这里把 Rust 的实际输出钉住。T14b fix round 1 之前 JS 侧还有一份镜像夹取
+    /// （`normalize.js::clampLightness`）并被 tests/settings.test.mjs 直接断言；那份镜像与
+    /// 整个 `normalizeMods` 一起**已按评审意见删除**（设置窗不再有任何 mods 归一化），
+    /// 不变式现在只由「JS 原样采纳 IPC 回包」+「Rust 是唯一的归一化实现」两条支撑，
+    /// 回归锁在 tests/settings.test.mjs 的 A 组（含源码级断言：app.js 不得引用 normalize.js）。
     #[test]
     fn brand_color_clamp_of_the_finding_a_input() {
         assert_eq!(
             crate::config::normalize_brand_color("#cec1b2"),
             "#c4b4a2",
-            "JS clampLightness('#cec1b2') 也是 #c4b4a2，两侧必须同值"
+            "Rust 这一侧的夹取结果就是页面生效值（JS 不再二次夹取）"
         );
         // fix round 2：Rust 侧改成幂等（明度在区间内时原样返回），夹取结果因此是**不动点**。
         // 于是 `Config::save` 里那次多余的 `normalize()`（config.rs，注释写的是「幂等」）
@@ -1879,8 +1891,6 @@ mod tests {
             "#c4b4a2",
             "夹取必须是不动点，否则 save() 会让 config.json 与生效值差一个通道"
         );
-        // JS 侧（ui/settings/normalize.js 的 `clampLightness`）仍不是不动点，本轮不动它；
-        // 不变式改由「JS 只夹用户刚输入的值、绝不夹 Rust 归一化过的值」维持（fix round 1 的 A）。
     }
 
     // ---------- Task 12：合规件路径的 IPC 契约 ----------
@@ -2117,12 +2127,19 @@ mod tests {
 
     /// R30 的 **JS 镜像**必须与 Rust 规则同步（fix round 1 / Important 2）。
     ///
-    /// 同一条 `prefect_icon/*.png` 规则在**两个**实现里生效——设置窗提交前
-    /// （`ui/settings/normalize.js::isPrefectIconPath` ← `app.js::commit` ← `MODS_KEYS`）与
-    /// Rust 归一化时（`config.rs::Config::normalize` 的 `retain`）。任何一个落后于另一个都是
-    /// **静默丢配置**：fix round 1 之前 JS 用的是全小写正则，于是 `prefect_icon/Emby.png`
-    /// （磁盘上真实存在的 `panIndex.png` 这类名字）在设置窗里就被丢掉，Rust 的放宽规则永远
-    /// 见不到它。
+    /// 同一条 `prefect_icon/*.png` 规则写在**两个**地方：`ui/settings/normalize.js` 的
+    /// `PREFECT_ICON_PATH` 与 Rust 归一化时的判定（`config.rs::is_valid_prefect_icon_path`
+    /// ← `Config::normalize` 的 `retain`）。任何一个落后于另一个都是**静默丢配置**：
+    /// fix round 1 之前 JS 用的是全小写正则，于是 `prefect_icon/Emby.png`
+    /// （磁盘上真实存在的 `panIndex.png` 这类名字）会在设置窗那一侧先被丢掉，Rust 的放宽
+    /// 规则永远见不到它。
+    ///
+    /// T14b fix round 1：JS 侧的**生产消费者**已经没有了（退休的 `schema.js` 是最后一个调用
+    /// `isPrefectIconPath` / `normalizeModsEntry` 的地方，两个函数连同 `normalizeMods` 一起
+    /// 按评审意见删除）。常量与它的大小写语义**保留**，因为它仍是「同一份事实被写在两种语言
+    /// 里」的那份镜像，而 `ui/settings/chrome-shim.js::getURL` 现在也依赖同一条大小写不敏感语义
+    /// （内嵌资产表大小写敏感，两个名字都要解析到同一份字节）；锁法照旧：逐字锁正则文本 +
+    /// 读 `tests/normalize.test.mjs` 的输入表逐行核对。
     ///
     /// 用与 `report_prefix_and_shim_agree` 同一手法做两件事：
     /// ① 逐字锁住 JS 的正则文本（**必须带 `i`**——那正是 R30 要修的那一处）；
@@ -2135,6 +2152,12 @@ mod tests {
         assert!(
             js.contains("PREFECT_ICON_PATH = /^prefect_icon\\/[a-z0-9-]+\\.png$/i;"),
             "JS 镜像的正则必须与 Rust 规则同形且带 `i`（大小写不敏感，R30）"
+        );
+        // 镜像不得只有常量而无人核对：那张输入表（本函数下半段逐行锁着）就是它的实测判据。
+        let shim = include_str!("../../ui/settings/chrome-shim.js");
+        assert!(
+            shim.contains("canonicalAssetPath(raw)") && shim.contains("raw.toLowerCase()"),
+            "chrome-shim 的 getURL 必须把路径折成小写（与页面侧 shim / 本条镜像同一条语义）"
         );
         let table = include_str!("../../tests/normalize.test.mjs");
         // 与 config.rs 那份用例**逐行相同**的输入表（顺序也相同）。
@@ -2580,6 +2603,18 @@ mod tests {
         assert!(
             !shim.contains("invoke("),
             "钩子仍然只能写 document.title，不得给页面开命令授权"
+        );
+        // fix round 1 / Minor 5：3 次额度必须按**真的送出去的请求**结算，而不是按调用次数。
+        // 顺序是硬约束：先问「送出去了没有」，再计数——反过来就会把空转的调用也记账。
+        let ask = shim
+            .find("if (!askForAppItemsNow()) return false;")
+            .expect("钩子必须先判定请求有没有真的送出（Minor 5：额度不得被空转消耗）");
+        let count = shim
+            .find("appItemsManualCalls += 1;")
+            .expect("钩子必须仍然有次数上限");
+        assert!(
+            ask < count,
+            "计数的位置必须在「真的送出去了」判定之后（先加一再看结果 = 旧缺陷）"
         );
     }
 }

@@ -20,8 +20,9 @@
 //
 // 纪律（与前几轮一致）：
 // - **显示的值 = 生效的值**：`state.config` 一律原样采纳 `get_config` / `set_config` 的返回，
-//   不在 JS 侧二次归一化（`normalize.js` 仍是「用户刚输入的值」在提交前的唯一入口，
-//   而这里唯一的手工输入是 NAS 地址，提交时由 Rust 的 `Config::normalize` 收口）。
+//   不在 JS 侧二次归一化。T14b fix round 1 起设置窗**没有任何 mods 归一化**（normalize.js
+//   的镜像函数已按评审意见删除，本文件不得引用它——tests/settings.test.mjs 的 A 组锁着）；
+//   唯一的手工输入是 NAS 地址，原样提交、由 Rust 的 `Config::normalize` 收口。
 // - **显示与否都要有据**：状态条只读真实回包；应用项列表只读 Rust 分好槽的上报。
 // - 页面可控文本一律 `textContent`，绝不 `innerHTML`。
 import { addCurrentOriginToWhitelist, cornerShapeHint, statusBar, statusFor, reportVerdict } from './status.js';
@@ -105,10 +106,12 @@ function domReady() {
 /**
  * 把 IPC 返回的配置收进 state **与** iframe 的快照。
  *
- * **`mods` 原样采纳，不做任何归一化**（Review finding A / §8.4）：`clampLightness` 不是不动点
- * （`#cec1b2` → Rust `#c4b4a2` → JS 再夹一次 `#c4b4a1`），而页面按 Rust 那份生效。
- * 归一化只剩一个合法入口：用户刚输入的值在提交 patch 之前（本文件只剩 NAS 地址一处，
- * 且它由 Rust 的 `Config::normalize` 收口）。回归测试见 `tests/settings.test.mjs`。
+ * **`mods` 原样采纳，不做任何归一化**（Review finding A / §8.4）：Rust 归一化过的值
+ * 再过一遍 JS 镜像就会漂移（`#cec1b2` → Rust `#c4b4a2` → JS 再夹一次 `#c4b4a1`），
+ * 而页面按 Rust 那份生效。T14b fix round 1 起镜像函数已删除、设置窗没有任何 mods
+ * 归一化；本文件仅剩的手工输入（NAS 地址）也原样提交、由 Rust 的 `Config::normalize`
+ * 收口。回归测试见 `tests/settings.test.mjs` 的 A 组（含「不得引用 normalize.js」的
+ * 源码级断言）。
  */
 export function adoptConfig(raw) {
   if (!raw || typeof raw !== 'object') return;
@@ -417,19 +420,56 @@ export function installHostBridge() {
  *
  * 时序是硬约束：上游 popup.js 第一行就同步读 `chrome.runtime.getManifest().version`，
  * 而 shim 的 `getManifest` 读的是父 frame 的快照。先建帧再取配置会让版本显示落在兜底值上。
+ *
+ * **帧内的 `data-state` 不在挂载时就写 ready**（fix round 1 / Minor 2）：只有帧内真的出现
+ * 上游自己的节点（`#siteToggle` + `code.version`）才算渲染成功。旧实现在这里立刻写
+ * `ready`，而 CSS 又把占位说明在 ready 态隐藏，于是「上游界面没渲染出来」的兜底
+ * （`reportFrameVerdict`）永远不可能被用户看见——正是「绝不静默留白」要防的那种情形。
  */
 export function mountUpstreamFrame() {
   if (!domReady()) return null;
   const host = document.getElementById('upstreamHost');
-  if (!host || host.dataset.state === 'ready') return null;
+  if (!host || host.dataset.state === 'ready' || host.dataset.state === 'mounted') return null;
   const frame = document.createElement('iframe');
   frame.id = 'upstreamFrame';
   frame.title = '上游设置界面（fnOS UI Mods popup）';
   frame.setAttribute('src', UPSTREAM_PAGE);
-  frame.addEventListener('load', () => { reportFrameVerdict(); });
+  frame.addEventListener('load', () => { applyFrameVerdict(true); });
   host.appendChild(frame);
-  host.dataset.state = 'ready';
+  // `mounted`：帧已经挂上，占位说明先让位给帧本身；真正的判定交给 applyFrameVerdict。
+  host.dataset.state = 'mounted';
+  applyFrameVerdict();
+  scheduleFrameVerdict();
   return frame;
+}
+
+/** 帧内自检的有界重试：上游 popup.js 是异步启动的，给它几拍再判死。 */
+export const FRAME_VERDICT_TRIES = 8;
+export const FRAME_VERDICT_INTERVAL_MS = 400;
+let frameVerdictTimer = null;
+
+/**
+ * 有界轮询帧内自检（最多 [`FRAME_VERDICT_TRIES`] × [`FRAME_VERDICT_INTERVAL_MS`]）。
+ *
+ * 只为了「不冤判」：上游 UI 的静态节点在文档就绪时就存在，但帧的 `load` 事件与
+ * `chrome.storage.sync.get` 的回包之间有真实的空档；轮询窗口结束仍未就绪就如实
+ * 显示失败说明（不无限等，也不假装 ready）。
+ */
+export function scheduleFrameVerdict() {
+  if (frameVerdictTimer !== null) return;
+  let tries = 0;
+  const tick = () => {
+    frameVerdictTimer = null;
+    tries += 1;
+    if (applyFrameVerdict(false)) return;
+    if (tries >= FRAME_VERDICT_TRIES) {
+      // 有界窗口用尽仍未就绪 → 如实显示失败说明（**不再**停在会隐藏说明的态上）。
+      applyFrameVerdict(true);
+      return;
+    }
+    frameVerdictTimer = setTimeout(tick, FRAME_VERDICT_INTERVAL_MS);
+  };
+  frameVerdictTimer = setTimeout(tick, FRAME_VERDICT_INTERVAL_MS);
 }
 
 /**
@@ -458,10 +498,13 @@ export function probeUpstreamFrame() {
   const notice = doc.getElementById('fnosShellNotice');
   const chromeObj = win && win.chrome;
   const upstreamGroups = doc.querySelectorAll('#nav, #pane, .nav-item');
+  const ready = !!siteToggle && !!version;
   return {
     mounted: true,
     sameOrigin: true,
-    ready: !!siteToggle && !!version,
+    ready,
+    // 未就绪时给出**可读的原因**（旧实现这里没有 reason，占位说明只能显示「未知原因」）。
+    reason: ready ? null : frameFailureReason(doc, chromeObj),
     version: version ? String(version.textContent).trim() : null,
     siteToggle: !!siteToggle,
     appListEmptyText: appList ? String(appList.textContent).trim().slice(0, 80) : null,
@@ -472,14 +515,41 @@ export function probeUpstreamFrame() {
   };
 }
 
-/** 把帧内自检的结论写进占位说明（只在**没渲染出来**时才说话）。 */
-function reportFrameVerdict() {
+/** 帧内为什么没渲染出来：按**能观测到的**差别给一句可读的原因（不猜、不编）。 */
+function frameFailureReason(doc, chromeObj) {
+  const chromeReady = !!(chromeObj && chromeObj.storage && chromeObj.storage.sync && chromeObj.runtime);
+  if (!chromeReady) {
+    return '帧内的 chrome.* 兼容层没有就位（chrome-shim.js 没跑起来，popup.js 会在启动时抛错）';
+  }
+  const body = doc && doc.body ? String(doc.body.textContent || '').trim() : '';
+  if (!body) return '帧内文档是空的（popup.html 没有加载出来，或被 CSP/协议拒绝）';
+  return '上游界面的关键节点不存在（#siteToggle / code.version 都没有出现，popup.html 或 popup.js 没有跑起来）';
+}
+
+/**
+ * 把帧内自检的结论写进占位说明，并**只在真的就绪时**把 host 标成 ready。
+ *
+ * 返回是否就绪。未就绪时分两种态：还在有界重试窗口内 → `mounted`（不显示说明，避免抖动），
+ * 重试用尽或帧的 `load` 已经把结论带来 → `failed`（说明可见）。CSS 只在 ready 态隐藏说明，
+ * 所以 `failed` 的说明**一定看得见**（旧实现永远停在 ready，说明被 CSS 隐藏）。
+ */
+function applyFrameVerdict(final = false) {
   const host = domReady() ? document.getElementById('upstreamHost') : null;
-  if (!host) return;
+  if (!host) return false;
   const verdict = probeUpstreamFrame();
-  if (verdict.ready) return;
-  const note = document.getElementById('upstreamNote');
-  if (note) note.textContent = `上游设置界面没能渲染：${verdict.reason || '未知原因'}`;
+  if (verdict.ready) {
+    host.dataset.state = 'ready';
+    return true;
+  }
+  if (final) {
+    host.dataset.state = 'failed';
+    const note = document.getElementById('upstreamNote');
+    if (note) {
+      note.textContent = `上游设置界面没能渲染：${verdict.reason || '未知原因'}`
+        + '（本壳不会假装它渲染成功；这句话只有在帧内确实没有上游节点时才会出现。）';
+    }
+  }
+  return false;
 }
 
 // ---------- 状态条（spec §12.3） ----------
@@ -567,6 +637,29 @@ function renderStatus(busy) {
 
 // ---------- 外壳开关（上游 UI 里没有的两项） ----------
 
+/** 上一次真的画进 DOM 的外壳状态（值没变就不重建——见 [`renderShell`]）。 */
+let shellRenderKey = null;
+
+/**
+ * 正在编辑中的 NAS 地址（未保存的输入）。
+ *
+ * `renderShell` 会 `host.textContent = ''` 再重建，**重建就会丢掉用户正在敲的字**。聚焦刷新
+ * （`refresh()`）或任何一次重画都可能发生，所以重建前先把「与已保存值不同」的输入记下来，
+ * 重建后原样放回（含焦点与光标位置）。
+ */
+function captureNasEdit(host) {
+  const nas = host.querySelector('#f_shell_nasUrl');
+  if (!nas) return null;
+  const saved = nas.dataset.savedValue == null ? '' : nas.dataset.savedValue;
+  if (nas.value === saved) return null; // 没有未保存的改动：按配置值重建即可
+  return {
+    value: nas.value,
+    focused: document.activeElement === nas,
+    start: nas.selectionStart,
+    end: nas.selectionEnd,
+  };
+}
+
 /**
  * `shell.injectEnabled`（注入总开关）与 `shell.nasUrl`。
  *
@@ -577,13 +670,28 @@ function renderStatus(busy) {
  * `nasUrl` 在保存时会把它的 origin 并入白名单，是「一键把 NAS 加进来」的入口。
  * 托盘精简（T14a）之后，注入总开关只剩设置窗这一个入口——把它一起删掉就等于删功能。
  * 因此它们放在**本壳自己的区域**里（与上游界面并列），而不是塞进上游 UI。
+ *
+ * **值没变就不重建**（fix round 1 / Minor 1）：旧实现在每次 `refresh()`（窗口获得焦点）
+ * 都无条件 `host.textContent = ''` 重画，于是 alt-tab 一次就把用户没保存的 NAS 地址清成
+ * 配置里的旧值。现在两道闸：① 渲染键（两个键 + 错误条）与上次相同 → 直接返回，DOM 一个
+ * 字节都不动（焦点与输入都留着）；② 万一必须重建，也先把未保存的输入捞出来再放回去。
  */
 function renderShell() {
   if (!domReady()) return;
   const host = document.getElementById('shellFields');
   if (!host) return;
-  host.textContent = '';
   const shell = (state.config && state.config.shell) || {};
+  const injected = shell.injectEnabled !== false;
+  const nasValue = typeof shell.nasUrl === 'string' ? shell.nasUrl : '';
+
+  const renderKey = JSON.stringify({
+    injectEnabled: injected, nasUrl: nasValue, error: state.error || '',
+  });
+  if (renderKey === shellRenderKey && host.childElementCount > 0) return;
+
+  const edit = captureNasEdit(host);
+  host.textContent = '';
+  shellRenderKey = renderKey;
 
   const injectField = el('div', { className: 'field' });
   const injectId = 'f_shell_injectEnabled';
@@ -591,7 +699,7 @@ function renderShell() {
   injectLabel.htmlFor = injectId;
   const inject = el('input', { id: injectId });
   inject.type = 'checkbox';
-  inject.checked = shell.injectEnabled !== false;
+  inject.checked = injected;
   inject.addEventListener('change', () => { commitShell('injectEnabled', inject.checked); });
   injectField.append(injectLabel, inject, el('p', {
     className: 'hint',
@@ -606,7 +714,8 @@ function renderShell() {
   const nas = el('input', { id: nasId });
   nas.type = 'text';
   nas.placeholder = 'http://192.168.1.10:8000';
-  nas.value = typeof shell.nasUrl === 'string' ? shell.nasUrl : '';
+  nas.dataset.savedValue = nasValue; // 「已保存的值」：判断有没有未保存改动的唯一依据
+  nas.value = edit ? edit.value : nasValue;
   const nasSave = button('保存');
   nasSave.id = 'f_shell_nasUrl_save';
   const commitNas = () => { commitShell('nasUrl', nas.value); };
@@ -634,6 +743,13 @@ function renderShell() {
   host.appendChild(actions);
 
   if (state.error) host.insertBefore(el('p', { className: 'error-banner', text: state.error }), host.firstChild);
+
+  if (edit) {
+    // 未保存的输入原样放回（值 + 光标），必要时把焦点也还回去——「绝不丢弃进行中的输入」。
+    nas.value = edit.value;
+    try { nas.setSelectionRange(edit.start, edit.end); } catch (e) { /* 不支持就不设 */ }
+    if (edit.focused && typeof nas.focus === 'function') nas.focus();
+  }
 }
 
 // ---------- 关于页（spec §10：合规与品牌） ----------
