@@ -46,6 +46,8 @@
   var LOCATE_DELAY_MS = 150; // SPA 重渲染的合并窗口：一批变更只查一次选择器
   var TRANSITION_MS = 320;   // 与 CSS 的 .28s 过渡对齐（略留余量）；到点后真正 display:none
   var IDLE_MS = 3000;        // 「无操作」判定：这么久没有任何指针事件就藏
+  var DIAG_DELAY_MS = 5000;  // 开启后这么久还没找到 Dock → 页面角标给出诊断（不静默失效）
+  var TOAST_MS = 2600;       // 接管成功的提示停留时长
 
   var enabled = SHELL_CFG.dockAutoHide === true;
   var dock = null;       // 当前接管的 Dock 元素（可能被 SPA 换掉，observer 会重新找）
@@ -56,11 +58,20 @@
   var shown = false;     // 显隐意图（与 HIDDEN_CLASS 互斥）；接管默认 false = 平时是藏着的
   var idleTimer = null;  // 无操作兜底定时器（armIdle）
   var displayTimer = null; // 滑出动画结束后真正 display:none 的定时器
+  var diagTimer = null;  // 「还没找到 Dock」诊断角标的定时器
+  var toastTimer = null; // 成功提示的定时器
+  var greeted = false;   // 成功提示每次页面加载只出一次
 
   var CSS =
     '.' + HOST_CLASS + '{transition:transform .28s cubic-bezier(.4,0,.2,1);}' +
     '.' + HOST_CLASS + '.' + HIDDEN_CLASS + '{transform:var(--fnos-dock-hide-tf,translateX(-105%));}' +
-    '@media (prefers-reduced-motion: reduce){.' + HOST_CLASS + '{transition:none;}}';
+    '@media (prefers-reduced-motion: reduce){.' + HOST_CLASS + '{transition:none;}}' +
+    // 诊断/提示角标（本壳命名空间；pointer-events:none 不挡任何点击）
+    '.fnos-shell-dock-badge{position:fixed;left:10px;bottom:10px;z-index:2147483000;max-width:460px;' +
+    'padding:7px 11px;border-radius:8px;background:rgba(20,20,22,.82);color:#d8dadd;' +
+    'font:12px/1.6 system-ui,"Segoe UI","Microsoft YaHei",sans-serif;pointer-events:none;' +
+    'box-shadow:0 2px 10px rgba(0,0,0,.35);white-space:pre-wrap;}' +
+    '.fnos-shell-dock-badge.warn{color:#ffd479;}';
 
   /** 样式只装一次；优先可构造样式表（CSP 对 inline <style> 收紧时仍然可用），否则 <style>。 */
   function ensureStyle() {
@@ -168,6 +179,55 @@
     renderState();
   }
 
+  // ---------- 页面角标：接管成功有一次性提示，找不到 Dock 有常驻诊断（不静默失效） ----------
+
+  /** 设置或清除角标；`text` 为空 = 清除。样式走 adoptedStyleSheet（CSP 免疫），不挡点击。 */
+  function badge(text, warn) {
+    var el = D.getElementById('fnos-shell-dock-badge');
+    if (!text) {
+      if (el) el.remove();
+      return;
+    }
+    if (!el) {
+      el = D.createElement('div');
+      el.id = 'fnos-shell-dock-badge';
+      el.className = 'fnos-shell-dock-badge';
+      (D.body || D.documentElement).appendChild(el);
+    }
+    el.className = 'fnos-shell-dock-badge' + (warn ? ' warn' : '');
+    el.textContent = text;
+  }
+
+  function edgeName() {
+    return (axis === 'x' ? '左/右' : '上/下') + (edgeMin ? '（屏幕起点一侧）' : '（屏幕终点一侧）');
+  }
+
+  /** 接管成功的一次性提示：让「功能已生效」肉眼可证，不用开开发者工具。 */
+  function greet() {
+    if (greeted) return;
+    greeted = true;
+    badge('fnOS壳：已接管 Dock 的自动隐藏（贴' + edgeName() + '）。鼠标顶到该边缘唤出；无操作 3 秒自动藏。', false);
+    if (toastTimer) W.clearTimeout(toastTimer);
+    toastTimer = W.setTimeout(function () {
+      toastTimer = null;
+      if (dock) badge(null); // 只清成功提示；失败诊断角标不受这里影响
+    }, TOAST_MS);
+  }
+
+  /** 开启后一段时间还没找到 Dock → 常驻诊断角标（选择器失明时绝不悄悄躺平）。 */
+  function scheduleDiag() {
+    if (diagTimer) W.clearTimeout(diagTimer);
+    diagTimer = W.setTimeout(function () {
+      diagTimer = null;
+      if (!enabled || dock) return; // 已接管 / 已关闭：不需要诊断
+      var count = 0;
+      try { count = D.querySelectorAll(DOCK_ROOT_SELECTOR).length; } catch (e) { /* 保持 0 */ }
+      badge('fnOS壳·Dock自动隐藏：开启 ' + Math.round(DIAG_DELAY_MS / 1000) + ' 秒仍未找到 Dock 元素（'
+        + DOCK_ROOT_SELECTOR + ' 匹配 ' + count + ' 个）。找到后本提示自动消失；若持续显示，请截图反馈。',
+        true);
+    }, DIAG_DELAY_MS);
+  }
+
   /** 重新找 Dock 并接管。已接管的元素不变；旧元素被换掉时把自己加的东西清干净。 */
   function locate() {
     locateScheduled = false;
@@ -184,6 +244,7 @@
       try { hovered = dock.matches(':hover'); } catch (e) { /* 老内核不支持就照藏 */ }
       if (hovered) shown = true;
       renderState();
+      greet();          // 找到了：失败诊断（若有）被成功提示就地替换，随后自动消失
     }
   }
 
@@ -238,6 +299,7 @@
     D.addEventListener('pointerleave', onHideSignal);
     W.addEventListener('blur', onHideSignal);
     armIdle();
+    scheduleDiag();
     locate();
   }
 
@@ -245,11 +307,14 @@
     if (observer) { observer.disconnect(); observer = null; }
     if (idleTimer) { W.clearTimeout(idleTimer); idleTimer = null; }
     if (displayTimer) { W.clearTimeout(displayTimer); displayTimer = null; }
+    if (diagTimer) { W.clearTimeout(diagTimer); diagTimer = null; }
+    if (toastTimer) { W.clearTimeout(toastTimer); toastTimer = null; }
     D.removeEventListener('pointermove', onPointerMove);
     D.removeEventListener('pointerleave', onHideSignal);
     W.removeEventListener('blur', onHideSignal);
     release(dock);
     dock = null;
+    badge(null); // 功能关了，角标也不该留着
   }
 
   /** set_config 的免刷新入口（shim 的 `__FNOS_APPLY_CONFIG__` 转调；幂等）。 */
@@ -261,6 +326,11 @@
     enabled = next;
     if (enabled) install();
     else teardown();
+  };
+
+  /** 诊断口：控制台里 `__FNOS_DOCK_STATE__()` 即可看到接管状态（不携带任何页面数据）。 */
+  W.__FNOS_DOCK_STATE__ = function () {
+    return { enabled: enabled, found: !!dock, axis: axis, edgeMin: edgeMin, shown: shown };
   };
 
   if (enabled) install();

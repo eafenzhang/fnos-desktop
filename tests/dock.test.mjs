@@ -54,7 +54,13 @@ function fakeDom(opts = {}) {
     adoptedStyleSheets: [],
     head: { appendChild: (n) => doc._styles.push(n) },
     documentElement: { appendChild: (n) => doc._styles.push(n) },
-    createElement: () => ({ tag: 'style', textContent: '' }),
+    createElement: (tag) => {
+      const node = { tag, textContent: '', className: '', remove() {
+        const i = doc._styles.indexOf(node);
+        if (i >= 0) doc._styles.splice(i, 1);
+      } };
+      return node;
+    },
     getElementById: (id) => doc._styles.find((n) => n.id === id) || null,
     querySelectorAll: (sel) => (sel === UPSTREAM_ROOT ? doc._candidates : []),
     addEventListener(ev, fn) { this._listeners[ev] = fn; },
@@ -352,6 +358,57 @@ test('免刷新切换的形状闸：非 boolean 不动手、同值幂等、非�
   w.__FNOS_APPLY_SHELL__({});
   w.__FNOS_APPLY_SHELL__(42);
   assert.ok(doc._moObserved, '非法形状不得拆除已开启的功能');
+});
+
+// ---------- 页面角标：成功提示与「找不到 Dock」的诊断 ----------
+
+test('接管成功：一次性提示；诊断期后再找到会替换失败角标', () => {
+  const doc = fakeDom();
+  load(doc, { dockAutoHide: true });
+  const dock = fakeDock({ left: 0, top: 0, right: 68, bottom: 800 }, { hasList: true });
+  doc._candidates = [dock];
+  settle(doc);
+  const badge = doc.getElementById('fnos-shell-dock-badge');
+  assert.ok(badge, '接管成功必须有提示角标');
+  assert.match(badge.textContent, /已接管 Dock 的自动隐藏/);
+  assert.equal(badge.className, 'fnos-shell-dock-badge', '成功提示不是警告样式');
+  // 停留时长到点自动消失
+  doc._win.drainTimers();
+  assert.equal(doc.getElementById('fnos-shell-dock-badge'), null, '成功提示必须自动消失');
+  // 同页只出一次：SPA 换元素再接管，不重复弹（greeted 闸门）
+  const second = fakeDock({ left: 0, top: 0, right: 68, bottom: 800 }, { hasList: true });
+  doc._candidates = [second];
+  settle(doc);
+  assert.ok(second._classes.has('fnos-shell-dock-autohide'), '新元素照常接管');
+  assert.equal(doc.getElementById('fnos-shell-dock-badge'), null, '接管提示不得重复弹出');
+});
+
+test('找不到 Dock：诊断期后出现常驻警告角标（含选择器与匹配数），接管后消失', () => {
+  const doc = fakeDom();
+  load(doc, { dockAutoHide: true }); // 没有任何候选
+  doc._win.drainTimers();
+  const badge = doc.getElementById('fnos-shell-dock-badge');
+  assert.ok(badge, '超时未找到 Dock 必须有诊断角标（不静默失效）');
+  assert.equal(badge.className, 'fnos-shell-dock-badge warn', '诊断是警告样式');
+  assert.match(badge.textContent, /\.h-screen\.fixed\.left-0 匹配 0 个/);
+  // 之后 Dock 出现：接管，诊断被成功提示替换
+  const dock = fakeDock({ left: 0, top: 0, right: 68, bottom: 800 }, { hasList: true });
+  doc._candidates = [dock];
+  settle(doc);
+  assert.match(doc.getElementById('fnos-shell-dock-badge').textContent, /已接管/);
+});
+
+test('关闭功能：角标一并清除', () => {
+  const doc = fakeDom();
+  const w = load(doc, { dockAutoHide: true });
+  const dock = fakeDock({ left: 0, top: 0, right: 68, bottom: 800 }, { hasList: true });
+  doc._candidates = [dock];
+  settle(doc);
+  assert.ok(doc.getElementById('fnos-shell-dock-badge'));
+  w.__FNOS_APPLY_SHELL__({ dockAutoHide: false });
+  assert.equal(doc.getElementById('fnos-shell-dock-badge'), null, '功能关闭时角标必须清除');
+  // 诊断口可用且如实
+  assert.deepEqual(w.__FNOS_DOCK_STATE__(), { enabled: false, found: false, axis: 'x', edgeMin: true, shown: false });
 });
 
 // ---------- 样式注入的 CSP 兜底 ----------
