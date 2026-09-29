@@ -480,24 +480,72 @@ test('零尺寸 rect（SPA 未布局）不改写贴边结论', () => {
   assert.equal(dock.style.getPropertyValue('--fnos-dock-hide-tf'), 'translateX(105%)', '零 rect 沿用右缘结论');
 });
 
-test('Dock 被 SPA 换掉时重新接管：旧元素与旧回收完全还原，新元素接管', () => {
+test('Dock 被 SPA 换掉时重新接管：旧元素只清接管标记，空间回收**必须保持**（不闪回空白）', () => {
   const doc = fakeDom();
-  load(doc, { dockAutoHide: true });
-  const holder = fakeEl({ w: 1200, h: 800, left: 0, computed: { paddingLeft: '68px' } });
-  const first = fakeEl({ w: 68, h: 800, left: 0, top: 0, parent: holder, hasList: true, icons: 5 });
+  const w = load(doc, { dockAutoHide: true });
+  const root = fakeEl({ w: 1200, h: 800, left: 0 });
+  const holder = fakeEl({ w: 1200, h: 800, left: 0, parent: root, computed: { paddingLeft: '66px' } });
+  const first = fakeEl({ w: 66, h: 800, left: 0, top: 0, parent: root, hasList: true, icons: 5 });
+  root.children = [first, holder];
   doc._candidates = [first];
   settle(doc);
-  assert.equal(holder.style.getPropertyValue('padding-left'), '0px');
+  assert.equal(holder.style.getPropertyValue('padding-left'), '0px', '先中和');
 
-  const second = fakeEl({ w: 68, h: 800, left: 0, top: 0, hasList: true, icons: 5 });
+  // fnOS 在悬浮等时机重建 Dock 元素：新元素接管，但容器没变 —— 回收必须原地保留
+  const second = fakeEl({ w: 66, h: 800, left: 0, top: 0, parent: root, hasList: true, icons: 5 });
+  root.children = [second, holder];
   doc._candidates = [second];
   settle(doc);
   assert.ok(!first._classes.has('fnos-shell-dock-autohide') && !first._classes.has('fnos-shell-dock-hidden'),
     '被换掉的旧元素必须清掉本壳加的 class（不留下孤儿状态）');
   assert.equal(first.style.display, '', '被换掉的旧元素不得残留 display:none');
-  assert.equal(holder.style.getPropertyValue('padding-left'), '', '旧的一轮回收必须还原（避免叠加）');
+  assert.equal(holder.style.getPropertyValue('padding-left'), '0px',
+    '空间回收必须保持（还原会让左侧空白闪回来 —— 「悬浮时闪烁」的根因）');
   assert.ok(second._classes.has('fnos-shell-dock-autohide'));
   assert.ok(second._classes.has('fnos-shell-dock-hidden'), '新元素接管即藏');
+
+  // 真正关闭功能时才还原
+  w.__FNOS_APPLY_SHELL__({ dockAutoHide: false });
+  assert.equal(holder.style.getPropertyValue('padding-left'), '', '关闭功能时才还原回收');
+});
+
+test('显隐不来回拉锯：唤出（悬浮）不派发 resize，只有离场派发', () => {
+  const doc = fakeDom();
+  load(doc, { dockAutoHide: true });
+  const dock = fakeEl({ w: 66, h: 800, left: 0, top: 0, hasList: true, icons: 5 });
+  doc._candidates = [dock];
+  settle(doc);
+  doc._win.drainTimers();
+  const afterHide = doc._win._resized;
+  assert.ok(afterHide >= 1, '离场要派发 resize（工作区变大）');
+
+  doc._listeners.pointermove({ clientX: 3, clientY: 400 }); // 悬浮唤出
+  assert.equal(doc._win._resized, afterHide,
+    '唤出是浮层，不得派发 resize（否则窗口管理器重算、把 66px 偏移写回来 → 闪烁）');
+  doc._listeners.pointermove({ clientX: 600, clientY: 400 }); // 离开 → 藏
+  doc._win.drainTimers();
+  assert.ok(doc._win._resized > afterHide, '再次离场照常派发 resize');
+});
+
+test('覆盖丢失即刻补扫：容器被换掉时不等待节流窗口', () => {
+  const doc = fakeDom();
+  load(doc, { dockAutoHide: true });
+  const root = fakeEl({ w: 1200, h: 800, left: 0 });
+  const dock = fakeEl({ w: 66, h: 800, left: 0, top: 0, parent: root, hasList: true, icons: 5 });
+  const content = fakeEl({ w: 1200, h: 800, left: 0, parent: root, computed: { paddingLeft: '66px' } });
+  root.children = [dock, content];
+  doc._candidates = [dock];
+  settle(doc);
+  assert.equal(content.style.getPropertyValue('padding-left'), '0px');
+
+  // SPA 换掉内容区容器：新容器又带着 66px（我们的覆盖随旧元素一起消失）
+  const fresh = fakeEl({ w: 1200, h: 800, left: 0, parent: root, computed: { paddingLeft: '66px' } });
+  root.children = [dock, fresh];
+  content.isConnected = false;
+  doc._moCallback();
+  doc._win.drainTimers();
+  assert.equal(fresh.style.getPropertyValue('padding-left'), '0px',
+    '新容器必须被立刻中和（不等 1.5s 节流 —— 否则空白会闪一下）');
 });
 
 // ---------- 免刷新切换的形状闸 ----------

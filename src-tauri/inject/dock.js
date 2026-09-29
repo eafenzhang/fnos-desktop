@@ -324,6 +324,19 @@
     }
   }
 
+  /** 已记账的回收是否仍然有效：元素还在文档里、且覆盖还在（否则应当**立刻**重扫）。 */
+  function reclaimStillValid() {
+    if (!reclaimed.length) return true; // 还没扫过：交给节流（首轮 lastPaddingPass = 0 必跑）
+    for (var i = 0; i < reclaimed.length; i++) {
+      var item = reclaimed[i];
+      if (!item.el || item.el.isConnected === false) return false;
+      try {
+        if (!item.el.style.getPropertyValue(item.prop)) return false;
+      } catch (e) { return false; }
+    }
+    return true;
+  }
+
   /**
    * 机制①的入口。fnOS 实测结构：
    *   <div class="relative flex …">            ← 桌面根（flex 行）
@@ -332,13 +345,14 @@
    *   </div>
    * 所以预留写在 Dock 的**同级内容区**上（也从 Dock 的祖先链兜一层），本函数两处都扫。
    *
-   * 有界 + 节流：一次最多 400 个节点，且两次之间至少 [`LAYOUT_PASS_MIN_MS`]——容器是稳定的，
-   * 覆盖一旦写上就一直在（除非容器被 SPA 换掉，那时下一轮会补上）。
+   * 有界 + 节流：一次最多 400 个节点，且两次之间至少 [`LAYOUT_PASS_MIN_MS`]；但只要
+   * [`reclaimStillValid`] 发现覆盖丢了（容器被 SPA 换掉），节流窗口不作数——**立刻**补扫，
+   * 免得左侧空白闪一下再收回（修复轮 9）。
    */
   function reclaimLayoutPadding() {
     if (!(axis === 'x' && edgeMin)) return; // 只处理贴左缘的形态
     var now = Date.now();
-    if (now - lastPaddingPass < LAYOUT_PASS_MIN_MS) return;
+    if (now - lastPaddingPass < LAYOUT_PASS_MIN_MS && reclaimStillValid()) return;
     lastPaddingPass = now;
     var vw = W.innerWidth || 0;
     var vh = W.innerHeight || 0;
@@ -447,21 +461,33 @@
     } catch (e) { /* 不支持就算了 */ }
   }
 
-  /** 释放全部接管元素 + 还原所有被中和的预留与窗口覆盖。 */
-  function releaseAll() {
+  /**
+   * 只释放接管元素（class / 内联变量 / display），**不动空间回收**。
+   *
+   * 为什么必须分开（修复轮 9）：fnOS 在悬浮等时机**会重建 Dock 元素**，而「换元素」走的正是
+   * 这条路。早先这里连着 `restoreReclaimed()` 一起还原，于是每次悬浮都先把左侧预留还回去
+   * （空白闪回来）、再等下一轮扫描才中和 —— 用户看到的就是「悬浮时左侧空白闪烁」。
+   * 容器没变，回收就该一直有效：还原只在真正关闭功能（`teardown`）时做。
+   */
+  function releaseTargets() {
     for (var i = 0; i < targets.length; i++) releaseOne(targets[i]);
     targets = [];
     dock = null;
-    lastPaddingPass = 0; // 覆盖刚被还原：下一轮立刻补扫（节流窗口不作数）
+  }
+
+  /** 完全还原：接管元素 + 空间回收 + 窗口覆盖（**只在功能关闭时**调用）。 */
+  function releaseAll() {
+    releaseTargets();
     releaseWindowFixes();
     restoreReclaimed();
   }
 
   /**
-   * Dock 离场/回归都会改变「可用工作区」，而 fnOS 的窗口管理器通常只在 resize 时重排
-   * 窗口位置（修复轮 5：已打开的窗口不会跟着回收 Dock 让出的那条宽度）。Dock 真正
-   * 离场（display:none）或恢复布局的当下派发一次 resize，让最大化/已铺开的窗口按
-   * 新工作区重排。
+   * Dock 离场时派发一次 resize：工作区变大，让窗口管理器重排已铺开的窗口（修复轮 5）。
+   *
+   * **只在离场时派发，回归时不再派发**（修复轮 9）：回归（悬浮唤出）时 Dock 是**浮在内容
+   * 之上**的，布局本该一点不动；派发 resize 只会让窗口管理器重算，把 66px 偏移又写回窗口与
+   * 内容区，与我们的中和互相拉锯 —— 用户看到的就是「悬浮时左侧空白闪烁」。
    */
   function notifyResize() {
     try { W.dispatchEvent(new W.Event('resize')); } catch (e) { /* 老内核缺 Event 构造器就算了 */ }
@@ -477,8 +503,7 @@
       }
       try { void dock.offsetWidth; } catch (e) { /* 强制重排：display:none 刚恢复时要有动画起点 */ }
       dock.classList.remove(HIDDEN_CLASS);
-      notifyResize(); // Dock 回到布局：工作区变小，窗口管理器按旧几何收回去
-      return;
+      return; // 唤出是「浮层」：不改布局、不派发 resize（见 notifyResize 的注释）
     }
     syncTransform();
     dock.classList.add(HIDDEN_CLASS);
@@ -504,10 +529,14 @@
     locateScheduled = false;
     var found = findDock();
     if (found && found !== dock) {
-      releaseAll();
+      // fnOS 会重建 Dock 元素（悬浮等时机）：这里只释放旧元素的接管标记，
+      // **空间回收保持不变**（容器没变；还原会让左侧空白闪回来，见 releaseTargets）。
+      releaseTargets();
       dock = found;
       targets = [found];
       found.classList.add(HOST_CLASS);
+      // 元素被换掉时容器也可能被换掉：清掉节流，让本轮立刻重扫一次
+      lastPaddingPass = 0;
       // 先定贴边方向：空间回收（只处理贴左缘）与滑出方向都依赖它，而它只能从**当前可见**
       // 的 Dock 几何量出来——晚于这一步量就会拿到默认值（修复轮 7 的实现次序）。
       syncTransform();
