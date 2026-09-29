@@ -85,6 +85,57 @@
     if (cssMissing()) installFallbackCss();
   }
 
+  // ---------- 本壳自己的样式覆盖（与上游 mod 无关，永远装） ----------
+
+  /**
+   * 唯一一条覆盖规则：**「绝对定位的整屏覆盖层」必须不透明**。
+   *
+   * 上游 mod 把 `.bg-[var(--semi-color-app-container)]` 统一改成 50% 透明的玻璃效果
+   * （`basic_mod.css` 的 `background-color: color-mix(… 50%, transparent) !important`）。
+   * 它在普通窗口上好看，但应用中心的**应用详情**正是用这个类的整屏覆盖层
+   * （`absolute inset-0 z-10 …`，实测），半透明会让底下的应用列表穿透上来、与详情文字重叠
+   * ——用户实测反馈的「应用详情没有背景底色」。
+   *
+   * 修法是**在同一属性上用更高特异性压回去**（三条类 0,3,0 > 一条类 0,1,0，两边都是
+   * `!important` 时由特异性决出胜负）：只命中「绝对定位 + 铺满父容器」的覆盖层，
+   * 普通窗口/内容区的玻璃效果原样保留。
+   */
+  var SHELL_CSS_ID = 'fnos-shell-overrides';
+  var SHELL_CSS =
+    '.bg-\\[var\\(--semi-color-app-container\\)\\].absolute.inset-0' +
+    '{background-color:var(--semi-color-app-container) !important;}';
+  var shellCssInstalled = false;
+
+  function installShellCss() {
+    if (shellCssInstalled) return;
+    // 与上游 CSS 兜底同一条路：优先可构造样式表（CSP 免疫）
+    if (D.adoptedStyleSheets && typeof CSSStyleSheet === 'function') {
+      try {
+        var sheet = new CSSStyleSheet();
+        sheet.replaceSync(SHELL_CSS);
+        D.adoptedStyleSheets = D.adoptedStyleSheets.concat([sheet]);
+        shellCssInstalled = true;
+        state.shellCss = 'adopted';
+        return;
+      } catch (e) { /* 落到 <style> */ }
+    }
+    if (D.getElementById(SHELL_CSS_ID)) {
+      shellCssInstalled = true;
+      state.shellCss = 'style';
+      return;
+    }
+    try {
+      var el = D.createElement('style');
+      el.id = SHELL_CSS_ID;
+      el.textContent = SHELL_CSS;
+      (D.head || D.documentElement).appendChild(el);
+      shellCssInstalled = true;
+      state.shellCss = 'style';
+    } catch (e) {
+      state.shellCss = 'failed'; // 装不上不静默：状态里留痕（排障用）
+    }
+  }
+
   /* 执行 mod.js 原文。优先用 Function 显式绑定当前 window/document：
    * 初始化脚本没有真正的全局脚本作用域（沙箱/测试里 (0,eval) 拿不到 W），而 mod.js 是
    * 自足脚本、对外只经 window.* 暴露（mod.js:1/93/292/375/1286/1432），入参绑定与
@@ -191,6 +242,7 @@
   };
 
   function afterLoad() {
+    installShellCss();
     cssSelfCheck();
     watchModScript();
     setTimeout(cssSelfCheck, CSS_RECHECK_DELAY);

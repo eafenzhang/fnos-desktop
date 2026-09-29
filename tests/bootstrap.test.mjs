@@ -94,6 +94,17 @@ test('bootstrap 暴露版本与受管 CSS id 列表', () => {
   assert.ok(w.__FNOS_BOOTSTRAP__.cssIds.includes(MANAGED_LINK_ID));
 });
 
+test('本壳样式覆盖：绝对定位的整屏覆盖层恢复不透明（应用详情不再是透明的）', () => {
+  const doc = fakeDom({ readyState: 'complete' });
+  const w = load(SHELL, doc);
+  // 覆盖表必须装（与上游 CSS 是否被拦无关）
+  const css = (w.__installedSheets || []).map((s) => s.cssText).join(String.fromCharCode(10));
+  const marker = 'bg-\\[var\\(--semi-color-app-container\\)\\].absolute.inset-0';
+  assert.ok(css.indexOf(marker) >= 0, '必须有针对「绝对定位整屏覆盖层」的规则选择器');
+  assert.ok(css.indexOf(marker + '{background-color:var(--semi-color-app-container) !important;}') >= 0,
+    '用主题自己的容器底色恢复不透明，并带 !important');
+});
+
 test('link 未生效时用 adoptedStyleSheets 补装 CSS', () => {
   const doc = fakeDom({ readyState: 'complete' });
   // 受管 link 已注入但 sheet === null（被 CSP/协议拦掉的真实形态）→ cssMissing() 必须为真
@@ -101,8 +112,12 @@ test('link 未生效时用 adoptedStyleSheets 补装 CSS', () => {
   const w = load(SHELL, doc);
   assert.ok(w.__FNOS_BOOTSTRAP__.fallbackInstalled >= 1);
   assert.ok(doc.adoptedStyleSheets.length >= 1);
-  assert.equal(doc.adoptedStyleSheets[0], w.__installedSheets[0]);
-  assert.equal(w.__installedSheets[0].cssText, 'body{color:red}');
+  // 按**内容**判定（不依赖安装顺序）：上游那份兜底 CSS 必须真的在列表里
+  const texts = doc.adoptedStyleSheets.map((x) => x.cssText);
+  assert.ok(texts.indexOf('body{color:red}') >= 0, '上游 CSS 兜底必须装上');
+  assert.equal(doc.adoptedStyleSheets.indexOf(w.__installedSheets[0]) >= 0, true);
+  // 本壳的覆盖表也在（无论上游 CSS 是否被拦，它都要装）
+  assert.ok(texts.some((t) => t.indexOf('--semi-color-app-container') >= 0), '本壳覆盖表必须装上');
 });
 
 test('link 生效时不触发 CSS 兜底（cssMissing 对照组）', () => {
@@ -110,7 +125,10 @@ test('link 生效时不触发 CSS 兜底（cssMissing 对照组）', () => {
   doc.nodes.push({ id: MANAGED_LINK_ID, sheet: {} });
   const w = load(SHELL, doc);
   assert.equal(w.__FNOS_BOOTSTRAP__.fallbackInstalled, 0);
-  assert.equal(doc.adoptedStyleSheets.length, 0);
+  // 上游 CSS 兜底不得触发；列表里只允许有本壳自己的覆盖表（它与应用 CSS 无关，永远装）
+  const texts = doc.adoptedStyleSheets.map((x) => x.cssText);
+  assert.equal(texts.indexOf('body{color:red}'), -1, '不得补装上游 CSS');
+  assert.ok(texts.every((t) => t.indexOf('--semi-color-app-container') >= 0), '只应有本壳覆盖表');
 });
 
 test('mod.js 未执行时兜底执行且只执行一次', () => {
@@ -168,8 +186,11 @@ test('installFallbackCss 幂等：重复自检不重复安装、不重复计数'
   drainTimers(doc); // 跑掉 +600ms 的第二次自检
   w.__FNOS_BOOTSTRAP__.installFallbackCss(); // 再显式调一次
   assert.equal(w.__FNOS_BOOTSTRAP__.fallbackInstalled, 1);
-  assert.equal(doc.adoptedStyleSheets.length, 1);
-  assert.equal(w.__installedSheets.length, 1);
+  // 按**内容**判定安装次数（不走顺序/总数：本壳覆盖表也在同一个列表里）
+  assert.equal(doc.adoptedStyleSheets.filter((x) => x.cssText === 'body{color:red}').length, 1,
+    '上游 CSS 只补装一次');
+  assert.equal(doc.adoptedStyleSheets.filter((x) => x.cssText.indexOf('--semi-color-app-container') >= 0).length, 1,
+    '本壳覆盖表也只装一次（幂等）');
 });
 
 test('script 元素出现约 100ms 后才兜底执行 mod.js', () => {
