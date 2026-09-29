@@ -113,6 +113,13 @@ test('本壳样式覆盖：绝对定位的整屏覆盖层恢复不透明（应�
   const appCenterRule = css.slice(css.indexOf('fnos-app-center-route-detail'));
   assert.ok(appCenterRule.indexOf('background-color:var(--semi-color-app-container) !important;') >= 0,
     '应用中心那条也要用主题容器底色恢复不透明');
+  // 过渡期透明：上游给该面板挂了 `background-color 0s linear 320ms`（背景延迟切换），
+  // 必须把 background-color 从过渡属性里去掉，否则「列表→详情」会露出一瞬透明。
+  assert.ok(appCenterRule.indexOf('transition-property:transform,opacity !important;') >= 0,
+    '必须去掉 background-color 的过渡延迟');
+  // 桌面壁纸顶行的亮蓝线：裁掉壁纸顶部 1px
+  assert.ok(css.indexOf('#root .absolute.inset-0.z-0.object-contain{clip-path:inset(1px 0 0 0) !important;}') >= 0,
+    '必须有「裁掉壁纸顶部 1px」的规则');
 });
 
 test('link 未生效时用 adoptedStyleSheets 补装 CSS', () => {

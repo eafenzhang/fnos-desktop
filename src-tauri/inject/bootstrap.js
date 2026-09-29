@@ -112,7 +112,16 @@
     '.fnos-app-center-route-detail.fnos-app-center-route-active,' +
     '.trim-ui__app-layout--window:has(.trim-ui__app-layout--header-title img[alt="应用中心"]) ' +
     '.fnos-app-center-route-detail.absolute.inset-0' +
-    '{background-color:var(--semi-color-app-container) !important;}';
+    '{background-color:var(--semi-color-app-container) !important;' +
+    // 上游给这个面板挂了 `transition: …, background-color 0s linear 320ms`（背景延迟 320ms 才切换）。
+    // 背景已经是底色的前提下这条延迟只会让「列表→详情」的过渡期露出一瞬透明，所以把
+    // `background-color` 从过渡属性里去掉（保留 transform/opacity 的滑动与淡入）。
+    'transition-property:transform,opacity !important;}' +
+    // 桌面壁纸（fnOS 的 live 壁纸 webp，object-fit: cover）**顶行本身就是一条亮蓝线**（实测
+    // rgb(38,77,143)，只占 1px）。裁掉壁纸顶部 1px，那条线就没有了；下方由页面底色承接，
+    // 视觉无缝。
+    '#root .absolute.inset-0.z-0.object-contain' +
+    '{clip-path:inset(1px 0 0 0) !important;}';
   var shellCssInstalled = false;
 
   function installShellCss() {
