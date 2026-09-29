@@ -98,11 +98,23 @@
   /** 壁纸允许的扩展名（与 `config::wallpaper_ext` / popup 的 `<input accept>` 同一张表）。 */
   const WALLPAPER_EXTS = ['png', 'jpg', 'jpeg', 'webp'];
 
-  /** 上游更新检查唯一会请求的地址（popup.js:89-90）。 */
+  /** 上游更新检查唯一会请求的地址（popup.js:89-90）。它是**拦截键**：上游文件不改，
+   *  所以这里必须与它的字面量逐字一致——改的是我们合成的应答内容，不是被拦的地址。 */
   const GITHUB_COMMITS_API_URL =
     'https://api.github.com/repos/aurysian-yan/FnOS_UI_Mods/commits?per_page=1';
+  /** 「最新提交」链接的目标（离线应答的 `html_url`；T14c 修复轮 6 起指向**本仓库**）。 */
   const GITHUB_COMMITS_PAGE_URL =
-    'https://github.com/aurysian-yan/FnOS_UI_Mods/commits';
+    'https://github.com/eafenzhang/fnos-desktop/commits';
+
+  /** 本仓库（GitHub 按钮与「最新提交」链接的**单一事实来源**）。 */
+  const APP_REPO_URL = 'https://github.com/eafenzhang/fnos-desktop';
+  /** 界面显示名（上游字标是矢量路径，改不了字；本层用同主题的文本替身）。 */
+  const APP_DISPLAY_NAME = 'fnOS Desktop';
+  /** 上游仓库地址前缀：用来认出上游 HTML 里那两个指向上游的链接。 */
+  const UPSTREAM_REPO_PREFIX = 'https://github.com/aurysian-yan/FnOS_UI_Mods';
+  /** 品牌文本替身的元素 id（幂等闸门 + 便于测试/排障定位）。 */
+  const BRAND_ID = 'fnosShellBrand';
+  let brandObserver = null;
 
   /** `chrome.runtime.getURL` 允许的形状：只能指到设置窗资产根下的相对路径。 */
   const ASSET_PATH = /^[A-Za-z0-9][A-Za-z0-9._/-]*$/;
@@ -817,6 +829,66 @@
     siteRow.parentNode.insertBefore(row, siteRow.nextSibling);
   }
 
+  // ---------- 品牌与链接（运行时适配；上游 HTML 逐字节不动） ----------
+
+  /** 把上游 HTML 里所有指向上游仓库的链接改指本仓库（提交链接相应带 `/commits`）。 */
+  function retargetUpstreamLinks() {
+    let nodes;
+    try { nodes = document.querySelectorAll('a[href]'); } catch (_error) { return; }
+    for (const el of nodes) {
+      const href = el.getAttribute('href') || '';
+      if (href.indexOf(UPSTREAM_REPO_PREFIX) !== 0) continue;
+      // 「最新提交」那条（更新检查用）指向本仓库的提交列表，其余指向仓库首页
+      const isCommits = el.id === 'latestCommitLink' || href.indexOf('/commits') >= 0;
+      el.setAttribute('href', isCommits ? `${APP_REPO_URL}/commits` : APP_REPO_URL);
+    }
+  }
+
+  /** 头部字标：上游用一条 SVG 路径画的「FnOS UI Mods」→ 隐藏它，放一个同主题的文本替身。 */
+  function replaceWordmark() {
+    let logo = null;
+    try { logo = document.querySelector('.card.header .info svg.logo'); } catch (_error) { /* 见下 */ }
+    if (!logo) {
+      try { logo = document.querySelector('.info svg.logo'); } catch (_error) { logo = null; }
+    }
+    if (!logo) return; // 上游改版了头部：不改它的结构，只是不改品牌（宁缺不砸）
+    if (document.getElementById(BRAND_ID)) return; // 幂等
+    const label = document.createElement('span');
+    label.id = BRAND_ID;
+    label.textContent = APP_DISPLAY_NAME;
+    // 字号/字重对齐被隐藏字标的高度（viewBox 95 单位 @18px，视觉字高约 17px）
+    label.setAttribute('style',
+      'margin:4px;font:700 17px/18px var(--popup-font-family,system-ui,sans-serif);' +
+      'color:var(--text,CanvasText);white-space:nowrap;');
+    logo.parentNode.insertBefore(label, logo);
+    logo.setAttribute('style', `${logo.getAttribute('style') || ''};display:none;`);
+    logo.dataset.fnosShell = '1'; // 诚实边界：这块显示已被本层接管
+  }
+
+  /**
+   * 品牌与链接的**运行时**适配（T14c 修复轮 6）：文档标题与头部字标 → 「fnOS Desktop」，
+   * 指向上游仓库的链接 → 本仓库。
+   *
+   * 为什么运行时做（而不是直接改 `popup.html`）：上游文件保持**逐字节原样**是合规纪律
+   * （NOTICE 记录了唯一的包装性改动 = 那一行 shim 标签，`tests/chrome-shim.test.mjs` 用
+   * 「长度差恒为 43 字节」把它钉住）。适配放在本层，审计时看到的仍是一份未改动的上游副本。
+   *
+   * 上游 popup.js 会在初始化与每次刷新时**重写** `#latestCommitLink` 的 href（它读
+   * `updateCheckState.latestUrl`，取不到就用它自己的上游常量），所以这里不只改一次：
+   * `MutationObserver` 盯住全文档的 href 变更，凡是回到上游地址就改回本仓库。
+   */
+  function rebrandUpstream() {
+    try {
+      if (document.title) document.title = APP_DISPLAY_NAME;
+      replaceWordmark();
+      retargetUpstreamLinks();
+      if (typeof MutationObserver === 'function' && !brandObserver) {
+        brandObserver = new MutationObserver(() => { retargetUpstreamLinks(); });
+        brandObserver.observe(document, { subtree: true, attributeFilter: ['href'] });
+      }
+    } catch (_error) { /* 品牌适配失败不影响任何上游功能 */ }
+  }
+
   installFetchGuard();
   const installed = installChrome(chromeApi);
 
@@ -831,4 +903,6 @@
   // 本壳设置行：脚本在 body 末尾加载，上游的静态行（#siteToggle 所在 .row）此时已解析。
   // （T14c 修复轮 6：常驻说明底栏已删——notice 只在错误/关键提示时以临时气泡出现。）
   injectDockRow();
+  // 品牌与链接适配：上游 HTML 都不动，改的是这份活文档（字标替身 + 链接改指本仓库）。
+  rebrandUpstream();
 })();

@@ -429,7 +429,7 @@ export function mountUpstreamFrame() {
   if (!host || host.dataset.state === 'ready' || host.dataset.state === 'mounted') return null;
   const frame = document.createElement('iframe');
   frame.id = 'upstreamFrame';
-  frame.title = '上游设置界面（fnOS UI Mods popup）';
+  frame.title = '设置界面（fnOS Desktop）';
   frame.setAttribute('src', UPSTREAM_PAGE);
   frame.addEventListener('load', () => { applyFrameVerdict(true); });
   host.appendChild(frame);

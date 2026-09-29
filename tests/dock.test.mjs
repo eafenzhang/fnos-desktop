@@ -232,7 +232,7 @@ test('登录页（有密码输入框）不弹「找不到 Dock」的诊断；登
   assert.match(badge.textContent, /各策略计数/);
 });
 
-test('诊断角标报告各策略计数，接管成功后替换为成功提示', () => {
+test('诊断角标报告各策略计数；接管成功后诊断被清除（且不再弹任何成功提示）', () => {
   const doc = fakeDom();
   load(doc, { dockAutoHide: true });
   doc._win.drainTimers();
@@ -244,27 +244,28 @@ test('诊断角标报告各策略计数，接管成功后替换为成功提示',
   const dock = fakeDock({ left: 0, top: 0, right: 68, bottom: 800 }, { hasList: true, icons: 5 });
   doc._candidates = [dock];
   settle(doc);
-  assert.match(doc.getElementById('fnos-shell-dock-badge').textContent, /已接管/);
+  assert.ok(dock._classes.has('fnos-shell-dock-autohide'), '接管照常');
+  assert.equal(doc.getElementById('fnos-shell-dock-badge'), null,
+    '接管成功后诊断必须清除，且**不弹**任何成功提示（T14c 修复轮 6：左下角提示已按用户要求删除）');
 });
 
-test('接管成功的提示只出一次，停留后自动消失', () => {
+test('接管成功不产生任何页面角标（静默生效）', () => {
   const doc = fakeDom();
   load(doc, { dockAutoHide: true });
   const dock = fakeDock({ left: 0, top: 0, right: 68, bottom: 800 }, { hasList: true, icons: 5 });
   doc._candidates = [dock];
   settle(doc);
-  const badge = doc.getElementById('fnos-shell-dock-badge');
-  assert.ok(badge, '接管成功必须有提示角标');
-  assert.match(badge.textContent, /已接管 Dock 的自动隐藏/);
-  // 停留时长到点自动消失
-  doc._win.drainTimers();
-  assert.equal(doc.getElementById('fnos-shell-dock-badge'), null, '成功提示必须自动消失');
-  // 同页只出一次：SPA 换元素再接管，不重复弹（greeted 闸门）
+  assert.ok(dock._classes.has('fnos-shell-dock-hidden'), '接管即藏照常');
+  assert.equal(doc.getElementById('fnos-shell-dock-badge'), null, '成功路径不得出现任何角标');
+  // SPA 换元素再接管：同样不弹
   const second = fakeDock({ left: 0, top: 0, right: 68, bottom: 800 }, { hasList: true, icons: 5 });
   doc._candidates = [second];
   settle(doc);
   assert.ok(second._classes.has('fnos-shell-dock-autohide'), '新元素照常接管');
-  assert.equal(doc.getElementById('fnos-shell-dock-badge'), null, '接管提示不得重复弹出');
+  assert.equal(doc.getElementById('fnos-shell-dock-badge'), null, '重新接管同样不得弹提示');
+  // 源码级：成功提示机制已整体移除（greet / TOAST_MS 不得借尸还魂）
+  assert.ok(!DOCK.includes('greet('), 'dock.js 不得再有成功提示函数');
+  assert.ok(!DOCK.includes('TOAST_MS'), 'dock.js 不得再有成功提示时长常量');
 });
 
 // ---------- 显隐状态机 ----------

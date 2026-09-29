@@ -7,6 +7,10 @@ _spike_tauri/src-tauri/gen/schemas/
 # SDD 过程产物（非项目代码）
 .superpowers/
 
+# 安全扫描器的会话状态（工具产物，随目录生成，不入库）
+.mimosa/
+.playwright-mcp/
+
 # 依赖
 node_modules/
 

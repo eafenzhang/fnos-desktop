@@ -56,7 +56,6 @@
   var TRANSITION_MS = 320;   // 与 CSS 的 .28s 过渡对齐（略留余量）；到点后真正 display:none
   var IDLE_MS = 3000;        // 「无操作」判定：这么久没有任何指针事件就藏
   var DIAG_DELAY_MS = 5000;  // 开启后这么久还没找到 Dock → 页面角标给出诊断（不静默失效）
-  var TOAST_MS = 2600;       // 接管成功的提示停留时长
   var DOCK_SIDE_MAX = 140;   // 「Dock 形状」的窄边上限 / 长边下限（像素）
 
   var enabled = SHELL_CFG.dockAutoHide === true;
@@ -69,8 +68,6 @@
   var idleTimer = null;  // 无操作兜底定时器（armIdle）
   var displayTimer = null; // 滑出动画结束后真正 display:none 的定时器
   var diagTimer = null;  // 「还没找到 Dock」诊断角标的定时器
-  var toastTimer = null; // 成功提示的定时器
-  var greeted = false;   // 成功提示每次页面加载只出一次
   var lastMiss = '';     // 最近一次「全部策略落空」的计数快照（诊断角标用）
 
   var CSS =
@@ -300,7 +297,7 @@
     renderState();
   }
 
-  // ---------- 页面角标：接管成功有一次性提示，找不到 Dock 有常驻诊断（不静默失效） ----------
+  // ---------- 页面角标：只在「找不到 Dock」时出现的诊断（不静默失效；成功不弹提示） ----------
 
   /** 设置或清除角标；`text` 为空 = 清除。样式走 adoptedStyleSheet（CSP 免疫），不挡点击。 */
   function badge(text, warn) {
@@ -319,25 +316,11 @@
     el.textContent = text;
   }
 
-  function edgeName() {
-    return (axis === 'x' ? '左/右' : '上/下') + (edgeMin ? '（屏幕起点一侧）' : '（屏幕终点一侧）');
-  }
-
-  /** 接管成功的一次性提示：让「功能已生效」肉眼可证，不用开开发者工具。 */
-  function greet() {
-    if (greeted) return;
-    greeted = true;
-    badge('fnOS壳：已接管 Dock 的自动隐藏（贴' + edgeName() + '）。鼠标顶到该边缘唤出；无操作 3 秒自动藏。', false);
-    if (toastTimer) W.clearTimeout(toastTimer);
-    toastTimer = W.setTimeout(function () {
-      toastTimer = null;
-      if (dock) badge(null); // 只清成功提示；失败诊断角标不受这里影响
-    }, TOAST_MS);
-  }
-
   /**
    * 开启后一段时间还没找到 Dock → 诊断角标（选择器失明时绝不悄悄躺平）。
    * 登录页本来就没有 Dock（用户实测反馈）：页面里有密码输入框时静默顺延，不误报。
+   * （T14c 修复轮 6：接管成功的左下角提示已按用户要求删除——找到即静默接管，
+   * 只清掉可能挂着的失败诊断角标。）
    */
   function scheduleDiag() {
     if (diagTimer) W.clearTimeout(diagTimer);
@@ -368,7 +351,7 @@
       try { hovered = dock.matches(':hover'); } catch (e) { /* 老内核不支持就照藏 */ }
       if (hovered) shown = true;
       renderState();
-      greet(); // 找到了：失败诊断（若有）被成功提示就地替换，随后自动消失
+      badge(null); // 找到了：清掉可能挂着的「找不到 Dock」诊断角标（不再弹任何成功提示）
     }
   }
 
@@ -432,7 +415,6 @@
     if (idleTimer) { W.clearTimeout(idleTimer); idleTimer = null; }
     if (displayTimer) { W.clearTimeout(displayTimer); displayTimer = null; }
     if (diagTimer) { W.clearTimeout(diagTimer); diagTimer = null; }
-    if (toastTimer) { W.clearTimeout(toastTimer); toastTimer = null; }
     D.removeEventListener('pointermove', onPointerMove);
     D.removeEventListener('pointerleave', onHideSignal);
     W.removeEventListener('blur', onHideSignal);

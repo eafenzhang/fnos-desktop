@@ -185,3 +185,36 @@ test('宿主桥：命令白名单包含 shim 真的会发的每一条，且不�
   // 宿主侧不许出现「把命令名原样转给 IPC」的兜底（那等于把白名单变成任意命令）
   assert.ok(!APP_JS.includes('api.invoke(data.cmd'), '不得把 iframe 给的命令名直接转发');
 });
+
+// ---------- 品牌与链接的运行时适配（T14c 修复轮 6） ----------
+
+test('品牌与链接：本仓库是唯一事实来源，适配在运行时做（上游 HTML 不动）', () => {
+  // 单一事实来源：本仓库地址只写一次，链接改指与离线应答都从它派生
+  const repoLiteral = [...SHIM.matchAll(/https:\/\/github\.com\/[A-Za-z0-9._-]+\/fnos-desktop/g)]
+    .map((m) => m[0]);
+  assert.deepEqual([...new Set(repoLiteral)], ['https://github.com/eafenzhang/fnos-desktop'],
+    '本仓库地址（含 /commits 派生的那处）必须只指向这一个仓库');
+  assert.ok(SHIM.includes("const APP_REPO_URL = 'https://github.com/eafenzhang/fnos-desktop';"),
+    '本仓库地址必须是具名常量（单一事实来源）');
+  assert.ok(SHIM.includes("const APP_DISPLAY_NAME = 'fnOS Desktop';"),
+    '界面显示名必须是具名常量');
+  // 品牌适配的三件事：标题、字标替身、链接重定向
+  assert.ok(SHIM.includes('document.title = APP_DISPLAY_NAME'), '文档标题必须改为本应用名');
+  assert.ok(SHIM.includes("document.createElement('span')") && SHIM.includes('BRAND_ID'),
+    '头部矢量字标必须有文本替身（上游字标是路径，改不了字）');
+  assert.ok(SHIM.includes("querySelector('.card.header .info svg.logo')"),
+    '字标替身必须锚定上游自己的 header logo 选择器');
+  assert.ok(SHIM.includes('retargetUpstreamLinks'), '必须把上游仓库链接改指本仓库');
+  assert.ok(SHIM.includes('attributeFilter'), '必须盯住 href 变更（上游会重写提交链接）');
+  // 上游标记：适配认得的是**上游仓库前缀**，不是写死的那两条锚点
+  assert.ok(SHIM.includes("const UPSTREAM_REPO_PREFIX = 'https://github.com/aurysian-yan/FnOS_UI_Mods';"),
+    '必须以上游仓库前缀识别待改链接');
+  // 离线更新应答的链接同样落在本仓库（上游据此重写 #latestCommitLink 的 href）
+  assert.ok(SHIM.includes("'https://github.com/eafenzhang/fnos-desktop/commits';"),
+    '离线应答的提交链接必须指向本仓库');
+  assert.ok(!/GITHUB_COMMITS_PAGE_URL\s*=\s*\n?\s*'https:\/\/github\.com\/aurysian-yan/.test(SHIM),
+    '提交链接不得再回指上游仓库');
+  // app.js 的 iframe 标题（无障碍名）同步改名
+  assert.ok(APP_JS.includes('设置界面（fnOS Desktop）'), 'iframe 标题必须用本应用名');
+  assert.ok(!APP_JS.includes('fnOS UI Mods popup'), 'app.js 不得残留上游品牌名');
+});
