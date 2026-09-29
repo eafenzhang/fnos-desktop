@@ -3,7 +3,7 @@
 use crate::{base64, config, config::Config, injector, paths, report, tray, MAIN_WINDOW};
 use serde::Serialize;
 use serde_json::Value;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 use tauri::webview::PageLoadEvent;
@@ -622,6 +622,11 @@ fn build_main_window_with<R: Runtime>(
                 payload.url().as_str(),
             );
         });
+    // `window.open` / `target=_blank` → **开成本壳窗口**（T14c 修复轮 11，见
+    // [`new_window_verdict`]）：Hermes Studio 这类外部 Web 应用就是这么启动的。
+    let app_for_new_window = app.clone();
+    builder =
+        builder.on_new_window(move |url, _features| new_window_verdict(&app_for_new_window, url));
 
     let script = injector::build_init_script(cfg);
     if !script.is_empty() {
@@ -640,8 +645,67 @@ fn build_main_window_with<R: Runtime>(
     Ok(window)
 }
 
-/// 建**内置错误页**窗口（Task 11 / spec §12.3「主窗口加载失败/离线」）。
+/// 新窗口请求的裁定（`window.open` / `target=_blank`）→ 开成**本壳窗口**。
 ///
+/// 背景（T14c 修复轮 11，实测）：Hermes Studio 这类「外部 Web 应用」的启动路径就是
+/// `window.open('https://hermes-studio.<nas>.fnos.net/', '_blank')`——在浏览器里是新标签页，
+/// 而 WebView2 默认把这类请求**丢弃**（点图标什么都没发生）。本壳没有标签页概念，按用户
+/// 要求一律改为开窗口：同一个 WebView 配置 → 共享会话 cookie，应用照它自己的样子加载。
+///
+/// 安全边界：只给 `http` / `https` / `about`（`about:blank` 是弹窗流程常见的起始页）开窗，
+/// 其余协议（`file:` / `data:` / `javascript:` …）一律 `Deny` 并留一行日志。
+fn new_window_verdict<R: Runtime>(
+    app: &AppHandle<R>,
+    url: tauri::Url,
+) -> tauri::webview::NewWindowResponse<R> {
+    match url.scheme() {
+        "http" | "https" | "about" => {}
+        other => {
+            eprintln!("[fnos] 拒绝非 http(s) 的新窗口请求（scheme={other}）：{url}");
+            return tauri::webview::NewWindowResponse::Deny;
+        }
+    }
+    match open_app_window(app, url.clone()) {
+        Ok(window) => {
+            eprintln!("[fnos] window.open -> 开成应用窗口：{url}");
+            tauri::webview::NewWindowResponse::Create { window }
+        }
+        Err(e) => {
+            eprintln!("[fnos] 应用窗口创建失败（已拒绝该请求）：{e}");
+            tauri::webview::NewWindowResponse::Deny
+        }
+    }
+}
+
+/// 为一个 `window.open` 请求建窗口。
+///
+/// 三条纪律：
+/// - **不注入任何脚本**：本壳的桌面注入（mods / dock / keepalive）只属于主窗口，
+///   应用页面按原样跑——注入桌面样式会改掉别人的界面，不是「开窗口」该做的事；
+/// - 标签唯一（`app-1`、`app-2`…）：tauri 要求标签唯一，进程内计数即可；
+/// - 标题先取主机名，之后跟随页面标题；**不**走 [`handle_title`]——那是主窗口的探针/上报
+///   通道，应用页面的标题不该写进主窗口的上报槽位。
+fn open_app_window<R: Runtime>(
+    app: &AppHandle<R>,
+    url: tauri::Url,
+) -> tauri::Result<WebviewWindow<R>> {
+    static NEXT_APP_WINDOW: AtomicUsize = AtomicUsize::new(1);
+    let label = format!("app-{}", NEXT_APP_WINDOW.fetch_add(1, Ordering::Relaxed));
+    let title = url.host_str().unwrap_or("fnOS 应用").to_string();
+    // 嵌套弹窗（应用自己再开小窗）同样走这条裁定
+    let app_for_nested = app.clone();
+    WebviewWindowBuilder::new(app, &label, WebviewUrl::External(url))
+        .title(title)
+        .inner_size(1100.0, 700.0)
+        .center()
+        .on_document_title_changed(|window, title| {
+            let _ = window.set_title(&title);
+        })
+        .on_new_window(move |url, _features| new_window_verdict(&app_for_nested, url))
+        .build()
+}
+
+/// 建**内置错误页**窗口（Task 11 / spec §12.3「主窗口加载失败/离线」）。
 /// 与[`build_main_window_with`] 的关键差别是**不注册任何 initialization_script**：mods 载荷
 /// 绝不在错误页运行。这里刻意不为了省几行复用正常路径再「传个空串」——那条路径的语义是
 /// 「injectEnabled 关了所以不注册」，与「错误页永远不注册」是两件事，混在一起将来很容易被
@@ -2666,5 +2730,49 @@ mod tests {
             !apply_body.contains("\"homeUrl\"") && !apply_body.contains("\"nasUrl\""),
             "免刷新通道同样不得把宿主私有的 homeUrl/nasUrl 发给页面"
         );
+    }
+
+    /// T14c：`window.open` / `target=_blank` 必须开成**本壳窗口**（外部 Web 应用的启动路径）。
+    ///
+    /// 实测：Hermes Studio 的启动就是 `window.open(url, '_blank')`，浏览器里是新标签页，
+    /// 而 WebView2 默认丢弃 → 点图标什么都没发生。修法是 `on_new_window` 把它变成我们
+    /// 自己的窗口。这里锁四件事：协议闸门、两个分支、两处挂载点、以及「应用窗口不注入
+    /// 桌面脚本 / 不占主窗口上报通道」。
+    #[test]
+    fn new_window_requests_become_app_windows() {
+        let src = include_str!("commands.rs");
+        let verdict_at = src.find("fn new_window_verdict").expect("裁定函数必须存在");
+        let open_at = src.find("fn open_app_window").expect("开窗函数必须存在");
+        let verdict = &src[verdict_at..open_at];
+        assert!(
+            verdict.contains("\"http\" | \"https\" | \"about\""),
+            "只允许 http(s)/about 开窗（file/data/javascript 一律拒绝）"
+        );
+        assert!(
+            verdict.contains("NewWindowResponse::Deny"),
+            "被拒的请求必须显式 Deny"
+        );
+        assert!(
+            verdict.contains("NewWindowResponse::Create"),
+            "允许的请求必须开成窗口（不是让 WebView2 自己弹一个裸窗口）"
+        );
+        assert!(
+            src.matches(".on_new_window(").count() >= 2,
+            "主窗口与嵌套弹窗都要挂这条裁定"
+        );
+        // 开窗函数体：到「建内置错误页窗口」的文档注释为止
+        let end = src
+            .find("/// 建**内置错误页**窗口")
+            .expect("错误页建窗函数必须紧随其后");
+        let body = &src[open_at..end];
+        assert!(
+            !body.contains("initialization_script"),
+            "应用窗口不得注入桌面脚本（mods/dock/keepalive 只属于主窗口）"
+        );
+        assert!(
+            !body.contains("handle_title"),
+            "应用窗口标题不得走主窗口的上报通道"
+        );
+        assert!(body.contains("AtomicUsize"), "标签必须唯一（进程内计数）");
     }
 }
