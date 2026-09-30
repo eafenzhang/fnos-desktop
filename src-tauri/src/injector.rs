@@ -610,7 +610,7 @@ mod tests {
             "不得用 setProperty 抢优先级（那会盖掉窗口管理器的定位）"
         );
         assert!(
-            js.contains("availW - w") && js.contains("availH - h"),
+            js.contains("m.availW - m.w") && js.contains("m.availH - m.h"),
             "居中按内容区与窗口的实测尺寸算"
         );
         assert!(
@@ -636,7 +636,7 @@ mod tests {
             "不得再有延迟合并扫描：那正是「先出现在级联位置、再跳一下」的来源"
         );
         let on_mut = js.find("function onMutations").expect("必须有观察回调");
-        let body = &js[on_mut..on_mut + 700];
+        let body = window(js, on_mut, 700);
         assert!(
             body.contains("place("),
             "回调体里必须**同步**调 place（不是排进 setTimeout/rAF 再落位）"
@@ -646,7 +646,7 @@ mod tests {
             "尺寸量不到时先按住（宁可晚一帧出现，也不要先出现在错的位置）"
         );
         let place = js.find("function place(").expect("必须有 place");
-        let place_body = &js[place..place + 500];
+        let place_body = window(js, place, 500);
         assert!(
             place_body.find("attempt(el)").unwrap_or(usize::MAX)
                 < place_body.find("requestAnimationFrame").unwrap_or(usize::MAX),
@@ -664,7 +664,7 @@ mod tests {
             "形态切换只从窗口自己的 class/style 变更上看（不订阅整页属性变更）"
         );
         assert!(
-            js.contains("state.obs.observe(el"),
+            js.contains("st.obs.observe(el"),
             "属性观察必须挂在窗口元素上（逐窗口、有界）"
         );
         assert!(
@@ -674,19 +674,71 @@ mod tests {
         let on_attr = js
             .find("function onWindowAttrs")
             .expect("必须有形态切换的处理函数");
-        let body = &js[on_attr..on_attr + 500];
+        let body = window(js, on_attr, 900);
         assert!(
-            body.contains("isMaximized(el)) { state.wasMax = true; return; }"),
+            body.contains("isMaximized(el)) { st.wasMax = true; return; }"),
             "最大化形态只记一笔，不动位置（位置由样式覆盖处理）"
         );
         assert!(
-            body.contains("centerWindow(el)"),
+            body.contains("if (st.wasMax) { st.wasMax = false; centerWindow(el); return; }"),
             "回到窗口形态必须重新居中"
         );
         assert!(
-            body.contains("if (!state.wasMax) return;"),
-            "没经历过最大值形态时，窗口形态下的拖动/缩放一律不干预"
+            body.contains("st.wroteLeft") && body.contains("st.wroteTop"),
+            "我们自己写的那一次不构成用户拖动（否则空写会被反复当意图记账）"
         );
+        assert!(
+            body.contains("st.areaW !== m.availW"),
+            "内容区尺寸变了就不更新比例：那可能是 fnOS 自己写的，不是用户的意图"
+        );
+    }
+
+    /// T14c 修复轮 18（用户要求：外壳程序窗口在 Windows 上最大化/还原时，程序内打开的应用
+    /// 窗口保持居中）：订阅 resize，按**记下来的**中心偏移比例重算位置 —— 不能从当前位置
+    /// 现算（fnOS 自己也会在尺寸变化时写位置，实测外壳最大化时它把 50,90 改成 165,202），
+    /// 并且要有一次补正兜住「fnOS 晚于我们写」。
+    #[test]
+    fn window_stays_centered_when_the_shell_viewport_resizes() {
+        let js = include_str!("../inject/windowpos.js");
+        assert!(
+            js.contains("addEventListener('resize'"),
+            "必须订阅外壳视口尺寸变化（最大化/还原走的就是它）"
+        );
+        assert!(js.contains("function applyRatio"), "必须按比例重算位置");
+        assert!(
+            js.contains("m.availW / 2 + st.ratioX * (m.availW / 2) - m.w / 2"),
+            "比例 0 必须落在正中（这是「保持居中」的算式）"
+        );
+        assert!(
+            js.contains("st.ratioX = 0;") && js.contains("st.ratioY = 0;"),
+            "居中落位时比例必须归零"
+        );
+        assert!(
+            js.contains("REFLOW_SETTLE_MS"),
+            "必须有一次补正（fnOS 可能晚于我们写位置）"
+        );
+        assert!(
+            js.contains("wroteLeft") && js.contains("wroteTop"),
+            "属性观察要能分辨「我们自己写的那一次」，不然会把空写当用户拖动记账"
+        );
+        let reflow = js.find("function reflow").expect("必须有 reflow");
+        let body = window(js, reflow, 600);
+        assert!(
+            body.contains("continue;") && body.contains("applyRatio(st, el, m)"),
+            "reflow 要跳过最大化形态的窗口，其余按比例摆正"
+        );
+    }
+
+    /// 取源码里的一段（从 `start` 起 `len` 字节，自动退到字符边界）。
+    ///
+    /// 中文注释一个字 3 字节，固定长度切片随时可能切在半个字上（`&s[a..b]` 会 panic）；
+    /// 本 helper 用 `is_char_boundary` 退到最近边界，断言失败时最多是「这段里没找到」。
+    fn window(src: &str, start: usize, len: usize) -> &str {
+        let mut end = (start + len).min(src.len());
+        while end > start && !src.is_char_boundary(end) {
+            end -= 1;
+        }
+        &src[start..end]
     }
 
     #[test]
