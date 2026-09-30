@@ -684,12 +684,12 @@ mod tests {
             "回到窗口形态必须重新居中"
         );
         assert!(
-            body.contains("st.wroteLeft") && body.contains("st.wroteTop"),
-            "我们自己写的那一次不构成用户拖动（否则空写会被反复当意图记账）"
+            body.contains("userDragging(el)") && body.contains("recordRatio(st, el, m)"),
+            "比例只在用户拖动（指针按在窗口上）时记录：fnOS 写的位置不是用户意图（修复轮 19）"
         );
         assert!(
-            body.contains("st.areaW !== m.availW"),
-            "内容区尺寸变了就不更新比例：那可能是 fnOS 自己写的，不是用户的意图"
+            body.contains("applyRatio(st, el, m)"),
+            "非用户写入必须当场按比例纠正（否则「一开始居中、然后跳走」）"
         );
     }
 

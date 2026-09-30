@@ -34,6 +34,7 @@ function fakeEl(opts = {}) {
       removeProperty: (p) => { delete inline[p]; },
     },
     matches: (sel) => sel === `.${WINDOW_CLS}` && !!opts.isWindow,
+    closest: (sel) => (sel === `.${WINDOW_CLS}` && !!opts.isWindow ? el : null),
     querySelectorAll: (sel) => (sel === `.${WINDOW_CLS}` ? (opts.windows || []) : []),
     _windows: opts.windows || [],
   };
@@ -46,10 +47,10 @@ function fakeCtx(opts = {}) {
   area.clientHeight = opts.areaH ?? 820;
   const doc = {
     readyState: opts.readyState || 'complete',
-    _listeners: {},
+    _listeners: {},   // ev -> [fn]（pointerdown/up 等会注册多个）
     _windows: opts.windows || [],
     _mos: [],   // 全部观察器实例（document 级的 + 逐窗口的）
-    addEventListener(ev, fn) { this._listeners[ev] = fn; },
+    addEventListener(ev, fn) { (this._listeners[ev] ||= []).push(fn); },
     querySelectorAll: (sel) => (sel === `.${WINDOW_CLS}` ? doc._windows : []),
   };
   class MOStub {
@@ -66,6 +67,8 @@ function fakeCtx(opts = {}) {
     MutationObserver: MOStub,
     top: null,
     self: null,
+    innerWidth: opts.vw ?? 1200,
+    innerHeight: opts.vh ?? 820,
     _timers: [],
     _resizeListeners: [],
     addEventListener(ev, fn) { if (ev === 'resize') this._resizeListeners.push(fn); },
@@ -118,6 +121,26 @@ function unmaximize(ctx, el, w = 1100, h = 640) {
   fireEl(ctx, el);
 }
 
+/** 按下 / 松开指针（模拟用户拖窗口：windowpos 靠它区分「用户拖动」与「fnOS 重排」）。 */
+function pointerDown(ctx, el) {
+  (ctx.doc._listeners.pointerdown || []).forEach((fn) => fn({ target: el }));
+}
+function pointerUp(ctx) {
+  for (const ev of ['pointerup', 'pointercancel']) {
+    (ctx.doc._listeners[ev] || []).forEach((fn) => fn());
+  }
+}
+
+/** 改内容区尺寸 = 外壳程序窗口在 Windows 上最大化/还原（视口尺寸一起变）。 */
+function setArea(ctx, w, h) {
+  ctx.area.clientWidth = w;
+  ctx.area.clientHeight = h;
+  ctx.win.innerWidth = w;
+  ctx.win.innerHeight = h;
+  (ctx.doc._win._resizeListeners || []).forEach((fn) => fn());
+  ctx.win.drain(); // rAF 那一趟 + 补正那一趟
+}
+
 test('落位是**同步**的：观察回调返回时窗口已经在正中（不推进任何定时器）', () => {
   const ctx = fakeCtx();
   load(ctx);
@@ -164,17 +187,35 @@ test('尺寸还没量到：先按住不给看（visibility:hidden），量到后
   assert.equal(win._inline.visibility, undefined, '摆正后必须放开');
 });
 
-test('只动一次：用户拖动之后，后续 DOM 变更不得把窗口拉回来', () => {
+test('用户拖动（指针按在窗口上）写下的位置被记为意图，之后不被拉回', () => {
   const ctx = fakeCtx();
   load(ctx);
   const win = newWindow(ctx);
   fireDoc(ctx, [{ addedNodes: [win] }]);
-  ctx.win.drain(); // 两次幂等重试也跑完
-  win._inline.left = '300px'; // 用户拖动
+  ctx.win.drain(); // 两次幂等重试跑完
+  pointerDown(ctx, win);
+  win._inline.left = '300px'; // 用户按住标题栏拖动
   win._inline.top = '220px';
+  fireEl(ctx, win);
+  pointerUp(ctx);
+  assert.equal(win._inline.left, '300px', '拖动中的写入必须保留');
+  fireEl(ctx, win); // 指针松开后的重复通知（值没变）也不得拉回
+  assert.equal(win._inline.left, '300px', '用户摆的位置优先：绝不再拉回居中');
   fireDoc(ctx, [{ addedNodes: [fakeEl({ isWindow: false })] }]); // 页面上别的变更
-  assert.equal(win._inline.left, '300px', '用户拖动优先：绝不再拉回居中');
   assert.equal(win._inline.top, '220px');
+});
+
+test('fnOS 自己重排（非用户写入）：当场按比例纠正，居中的窗口回正中', () => {
+  const ctx = fakeCtx();
+  load(ctx);
+  const win = newWindow(ctx);
+  fireDoc(ctx, [{ addedNodes: [win] }]);
+  ctx.win.drain();
+  win._inline.left = '165px'; // 实测：fnOS 重排把 (50,90) 改写成 (165,202)
+  win._inline.top = '202px';
+  fireEl(ctx, win);
+  assert.equal(win._inline.left, '50px', '非用户写入必须被纠正（微任务里完成，画不出中间帧）');
+  assert.equal(win._inline.top, '90px');
 });
 
 test('窗口 → 最大化 → 窗口：还原时重新居中（用户要求的往返语义）', () => {
@@ -192,18 +233,24 @@ test('窗口 → 最大化 → 窗口：还原时重新居中（用户要求的�
   assert.equal(win._inline.top, '90px');
 });
 
-test('窗口形态下缩放（不构成形态切换）不得触发重新居中', () => {
+test('窗口形态下缩放（不构成形态切换）：按已记的相对位置重摆，不回正中也不漂移', () => {
   const ctx = fakeCtx();
   load(ctx);
   const win = newWindow(ctx);
   fireDoc(ctx, [{ addedNodes: [win] }]);
+  // 用户先拖到 300,220（按住指针 → 记为意图）
+  pointerDown(ctx, win);
   win._inline.left = '300px';
   win._inline.top = '220px';
-  win.offsetWidth = 900;  // 用户拖右下角改尺寸：只改尺寸不改位置
+  fireEl(ctx, win);
+  pointerUp(ctx);
+  // 再缩放：只改尺寸不改位置（无指针的样式变更）
+  win.offsetWidth = 900;
   win.offsetHeight = 500;
   fireEl(ctx, win);
-  assert.equal(win._inline.left, '300px', '窗口形态下的缩放不得把窗口拉回居中');
-  assert.equal(win._inline.top, '220px');
+  // 比例 ≈ 0.4167/0.3171 → 新尺寸下 left = 600+0.4167×600-450 = 400, top = 410+130-250 = 290
+  assert.equal(win._inline.left, '400px', '按已记的相对位置重摆（不回正中、也不停在缩放锚点上）');
+  assert.equal(win._inline.top, '290px');
 });
 
 test('最大化往返后再缩放一次，仍然只在还原那次居中（幂等，不来回拉锯）', () => {
@@ -215,8 +262,10 @@ test('最大化往返后再缩放一次，仍然只在还原那次居中（幂�
   unmaximize(ctx, win, 900, 500); // 还原并顺手改了尺寸
   assert.equal(win._inline.left, '150px', '按还原后的实测尺寸居中：((1200-900)/2)');
   assert.equal(win._inline.top, '160px', '((820-500)/2)');
-  win._inline.left = '40px';      // 用户再拖走
-  fireEl(ctx, win);               // 窗口形态下的属性变更
+  pointerDown(ctx, win);
+  win._inline.left = '40px';      // 用户再拖走（按住指针 = 意图）
+  fireEl(ctx, win);
+  pointerUp(ctx);
   assert.equal(win._inline.left, '40px', '不得反复居中');
 });
 
@@ -232,14 +281,6 @@ test('不做全量重扫：不相关的节点插入不会去动已有窗口', ()
 });
 
 // ---------- 内容区尺寸变化（外壳窗口最大化/还原）也要保持居中 ----------
-
-/** 改内容区尺寸 = 外壳程序窗口在 Windows 上最大化/还原。 */
-function setArea(ctx, w, h) {
-  ctx.area.clientWidth = w;
-  ctx.area.clientHeight = h;
-  (ctx.doc._win._resizeListeners || []).forEach((fn) => fn());
-  ctx.win.drain(); // rAF 那一趟 + 补正那一趟
-}
 
 test('外壳最大化（内容区变大）后，居中的窗口仍然居中', () => {
   const ctx = fakeCtx();
@@ -261,33 +302,52 @@ test('用户拖到一边的窗口：尺寸变化时保持**相对位置**，不�
   const win = newWindow(ctx);
   fireDoc(ctx, [{ addedNodes: [win] }]);
   ctx.win.drain();            // 落位后的两次幂等重试先跑完（真实里用户也不会在 160ms 内拖）
+  pointerDown(ctx, win);
   win._inline.left = '600px'; // 用户拖到右侧：中心偏移比例 ≈ (600+550-600)/600 = 0.917
   win._inline.top = '90px';
-  fireEl(ctx, win);           // 内容区尺寸未变 → 记下比例
+  fireEl(ctx, win);           // 指针按着 = 用户意图 → 记下比例
+  pointerUp(ctx);
   setArea(ctx, 1920, 1009);
   // 新尺寸下：中心 = 960 + 0.917×960 ≈ 1840 → left ≈ 1290（保持贴右的相对位置）
   assert.equal(win._inline.left, '1290px', '按比例跟随，不回到中间');
   assert.equal(win._inline.top, '185px', '竖直方向原本就是居中，仍居中');
 });
 
-test('fnOS 在尺寸变化时自己写了位置：补正那一次按记下的比例纠正（重复执行稳定）', () => {
+test('外壳最大化时 fnOS 抢先写了级联位置：非用户写入按新尺寸纠正，重复执行稳定', () => {
   const ctx = fakeCtx();
   load(ctx);
   const win = newWindow(ctx);
   fireDoc(ctx, [{ addedNodes: [win] }]);
-  // 模拟 fnOS 先按自己的算法改写（实测外壳最大化时它把 50,90 改成 165,202）
+  ctx.win.drain();
+  // 模拟外壳正在最大化：内容区/视口一起变大，fnOS 按它自己的算法改写位置（实测行为）
   ctx.area.clientWidth = 1920;
   ctx.area.clientHeight = 1009;
+  ctx.win.innerWidth = 1920;
+  ctx.win.innerHeight = 1009;
   win._inline.left = '165px';
   win._inline.top = '202px';
   fireEl(ctx, win);
+  assert.equal(win._inline.left, '410px', '纠正必须按比例（0 = 居中）在新尺寸下落位');
+  const first = win._inline.left;
   (ctx.doc._win._resizeListeners || []).forEach((fn) => fn());
   ctx.win.drain();
-  assert.equal(win._inline.left, '410px', '补正必须回到按比例的居中值，而不是顺着 fnOS 的值算');
-  const first = win._inline.left;
-  (ctx.doc._win._resizeListeners || []).forEach((fn) => fn()); // 再跑一次
-  ctx.win.drain();
   assert.equal(win._inline.left, first, '重复执行结果恒定（不会漂移）');
+});
+
+test('视口尺寸没变的 resize（Dock 隐藏的合成事件那种）：不得触发重排', () => {
+  const ctx = fakeCtx();
+  load(ctx);
+  const win = newWindow(ctx);
+  fireDoc(ctx, [{ addedNodes: [win] }]);
+  ctx.win.drain();
+  // 首次 resize（建立基准）→ 重排照常
+  (ctx.doc._win._resizeListeners || []).forEach((fn) => fn());
+  ctx.win.drain();
+  assert.equal(win._inline.left, '50px');
+  win._inline.left = '400px'; // 伪造一个「当前值」（不触发属性观察）
+  (ctx.doc._win._resizeListeners || []).forEach((fn) => fn()); // 同尺寸再来一次
+  ctx.win.drain();
+  assert.equal(win._inline.left, '400px', '同尺寸的 resize 不得再触发重排（修复轮 19）');
 });
 
 test('最大化形态的窗口在尺寸变化时不被写位置', () => {
@@ -300,6 +360,8 @@ test('最大化形态的窗口在尺寸变化时不被写位置', () => {
   // 外壳随后也最大化：内容区与「已铺满的窗口」一起变大（窗口管理器会同步铺满）
   ctx.area.clientWidth = 1920;
   ctx.area.clientHeight = 1009;
+  ctx.win.innerWidth = 1920;
+  ctx.win.innerHeight = 1009;
   win.offsetWidth = 1920;
   win.offsetHeight = 1009;
   win._inline.left = '';

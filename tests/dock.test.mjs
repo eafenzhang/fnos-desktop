@@ -362,7 +362,7 @@ test('免刷新关闭：接管与内边距中和全部还原（含还原原本�
 
 // ---------- 显隐状态机 ----------
 
-test('开启：观察 document、接管即藏且到点真正离场（display:none）+ 派发 resize', () => {
+test('开启：观察 document、接管即藏且到点真正离场（display:none），全程不派发 resize', () => {
   const doc = fakeDom();
   load(doc, { dockAutoHide: true });
   assert.deepEqual(
@@ -381,7 +381,8 @@ test('开启：观察 document、接管即藏且到点真正离场（display:non
   assert.equal(dock.style.display, '', '滑出动画期间还在布局里');
   doc._win.drainTimers(); // 第二轮排空：display:none 的延迟到点
   assert.equal(dock.style.display, 'none', '动画结束后真正 display:none');
-  assert.ok(doc._win._resized >= 1, 'Dock 离场必须派发 resize（窗口管理器借它重排）');
+  assert.equal(doc._win._resized, 0,
+    '离场不派发 resize（修复轮 19：布局不随 Dock 显隐变化，合成 resize 会触发 fnOS 重排级联）');
 
   doc._listeners.pointermove({ clientX: 3, clientY: 400 });
   assert.ok(!dock._classes.has('fnos-shell-dock-hidden'), '边缘热区必须唤回');
@@ -502,22 +503,23 @@ test('Dock 被 SPA 换掉时重新接管：旧元素只清接管标记，空间�
   assert.equal(holder.style.getPropertyValue('padding-left'), '', '关闭功能时才还原回收');
 });
 
-test('显隐不来回拉锯：唤出（悬浮）不派发 resize，只有离场派发', () => {
+test('显隐全程不派发 resize（合成 resize 会触发 fnOS 整体重排，把居中窗口推走）；只有关闭功能时派发', () => {
   const doc = fakeDom();
-  load(doc, { dockAutoHide: true });
+  const w = load(doc, { dockAutoHide: true });
   const dock = fakeEl({ w: 66, h: 800, left: 0, top: 0, hasList: true, icons: 5 });
   doc._candidates = [dock];
   settle(doc);
   doc._win.drainTimers();
-  const afterHide = doc._win._resized;
-  assert.ok(afterHide >= 1, '离场要派发 resize（工作区变大）');
+  assert.equal(doc._win._resized, 0, '接管即藏（display:none）也不派发：布局不随 Dock 显隐变化');
 
-  doc._listeners.pointermove({ clientX: 3, clientY: 400 }); // 悬浮唤出
-  assert.equal(doc._win._resized, afterHide,
-    '唤出是浮层，不得派发 resize（否则窗口管理器重算、把 66px 偏移写回来 → 闪烁）');
+  doc._listeners.pointermove({ clientX: 3, clientY: 400 }); // 悬浮唤出（浮层，不动布局）
   doc._listeners.pointermove({ clientX: 600, clientY: 400 }); // 离开 → 藏
   doc._win.drainTimers();
-  assert.ok(doc._win._resized > afterHide, '再次离场照常派发 resize');
+  assert.equal(doc._win._resized, 0,
+    '离场同样不派发（修复轮 19 实测：合成 resize 会让 fnOS 把所有窗口重排回级联位置）');
+
+  w.__FNOS_APPLY_SHELL__({ dockAutoHide: false }); // 关闭功能：左侧预留还原、工作区真的变了
+  assert.ok(doc._win._resized >= 1, '只有 teardown（真实布局变化）才派发 resize');
 });
 
 test('覆盖丢失即刻补扫：容器被换掉时不等待节流窗口', () => {

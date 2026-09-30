@@ -1,4 +1,4 @@
-/* fnOS Desktop Shell — 桌面内窗口默认居中 / 尺寸变化后保持居中（T14c 修复轮 15～18）
+/* fnOS Desktop Shell — 桌面内窗口默认居中 / 尺寸变化后保持居中（T14c 修复轮 15～19）
  *
  * 做什么：fnOS 自己的「应用窗口」是**桌面文档里的 DOM 元素**（`.trim-ui__app-layout--window`，
  * 绝对定位 + 内联 left/top），它的窗口管理器默认按**级联**摆位（每开一个往右下偏一点）。
@@ -29,6 +29,17 @@
  *   比例是**记在状态里的**（不是从当前位置现算）：fnOS 可能先于/后于我们写位置，从当前位置现算
  *   会把它的值当成人家的意图。落位时记 0，用户在窗口形态下拖动时（内容区尺寸没变、位置变了）
  *   才更新比例。落位后还有一次 [`REFLOW_SETTLE_MS`] 补正，兜住「fnOS 晚于我们写位置」。
+ *
+ * 谁写的位置才算数（修复轮 19：用户反馈「有时候一开始居中，还是会跳到其他位置」）：
+ *   实测抓到元凶——本壳 `dock.js` 在 Dock 闲置隐藏时派发的合成 resize 会让 fnOS 的窗口
+ *   管理器把**所有**窗口整体重排回级联位置（实测三个居中窗口一秒内全部被挪走：
+ *   50,90 → 165,202 …），而旧逻辑把这次改写当成了「用户拖动」记进比例，跳走后就再也不回来。
+ *   两条防线：
+ *     · 尺寸没变的 resize 一律忽略（Dock 显隐、各种合成事件都不会真的改视口尺寸）；
+ *     · 位置写入只有发生在「指针按在这个窗口上」才算用户拖动（记比例）；其余一律按已记的
+ *       比例**当场摆正**——居中的窗口立刻回正中。纠正跑在 MutationObserver 的微任务里，
+ *       在下一次绘制之前完成，画不出中间帧。`dock.js` 相应取消离场时的合成 resize
+ *       （布局本就不随 Dock 显隐变化，见那边修复轮 19 的注释）。
  *
  * 最大化往返（修复轮 17：用户要求「窗口→最大化→窗口 依然保持居中」）：
  *   fnOS 还原时会把「最大化前的位置」原样还回来，而那个位置未必居中——用户拖过/缩放过窗口
@@ -65,6 +76,9 @@
   var tracked = [];           // 已接管形态观察 / 比例跟随的窗口状态
   var reflowScheduled = false;
   var reflowTimer = null;
+  var dragEl = null;          // 指针当前按着的窗口（非 null = 用户正在拖/缩它）
+  var lastVW = 0;             // 上一次见到的视口尺寸（尺寸没变的 resize 一律忽略）
+  var lastVH = 0;
 
   /** 窗口此刻是不是「铺满内容区」= 最大化形态（内容区 = 包含块，也就是它的父容器）。 */
   function isMaximized(el) {
@@ -218,30 +232,41 @@
     } catch (e) { st.obs = null; }
   }
 
-  /**
-   * 窗口自己的 class/style 变了。两种情况：
-   *   ① 形态切换（铺满 ⇄ 窗口）→ 进最大化记一笔，回到窗口形态**重新居中**；
-   *   ② 内容区尺寸没变、位置变了 → 那是用户在拖窗口，把「中心偏移比例」记下来，
-   *      好让之后内容区尺寸变化时它还在同一个相对位置。
-   * 内容区尺寸变了（例如外壳窗口正在最大化）时**不**更新比例：那可能是 fnOS 自己写的，
-   * 不是用户的意图。
-   */
-  function onWindowAttrs(st) {
-    var el = st.el;
-    if (!el || !el.isConnected) { stopTrack(st); return; }
-    if (isMaximized(el)) { st.wasMax = true; return; }
-    if (st.wasMax) { st.wasMax = false; centerWindow(el); return; }
-    // 我们自己写的那一次不构成「用户的拖动」（否则会反复把自己写的值当意图记账）
-    if (el.style.left === st.wroteLeft && el.style.top === st.wroteTop) return;
-    var m = measure(el);
-    if (!m) return;
-    if (st.areaW > 0 && st.areaH > 0 && (st.areaW !== m.availW || st.areaH !== m.availH)) return;
+  /** 指针此刻是否按在这个窗口上（= 用户正在拖/缩它，这期间的位置写入就是用户的意图）。 */
+  function userDragging(el) {
+    return !!(dragEl && el && (dragEl === el || dragEl.contains(el) || el.contains(dragEl)));
+  }
+
+  /** 把当前 left/top 折算成「中心偏移比例」记下来（只在用户拖动时调用）。 */
+  function recordRatio(st, el, m) {
     var left = parseFloat(el.style.left);
     var top = parseFloat(el.style.top);
     if (isFinite(left) && isFinite(top)) {
       st.ratioX = clampRatio((left + m.w / 2 - m.availW / 2) / (m.availW / 2));
       st.ratioY = clampRatio((top + m.h / 2 - m.availH / 2) / (m.availH / 2));
     }
+  }
+
+  /**
+   * 窗口自己的 class/style 变了。按写入者分三种处理：
+   *   ① 形态切换（铺满 ⇄ 窗口）→ 进最大化记一笔，回到窗口形态**重新居中**；
+   *   ② 用户拖动（指针按在这个窗口上）→ 把「中心偏移比例」记下来，好让之后内容区
+   *      尺寸变化时它还在同一个相对位置；
+   *   ③ 其余（fnOS 窗口管理器的重排/级联）→ **当场按已记的比例摆正**。实测 fnOS 会在
+   *      resize 等时机把所有窗口整体重排回级联位置（修复轮 19 的元凶），照单全收就会
+   *      「一开始居中、然后跳走」。纠正跑在观察回调的微任务里，画不出中间帧。
+   * 我们自己写的那一次（wroteLeft/wroteTop 相同）直接忽略，否则会自我循环。
+   */
+  function onWindowAttrs(st) {
+    var el = st.el;
+    if (!el || !el.isConnected) { stopTrack(st); return; }
+    if (isMaximized(el)) { st.wasMax = true; return; }
+    if (st.wasMax) { st.wasMax = false; centerWindow(el); return; }
+    if (el.style.left === st.wroteLeft && el.style.top === st.wroteTop) return;
+    var m = measure(el);
+    if (!m) return;
+    if (userDragging(el)) { recordRatio(st, el, m); return; }
+    applyRatio(st, el, m);
   }
 
   // ---------- 内容区尺寸变化（外壳窗口最大化/还原、拖边缘改大小…） ----------
@@ -265,8 +290,16 @@
    * 为什么要有补正：fnOS 自己也会在尺寸变化时改写窗口位置（实测外壳最大化时它把
    * (50,90) 改成 (165,202)），谁先谁后不确定；补正那一次用的是**记下来的比例**，
    * 不读当前位置，所以重复执行结果恒定（既不会漂移，也不会把 fnOS 的值当意图）。
+   *
+   * 尺寸没变的 resize 一律忽略（修复轮 19）：Dock 显隐、各种合成事件都会派发 resize，
+   * 但视口尺寸根本没变；响应它们除了跟着 fnOS 的重排跳舞没有任何收益。
    */
   function onAreaResize() {
+    var vw = W.innerWidth || 0;
+    var vh = W.innerHeight || 0;
+    if (vw === lastVW && vh === lastVH) return;
+    lastVW = vw;
+    lastVH = vh;
     if (reflowScheduled) return;
     reflowScheduled = true;
     if (typeof W.requestAnimationFrame === 'function') W.requestAnimationFrame(reflow);
@@ -319,6 +352,21 @@
     } catch (e) { /* 观察装不上就算了：下面的首次扫描仍然有效 */ }
   }
   W.addEventListener('resize', onAreaResize); // 外壳窗口最大化/还原、拖边缘改大小
+
+  // 用户拖动识别（见文件头「谁写的位置才算数」）：捕获阶段盯 pointerdown/up。
+  // 只有指针按在窗口上时的位置写入才算用户的意图；fnOS 窗口管理器自己写的（重排/级联）
+  // 一律当场纠正。
+  function onPointerDown(e) {
+    var t = e && e.target;
+    dragEl = t && typeof t.closest === 'function' ? t.closest(WINDOW_SELECTOR) : null;
+  }
+  function onPointerUp() { dragEl = null; }
+  try {
+    D.addEventListener('pointerdown', onPointerDown, true);
+    D.addEventListener('pointerup', onPointerUp, true);
+    D.addEventListener('pointercancel', onPointerUp, true);
+  } catch (e) { /* 指针事件不可用：退化为「所有写入都按 fnOS 的重排纠正」 */ }
+  W.addEventListener('blur', onPointerUp);
   if (D.readyState === 'loading') D.addEventListener('DOMContentLoaded', scan);
   else scan();
 

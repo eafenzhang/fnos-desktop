@@ -440,11 +440,13 @@
   }
 
   /**
-   * Dock 离场时派发一次 resize：工作区变大，让窗口管理器重排已铺开的窗口（修复轮 5）。
+   * 派发一次 resize（**只在 teardown 时**：用户关掉自动隐藏、左侧预留还原、工作区真的
+   * 变了，让窗口管理器重排一次）。
    *
-   * **只在离场时派发，回归时不再派发**（修复轮 9）：回归（悬浮唤出）时 Dock 是**浮在内容
-   * 之上**的，布局本该一点不动；派发 resize 只会让窗口管理器重算，把 66px 偏移又写回窗口与
-   * 内容区，与我们的中和互相拉锯 —— 用户看到的就是「悬浮时左侧空白闪烁」。
+   * **离场（Dock 藏起来）时不再派发**（修复轮 19）：预留宽度已在样式层回收，布局本就
+   * 不随 Dock 显隐变化，这个事件没有任何要通报的；而实测 fnOS 的窗口管理器会响应
+   * resize 把**所有窗口整体重排回级联位置**——正好把居中的窗口推走（用户反馈的
+   * 「窗口居中不稳定、有时候会跳到其他位置」的元凶）。
    */
   function notifyResize() {
     try { W.dispatchEvent(new W.Event('resize')); } catch (e) { /* 老内核缺 Event 构造器就算了 */ }
@@ -464,14 +466,15 @@
     }
     syncTransform();
     dock.classList.add(HIDDEN_CLASS);
-    // 滑出动画结束后**真正离场**（transform 挡不住按 rect 的工作区计算，修复轮 2）。
+    // 滑出动画结束后**真正离场**（transform 挡不住按 rect 的命中测试，修复轮 2）。
     displayTimer = W.setTimeout(function () {
       displayTimer = null;
       if (!dock || shown) return;
       for (var i = 0; i < targets.length; i++) {
         try { targets[i].style.display = 'none'; } catch (e) { /* 不支持就算了 */ }
       }
-      notifyResize(); // Dock 离场：工作区变大，已开的窗口借 resize 重排（修复轮 5）
+      // 注意：这里**不派发 resize**（修复轮 19，见 notifyResize 的注释）——布局没有变化，
+      // 而合成 resize 会触发 fnOS 的整体重排，把居中的窗口推回级联位置。
     }, TRANSITION_MS);
   }
 
