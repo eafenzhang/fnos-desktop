@@ -1,0 +1,58 @@
+# 自动构建与发布（T14c 修复轮 21）。
+#
+# 两条触发线：
+# - push 到 master：构建冒烟（及时暴露编译/打包错误，不发版）；
+# - push 标签 v*：构建 + 创建 GitHub Release 并上传 NSIS 安装包 —— 这是「发布新版本」。
+#   （tauri-action 的 tagName 为空时不建 Release，只构建——用同一份 job 承载两条线。）
+#
+# 发版流程：把 src-tauri/tauri.conf.json 与 src-tauri/Cargo.toml 的 version **一起**改成
+# 新版本 → commit → `git tag vX.Y.Z && git push origin master vX.Y.Z`。
+# 托盘「检查更新」读的就是这个 Release（api.github.com/.../releases/latest）。
+name: build-and-release
+
+on:
+  push:
+    branches: [master]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write # 发 Release 需要写权限（冒烟构建只读不到它）
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Rust 依赖缓存：Windows 冷构建 10 分钟起，热构建几分钟
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Build & release (tag) / Build only (branch)
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          # 标签推送 → 用 tag 名建 Release 并上传安装包；分支推送 → 空串 = 只构建
+          tagName: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+          releaseName: 'fnOS Desktop ${{ github.ref_name }}'
+          releaseBody: '下载 fnOS_*_x64-setup.exe 双击安装（per-user，不需要管理员）。本壳会通过托盘「检查更新」提示新版本。'
+          releaseDraft: false
+          prerelease: false
+          args: --bundles nsis
+
+      - name: Upload installer artifact (branch builds)
+        if: github.ref_type != 'tag'
+        uses: actions/upload-artifact@v4
+        with:
+          name: fnOS-installer
+          path: src-tauri/target/release/bundle/nsis/*.exe
+          if-no-files-found: error

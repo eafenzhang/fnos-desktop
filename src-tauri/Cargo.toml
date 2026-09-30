@@ -1,6 +1,6 @@
 [package]
 name = "fnos-desktop"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 build = "build.rs"
 
@@ -16,6 +16,14 @@ serde_json = "1"
 # （`tauri-2.12.0/src/lib.rs:92` 的 `pub use url::Url`），版本由 tauri 统一到同一个 2.x，
 # 因此两个类型可直接互用、无需转换。
 url = "2"
+# T14c 修复轮 21：托盘「检查更新」——拉 GitHub Releases 的 latest 比对版本号。阻塞式
+# HTTP 放在 `spawn_blocking` 里跑；升级动作本身由用户在浏览器里完成，本壳不下载不安装。
+ureq = { version = "2", default-features = true }
+
+[target.'cfg(windows)'.dependencies]
+# 原生 MessageBoxW：检查结果要能从托盘动作直接反馈给用户（release 无控制台，
+# 主窗口页面也不是放这条消息的地方——那是 fnOS 的 WebUI）。
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
 
 [profile.release]
 lto = true

@@ -1,11 +1,12 @@
 //! 托盘图标 + 菜单（spec §7）。
 //!
-//! **T14a 起的菜单是 4 个动作项 + 1 条分隔线**，全部是无状态的瞬时动作：
+//! **T14c 修复轮 21 起的菜单是 5 个动作项 + 1 条分隔线**，全部是无状态的瞬时动作：
 //!
 //! ```text
 //! 显示窗口     → 显示 + 前置主窗口（最小化则先还原；不再是显示/隐藏开关）
 //! 重新加载     → 以当前配置重建主窗口
 //! 系统设置     → 打开设置窗
+//! 检查更新     → 查 GitHub Releases（crate::updater），有新版可去发布页下载
 //! ──────────
 //! 退出         → 退出
 //! ```
@@ -42,9 +43,10 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     // 任何 IPC 授权，重试入口必须由宿主提供——这里是其中之一（另一个是设置窗状态条的「重试」）。
     let reload = MenuItem::with_id(app, "reload", "重新加载", true, None::<&str>)?;
     let settings = MenuItem::with_id(app, "settings", "系统设置", true, None::<&str>)?;
+    let check_update = MenuItem::with_id(app, "check-update", "检查更新", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
     let sep = PredefinedMenuItem::separator(app)?;
-    let menu = Menu::with_items(app, &[&show, &reload, &settings, &sep, &quit])?;
+    let menu = Menu::with_items(app, &[&show, &reload, &settings, &check_update, &sep, &quit])?;
 
     TrayIconBuilder::with_id(TRAY_ID)
         .icon(icon()?)
@@ -55,6 +57,14 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
             "show" => show_main(app),
             "reload" => crate::commands::reload_main_window(app),
             "settings" => crate::commands::open_settings(app),
+            "check-update" => {
+                // HTTP（ureq）与 MessageBoxW 都是**阻塞**调用，绝不能在托盘事件回调里
+                // 直接跑（会卡住托盘与整条事件循环）——丢进阻塞线程池，跑完即退。
+                let app = app.clone();
+                tauri::async_runtime::spawn_blocking(move || {
+                    crate::updater::check_from_tray(app);
+                });
+            }
             "quit" => {
                 crate::commands::save_window_geom(app);
                 app.exit(0);
@@ -102,5 +112,33 @@ pub fn apply_window_geom<R: Runtime>(w: &WebviewWindow<R>, cfg: &Config) {
         if x > -10000.0 && y > -10000.0 {
             let _ = w.set_position(tauri::LogicalPosition::new(x, y));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// 「检查更新」菜单项（修复轮 21）必须真实接进菜单与事件分支，且走阻塞线程池。
+    #[test]
+    fn tray_menu_wires_check_update_through_spawn_blocking() {
+        let src = include_str!("tray.rs");
+        let code_end = src.find("#[cfg(test)]").expect("测试模块存在");
+        let code = &src[..code_end];
+        assert!(
+            code.contains("MenuItem::with_id(app, \"check-update\", \"检查更新\""),
+            "菜单里必须有「检查更新」项"
+        );
+        assert!(
+            code.contains("\"check-update\" =>"),
+            "事件分支必须处理 check-update"
+        );
+        assert!(
+            code.contains("spawn_blocking(move || {") && code.contains("check_from_tray(app)"),
+            "检查更新必须跑在阻塞线程池（HTTP + MessageBox 都是阻塞调用，不得卡托盘）"
+        );
+        // 菜单组装的项列表里也要有它（防「建了 MenuItem 忘了挂进菜单」）
+        assert!(
+            code.contains("&show, &reload, &settings, &check_update, &sep, &quit"),
+            "检查更新必须挂进托盘菜单（位于系统设置与分隔线之间）"
+        );
     }
 }

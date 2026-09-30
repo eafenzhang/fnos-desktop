@@ -8,6 +8,7 @@ mod injector;
 mod paths;
 mod report;
 mod tray;
+mod updater;
 
 // `Manager` 提供 `get_webview_window`（单实例回调）与 `app_handle`（关闭回调）；
 // 建窗用的 `WebviewWindowBuilder` 已集中到 `commands::build_main_window`（首启/重建共用）。

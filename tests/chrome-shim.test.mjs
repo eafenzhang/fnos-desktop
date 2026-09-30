@@ -218,3 +218,11 @@ test('品牌与链接：本仓库是唯一事实来源，适配在运行时做�
   assert.ok(APP_JS.includes('设置界面（fnOS Desktop）'), 'iframe 标题必须用本应用名');
   assert.ok(!APP_JS.includes('fnOS UI Mods popup'), 'app.js 不得残留上游品牌名');
 });
+
+test('仓库地址跨语言一致：托盘检查更新（Rust）与设置页外链（JS）指向同一个 repo', () => {
+  const UPDATER = read('../src-tauri/src/updater.rs');
+  assert.ok(
+    UPDATER.includes('pub const APP_REPO_SLUG: &str = "eafenzhang/fnos-desktop";'),
+    'updater.rs 的 repo slug 必须与 chrome-shim 的 APP_REPO_URL 同源（检查更新与关于页指向同一个仓库）',
+  );
+});
