@@ -84,6 +84,11 @@ pub fn show_main<R: Runtime>(app: &AppHandle<R>) {
 ///
 /// 留在 `tray.rs` 是历史位置（与「窗口」相关的窗口操作集中在这两个函数里），由
 /// `commands::build_main_window_with` 在建窗时调用。
+///
+/// T14c 修复轮 20 起，位置/尺寸在**建窗时**（`builder.position` / `builder.inner_size`）
+/// 就已经带上——首启路径「建窗即可见」，build 之后才补套位置会让窗口先在 OS 默认的
+/// 左上角落脚、再跳到保存的位置（用户实测「启动时从左上跳到居中」）。本函数保留为
+/// **幂等兜底**：同一份配置再套一次，正常路径下不改变任何值。
 pub fn apply_window_geom<R: Runtime>(w: &WebviewWindow<R>, cfg: &Config) {
     let g = &cfg.shell.window;
     // 防御（消费侧）：权威夹取在 `config::WindowGeom::clamp_to_usable`（`Config::normalize`

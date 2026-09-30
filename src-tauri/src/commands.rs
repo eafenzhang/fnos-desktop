@@ -628,6 +628,18 @@ fn build_main_window_with<R: Runtime>(
     builder =
         builder.on_new_window(move |url, _features| new_window_verdict(&app_for_new_window, url));
 
+    // 位置必须在**建窗时**就带上（T14c 修复轮 20）：此前位置是 build 之后由
+    // [`tray::apply_window_geom`] 补套的——首启路径「建窗即可见」，窗口先在 OS 默认的
+    // 左上角落脚、再被挪到保存的位置，用户看到的就是「启动时从左上跳到居中」。
+    // 首次运行（还没有保存位置）直接居中。哨兵值与 apply_window_geom 一致（-32000 是
+    // Windows 给最小化窗口的坐标，不能当合法位置用）。
+    match (cfg.shell.window.x, cfg.shell.window.y) {
+        (Some(x), Some(y)) if x > -10000.0 && y > -10000.0 => {
+            builder = builder.position(x, y);
+        }
+        _ => builder = builder.center(),
+    }
+
     let script = injector::build_init_script(cfg);
     if !script.is_empty() {
         builder = builder.initialization_script(script);
@@ -783,6 +795,14 @@ fn build_error_window<R: Runtime>(
                     "window.__FNOS_SET_ERROR__ && window.__FNOS_SET_ERROR__({payload});"
                 ));
             });
+    // 与 [`build_main_window_with`] 同理（T14c 修复轮 20）：位置建窗时就带上，
+    // 不让错误页窗口也「先在左上角落脚、再跳走」。
+    match (cfg.shell.window.x, cfg.shell.window.y) {
+        (Some(x), Some(y)) if x > -10000.0 && y > -10000.0 => {
+            builder = builder.position(x, y);
+        }
+        _ => builder = builder.center(),
+    }
     if !start_visible {
         builder = builder.visible(false);
     }
@@ -2774,6 +2794,40 @@ mod tests {
         assert!(
             !apply_body.contains("\"homeUrl\"") && !apply_body.contains("\"nasUrl\""),
             "免刷新通道同样不得把宿主私有的 homeUrl/nasUrl 发给页面"
+        );
+    }
+
+    /// T14c 修复轮 20（用户实测：启动时窗口「从左上侧突然跳到居中」）：位置必须在
+    /// **建窗时**就交给 builder。首启路径「建窗即可见」，build 之后才补套位置
+    /// （`tray::apply_window_geom`）必然让窗口先在 OS 默认的左上角落脚、再跳到保存的位置。
+    #[test]
+    fn main_window_is_born_at_its_saved_position() {
+        let src = include_str!("commands.rs");
+        // 只看测试模块**之前**的代码区（include_str 会把本测试自己的断言字符串也算进去）
+        let code_end = src.find("#[cfg(test)]").expect("测试模块存在");
+        let code = &src[..code_end];
+        // 主窗口 + 错误页两条建窗路径都要在建窗前带上位置（有保存位置 → position）
+        assert_eq!(
+            code.matches("builder = builder.position(x, y);").count(),
+            2,
+            "两条建窗路径都必须在建窗时带上保存的位置"
+        );
+        assert_eq!(
+            code.matches("_ => builder = builder.center(),").count(),
+            2,
+            "首次运行（还没有保存位置）直接居中，同样不在默认位置落脚"
+        );
+        assert_eq!(
+            code.matches("x > -10000.0 && y > -10000.0").count(),
+            2,
+            "哨兵值防御与 tray::apply_window_geom（tray.rs 里的第三处）一致：-32000 是最小化窗口的坐标"
+        );
+        // 位置块必须在 build_main_window_with 之内（函数序：主窗口在前、错误页在后）
+        let main_at = src.find("fn build_main_window_with").expect("主窗口构建函数存在");
+        let first_pos = src.find("builder = builder.position(x, y);").expect("位置块存在");
+        assert!(
+            main_at < first_pos && first_pos < src.find("fn build_error_window").expect("错误页构建函数存在"),
+            "第一条位置块必须落在主窗口构建函数内"
         );
     }
 
