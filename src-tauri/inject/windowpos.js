@@ -17,6 +17,13 @@
  *     · 之后再补两次幂等重试（下一帧 + [`SETTLE_MS`]），兜住「窗口管理器稍后改写尺寸/位置」
  *       的版本差异；值没变时是空写，用户看不见。
  *
+ * 最大化往返（修复轮 17：用户要求「窗口→最大化→窗口 依然保持居中」）：
+ *   fnOS 还原时会把「最大化前的位置」原样还回来，而那个位置未必居中——用户拖过/缩放过窗口
+ *   之后就不居中了（缩放只改尺寸不改 left/top，原本居中的窗口一缩放就偏了）。所以给每个
+ *   已接管的窗口挂一个只盯它自己的属性观察：进了「铺满内容区」形态就记一笔（wasMax），
+ *   之后第一次回到窗口形态**重新居中一次**。用户在窗口形态下的拖动/缩放不构成形态切换，
+ *   因此不会被拉回来（只居中一次的语义仍然成立）。
+ *
  * 边界与纪律：
  * - **只认 fnOS 自己的窗口类**，不碰别的元素；
  * - 只对**刚创建**的窗口动手：写一次内联 left/top（居中值），随后**不再干预**——用户拖动
@@ -42,6 +49,19 @@
 
   var placed = new WeakSet(); // 已处理过的窗口（只居中一次，之后交给窗口管理器与用户）
   var held = [];              // 尺寸还没量到、暂时按住的窗口（摆正即放开）
+  var tracked = [];           // 已接管「最大化 ⇄ 窗口」往返的窗口（{el, obs, wasMax}）
+
+  /** 窗口此刻是不是「铺满内容区」= 最大化形态（内容区 = 包含块，也就是它的父容器）。 */
+  function isMaximized(el) {
+    var area = el && el.parentElement;
+    if (!area) return false;
+    var availW = area.clientWidth || 0;
+    var availH = area.clientHeight || 0;
+    var w = el.offsetWidth || 0;
+    var h = el.offsetHeight || 0;
+    if (!(availW > 0 && availH > 0 && w > 0 && h > 0)) return false;
+    return w >= availW - 4 && h >= availH - 4;
+  }
 
   /** 把一个窗口摆到内容区正中（内容区 = 窗口的父容器，也就是它的包含块）。 */
   function centerWindow(el) {
@@ -58,6 +78,46 @@
     el.style.left = Math.max(0, Math.round((availW - w) / 2)) + 'px';
     el.style.top = Math.max(0, Math.round((availH - h) / 2)) + 'px';
     return true;
+  }
+
+  /**
+   * 从最大化**还原**成窗口时重新居中（用户要求：窗口→最大化→窗口 往返后仍然居中）。
+   *
+   * 为什么需要它：fnOS 会把「最大化前的位置」原样还回来，而那个位置未必居中——
+   * 用户拖过/缩放过窗口之后就不居中了（缩放只改尺寸不改 left/top，于是原本居中的窗口
+   * 一缩放就偏了），此后「最大化→还原」只会把这个偏心位置再还回来。
+   *
+   * 边界：只认**形态切换**这一件事——最大化形态（铺满内容区）记一笔，之后第一次回到
+   * 窗口形态就居中一次。用户在窗口形态下的拖动/缩放只改 class/style，不构成切换，
+   * 因此**不会**被本函数拉回来（那由 `placed` 的一次性语义保证）。
+   */
+  function onWindowAttrs(state) {
+    var el = state.el;
+    if (!el || !el.isConnected) { stopTrack(state); return; }
+    if (isMaximized(el)) { state.wasMax = true; return; }
+    if (!state.wasMax) return; // 没经历过最大化形态：窗口形态下的一切改动都不干预
+    state.wasMax = false;
+    centerWindow(el);
+  }
+
+  function stopTrack(state) {
+    var i = tracked.indexOf(state);
+    if (i >= 0) tracked.splice(i, 1);
+    try { if (state.obs) state.obs.disconnect(); } catch (e) { /* 忽略 */ }
+    state.obs = null;
+  }
+
+  /** 给一个窗口挂上「class/style 变更」观察（只观察它自己，属性名限定 class/style）。 */
+  function trackWindow(el) {
+    if (!el || el.__fnosPosTracked) return;
+    try { el.__fnosPosTracked = true; } catch (e) { return; }
+    var state = { el: el, obs: null, wasMax: isMaximized(el) };
+    tracked.push(state);
+    if (typeof W.MutationObserver !== 'function') return; // 老内核：退化为只在创建时居中
+    try {
+      state.obs = new W.MutationObserver(function () { onWindowAttrs(state); });
+      state.obs.observe(el, { attributes: true, attributeFilter: ['class', 'style'] });
+    } catch (e) { state.obs = null; }
   }
 
   /** 按住（尺寸未知时先用 visibility 挡住，免得它以级联位置先露一脸）。 */
@@ -87,6 +147,8 @@
     if (placed.has(el)) return;
     placed.add(el);
     attempt(el);
+    // 挂上「最大化 ⇄ 窗口」往返的观察（见 onWindowAttrs）：还原时再居中一次
+    trackWindow(el);
     if (typeof W.requestAnimationFrame === 'function') {
       W.requestAnimationFrame(function () { attempt(el); });
     }
@@ -143,11 +205,13 @@
     return {
       windows: nodes.length,
       held: held.length,
+      tracked: tracked.length,
       positions: [].slice.call(nodes).map(function (el) {
         return {
           left: el.style.left || '', top: el.style.top || '',
           w: el.offsetWidth, h: el.offsetHeight,
           visibility: (el.style && el.style.visibility) || '',
+          maximized: isMaximized(el),
         };
       }),
     };

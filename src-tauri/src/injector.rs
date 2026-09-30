@@ -654,6 +654,41 @@ mod tests {
         );
     }
 
+    /// T14c 修复轮 17（用户要求：窗口→最大化→窗口 往返后依然居中）：只观察**窗口自己**的
+    /// class/style 变更，进了「铺满内容区」记一笔，回到窗口形态时重新居中一次。
+    #[test]
+    fn window_stays_centered_across_maximize_round_trip() {
+        let js = include_str!("../inject/windowpos.js");
+        assert!(
+            js.contains("attributeFilter: ['class', 'style']"),
+            "形态切换只从窗口自己的 class/style 变更上看（不订阅整页属性变更）"
+        );
+        assert!(
+            js.contains("state.obs.observe(el"),
+            "属性观察必须挂在窗口元素上（逐窗口、有界）"
+        );
+        assert!(
+            js.contains("function isMaximized") && js.contains("wasMax"),
+            "必须有「最大化形态」判定与往返记忆"
+        );
+        let on_attr = js
+            .find("function onWindowAttrs")
+            .expect("必须有形态切换的处理函数");
+        let body = &js[on_attr..on_attr + 500];
+        assert!(
+            body.contains("isMaximized(el)) { state.wasMax = true; return; }"),
+            "最大化形态只记一笔，不动位置（位置由样式覆盖处理）"
+        );
+        assert!(
+            body.contains("centerWindow(el)"),
+            "回到窗口形态必须重新居中"
+        );
+        assert!(
+            body.contains("if (!state.wasMax) return;"),
+            "没经历过最大值形态时，窗口形态下的拖动/缩放一律不干预"
+        );
+    }
+
     #[test]
     fn shell_section_is_narrow_and_defaults_off() {
         // T14c：shell 段是**手写的窄对象**，只带页面消费的两个键（dockAutoHide /

@@ -1,8 +1,11 @@
-// windowpos.js（T14c 修复轮 16）的行为契约：新窗口**同步**落位到内容区正中（不出现
-// 「先以级联位置露一脸、再跳一下」）、最大化窗口不动、尺寸未就绪先按住、只动一次不再干预。
+// windowpos.js（T14c 修复轮 16～17）的行为契约：新窗口**同步**落位到内容区正中（不出现
+// 「先以级联位置露一脸、再跳一下」）、最大化往返后重新居中、窗口形态下的拖动/缩放不被干扰、
+// 尺寸未就绪先按住、只动一次不再干预。
 //
-// 关键回归点（用户实测反馈）：落位必须发生在**观察回调返回之前**（= 插入与首帧之间），
-// 所以断言一律在回调之后**不推进任何定时器**的情况下检查。
+// 关键回归点（用户实测反馈）：
+// · 落位必须发生在**观察回调返回之前**（= 插入与首帧之间），所以断言一律在回调之后
+//   **不推进任何定时器**的情况下检查；
+// · 「窗口 → 最大化 → 窗口」往返后必须仍然居中（fnOS 只会把最大化前的偏心位置还回来）。
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
@@ -45,12 +48,18 @@ function fakeCtx(opts = {}) {
     readyState: opts.readyState || 'complete',
     _listeners: {},
     _windows: opts.windows || [],
+    _mos: [],   // 全部观察器实例（document 级的 + 逐窗口的）
     addEventListener(ev, fn) { this._listeners[ev] = fn; },
     querySelectorAll: (sel) => (sel === `.${WINDOW_CLS}` ? doc._windows : []),
   };
   class MOStub {
-    constructor(cb) { doc._mo = cb; }
-    observe() { doc._observed = true; }
+    constructor(cb) { this.cb = cb; doc._mos.push(this); }
+    observe(target, options) {
+      this.target = target;
+      this.options = options;
+      doc._observed = { target, options };
+    }
+    disconnect() { this.disconnected = true; }
   }
   const win = {
     document: doc,
@@ -75,15 +84,42 @@ function load(ctx) {
 
 /** 造一个「刚插进内容区」的窗口元素。 */
 function newWindow(ctx, opts = {}) {
-  const el = fakeEl({ isWindow: true, parent: opts.parent || ctx.area, ...opts });
-  return el;
+  return fakeEl({ isWindow: true, parent: opts.parent || ctx.area, ...opts });
+}
+
+/** document 级观察器（插入节点的入口）。 */
+function fireDoc(ctx, records) {
+  const mo = ctx.doc._mos.find((m) => m.target === ctx.doc);
+  assert.ok(mo, '必须有 document 级观察器');
+  mo.cb(records);
+}
+
+/** 逐窗口的属性观察器（class/style 变更 = 最大化形态切换）。 */
+function fireEl(ctx, el) {
+  const mos = ctx.doc._mos.filter((m) => m.target === el);
+  assert.ok(mos.length > 0, '窗口必须被挂上属性观察器（最大化往返要靠它）');
+  mos.forEach((m) => m.cb([{ type: 'attributes', target: el }]));
+}
+
+/** 切到最大化形态：铺满内容区。 */
+function maximize(ctx, el) {
+  el.offsetWidth = ctx.area.clientWidth;
+  el.offsetHeight = ctx.area.clientHeight;
+  fireEl(ctx, el);
+}
+
+/** 从最大化还原成给定的窗口尺寸。 */
+function unmaximize(ctx, el, w = 1100, h = 640) {
+  el.offsetWidth = w;
+  el.offsetHeight = h;
+  fireEl(ctx, el);
 }
 
 test('落位是**同步**的：观察回调返回时窗口已经在正中（不推进任何定时器）', () => {
   const ctx = fakeCtx();
   load(ctx);
   const win = newWindow(ctx);
-  ctx.doc._mo([{ addedNodes: [win] }]);
+  fireDoc(ctx, [{ addedNodes: [win] }]);
   assert.equal(win._inline.left, '50px', '同步落位：插入与首帧之间就写好了（否则用户先看到级联位置）');
   assert.equal(win._inline.top, '90px', '垂直方向同理');
   assert.equal(win._inline.visibility, undefined, '尺寸量得到就不需要按住');
@@ -94,7 +130,7 @@ test('递归命中：整棵子树一次插入时，子树里的窗口也要同�
   load(ctx);
   const win = newWindow(ctx);
   const host = fakeEl({ isWindow: false, windows: [win], parent: ctx.area });
-  ctx.doc._mo([{ addedNodes: [host] }]);
+  fireDoc(ctx, [{ addedNodes: [host] }]);
   assert.equal(win._inline.left, '50px');
   assert.equal(win._inline.top, '90px');
 });
@@ -103,7 +139,7 @@ test('最大化形态（铺满内容区）不动它', () => {
   const ctx = fakeCtx();
   load(ctx);
   const win = newWindow(ctx, { w: 1200, h: 820 });
-  ctx.doc._mo([{ addedNodes: [win] }]);
+  fireDoc(ctx, [{ addedNodes: [win] }]);
   assert.equal(win._inline.left, undefined, '铺满内容区的窗口不得被改动');
   assert.equal(win._inline.top, undefined);
 });
@@ -112,7 +148,7 @@ test('尺寸还没量到：先按住不给看（visibility:hidden），量到后
   const ctx = fakeCtx();
   load(ctx);
   const win = newWindow(ctx, { w: 0, h: 0 });
-  ctx.doc._mo([{ addedNodes: [win] }]);
+  fireDoc(ctx, [{ addedNodes: [win] }]);
   assert.equal(win._inline.visibility, 'hidden', '量不到尺寸时必须先挡住（否则会以级联位置先露一脸）');
   assert.equal(win._inline.left, undefined, '还没摆正，不得写位置');
   assert.equal(ctx.win._timers.length, 2, '留了两次重试（下一帧 + 补正窗）');
@@ -129,13 +165,56 @@ test('只动一次：用户拖动之后，后续 DOM 变更不得把窗口拉回
   const ctx = fakeCtx();
   load(ctx);
   const win = newWindow(ctx);
-  ctx.doc._mo([{ addedNodes: [win] }]);
+  fireDoc(ctx, [{ addedNodes: [win] }]);
   ctx.win.drain(); // 两次幂等重试也跑完
   win._inline.left = '300px'; // 用户拖动
   win._inline.top = '220px';
-  ctx.doc._mo([{ addedNodes: [fakeEl({ isWindow: false })] }]); // 页面上别的变更
+  fireDoc(ctx, [{ addedNodes: [fakeEl({ isWindow: false })] }]); // 页面上别的变更
   assert.equal(win._inline.left, '300px', '用户拖动优先：绝不再拉回居中');
   assert.equal(win._inline.top, '220px');
+});
+
+test('窗口 → 最大化 → 窗口：还原时重新居中（用户要求的往返语义）', () => {
+  const ctx = fakeCtx();
+  load(ctx);
+  const win = newWindow(ctx);
+  fireDoc(ctx, [{ addedNodes: [win] }]);
+  // 用户先把窗口拖到偏心位置（比如为了看后面的内容）
+  win._inline.left = '300px';
+  win._inline.top = '220px';
+  maximize(ctx, win);
+  assert.equal(win._inline.left, '300px', '最大化形态下不得动位置（该形态由样式覆盖处理）');
+  unmaximize(ctx, win);
+  assert.equal(win._inline.left, '50px', '还原后必须回到居中');
+  assert.equal(win._inline.top, '90px');
+});
+
+test('窗口形态下缩放（不构成形态切换）不得触发重新居中', () => {
+  const ctx = fakeCtx();
+  load(ctx);
+  const win = newWindow(ctx);
+  fireDoc(ctx, [{ addedNodes: [win] }]);
+  win._inline.left = '300px';
+  win._inline.top = '220px';
+  win.offsetWidth = 900;  // 用户拖右下角改尺寸：只改尺寸不改位置
+  win.offsetHeight = 500;
+  fireEl(ctx, win);
+  assert.equal(win._inline.left, '300px', '窗口形态下的缩放不得把窗口拉回居中');
+  assert.equal(win._inline.top, '220px');
+});
+
+test('最大化往返后再缩放一次，仍然只在还原那次居中（幂等，不来回拉锯）', () => {
+  const ctx = fakeCtx();
+  load(ctx);
+  const win = newWindow(ctx);
+  fireDoc(ctx, [{ addedNodes: [win] }]);
+  maximize(ctx, win);
+  unmaximize(ctx, win, 900, 500); // 还原并顺手改了尺寸
+  assert.equal(win._inline.left, '150px', '按还原后的实测尺寸居中：((1200-900)/2)');
+  assert.equal(win._inline.top, '160px', '((820-500)/2)');
+  win._inline.left = '40px';      // 用户再拖走
+  fireEl(ctx, win);               // 窗口形态下的属性变更
+  assert.equal(win._inline.left, '40px', '不得反复居中');
 });
 
 test('不做全量重扫：不相关的节点插入不会去动已有窗口', () => {
@@ -145,7 +224,7 @@ test('不做全量重扫：不相关的节点插入不会去动已有窗口', ()
   load(ctx);
   assert.equal(existing._inline.left, '50px', '首次扫描要居中已存在的窗口');
   existing._inline.left = '400px'; // 之后用户挪了它
-  ctx.doc._mo([{ addedNodes: [fakeEl({ isWindow: false })] }]);
+  fireDoc(ctx, [{ addedNodes: [fakeEl({ isWindow: false })] }]);
   assert.equal(existing._inline.left, '400px', '观察回调只处理新增节点，不得触发全量重扫');
 });
 
@@ -153,7 +232,7 @@ test('纪律：非窗口元素零改动、不写页面内容、只在顶层文�
   const ctx = fakeCtx();
   load(ctx);
   const plain = fakeEl({ isWindow: false });
-  ctx.doc._mo([{ addedNodes: [plain] }, { addedNodes: [null] }, { addedNodes: [] }]);
+  fireDoc(ctx, [{ addedNodes: [plain] }, { addedNodes: [null] }, { addedNodes: [] }]);
   assert.deepEqual(Object.keys(plain._inline), [], '非窗口元素不得被写样式');
 
   assert.ok(POS.includes('W.top === W.self'), '只在顶层文档工作');
