@@ -1,30 +1,33 @@
 /* 设置窗样式（spec §8.1，Task 14b 起；T14c 修复轮 3 起**只保留上游界面**）。
  *
- * 布局：整个窗口就是上游 popup UI（`ui/settings/popup.html`，装在一个 372×522 的 iframe
- * 里——那正是上游 popup 自己写死的 body 尺寸，见 popup.html:44-51），在窗口内水平垂直
- * 居中。上游自带整套样式，本表**不碰** iframe 里的任何东西（「自动隐藏 Dock」由
- * chrome-shim 用上游自己的行样式注入，本表同样管不到它）。
- * 原状态条 / 外壳卡 / 关于页的样式随其 DOM 一起删除（T14c 修复轮 3）。
+ * T14c 修复轮 22（「优化排版、统一风格」）：
+ * - 窗口内尺寸精确等于上游 popup 自己写死的 372×522（popup.html:44-51），外壳的
+ *   12px 内边距与 400×550 窗口一并取消——不再有四周那圈死边；
+ * - 外层背景跟随弹窗**自己的**主题变量（popup.html:19-42 的 `--card-bg`：深色 #171717 /
+ *   浅色 #fff，随 `prefers-color-scheme`），外层与 iframe 永远同色，视觉上是**一张面**；
+ * - .frame-host 不再有边框 / 圆角 / 自己的底色（那正是「套娃框」的来源）。
+ * 上游界面本身一个字节都不动（装在 iframe 里，样式也不可能互相打架）。
  *
  * 零依赖、零构建链。 */
-:root {
-  color-scheme: dark;
-  --bg: #1b1c1e; --card: #232427;
-  --line: #2e3034; --fg: #e8e8ea; --dim: #8b9096;
-}
 * { box-sizing: border-box; }
 html, body { height: 100%; }
 body {
-  margin: 0; display: flex; background: var(--bg); color: var(--fg);
+  margin: 0; display: flex;
+  color-scheme: light dark;
+  /* 与 popup.html 的 body 背景（--card-bg）逐值一致：深色 #171717、浅色 #fff */
+  background: #fff;
   font: 14px/1.6 "Microsoft YaHei", system-ui, sans-serif;
 }
+@media (prefers-color-scheme: dark) {
+  body { background: #171717; }
+}
 
-/* 唯一的一块：上游界面，居中。 */
-.shell { flex: 1 1 auto; display: flex; align-items: center; justify-content: center; padding: 12px; }
-.upstream { flex: 0 0 auto; display: flex; flex-direction: column; }
+/* 唯一的一块：上游界面，撑满窗口（窗口尺寸就是按它定的）。 */
+.shell { flex: 1 1 auto; display: flex; align-items: stretch; justify-content: stretch; }
+.upstream { flex: 1 1 auto; display: flex; flex-direction: column; }
 
-/* iframe 的宿主：上游 popup 的 body 是 372×522（popup.html:44-51），
-   所以这里给同样的内尺寸，让上游按它自己设计的样子渲染，不做任何缩放。
+/* iframe 的宿主：上游 popup 的 body 是 372×522（popup.html:44-51），窗口内尺寸与它
+   精确一致，无边框无底色（背景由 body 与 iframe 同色承接）。
    四种态（fix round 1 / Minor 2）：
      loading  —— 还没挂帧：显示占位说明（「正在读取配置…」）；占位与帧不并排（否则会挤在一起）
      mounted  —— 帧已挂上、还没判定：隐藏占位，把位置让给帧
@@ -33,15 +36,14 @@ body {
                  于是「上游界面没渲染出来」这句话一次都没人能看见） */
 .frame-host {
   width: 372px; height: 522px; flex: 0 0 auto;
-  border: 1px solid var(--line); border-radius: 10px; background: var(--card);
   display: flex; align-items: center; justify-content: center; overflow: hidden;
 }
 .frame-host[data-state="ready"] { display: block; }
 .frame-host[data-state="mounted"] { display: block; }
-.frame-host iframe { width: 372px; height: 522px; border: 0; display: block; background: #171717; }
-.frame-note { margin: 0; padding: 16px; color: var(--dim); font-size: 12px; text-align: center; }
+.frame-host iframe { width: 372px; height: 522px; border: 0; display: block; }
+.frame-note { margin: 0; padding: 16px; font-size: 12px; text-align: center; opacity: 0.72; }
 .frame-host[data-state="ready"] .frame-note { display: none; }
 .frame-host[data-state="mounted"] .frame-note { display: none; }
 .frame-host[data-state="failed"] .frame-note {
-  padding: 24px 16px; color: #ff9a94; text-align: left; line-height: 1.7;
+  padding: 24px 16px; color: #ff9a94; text-align: left; line-height: 1.7; opacity: 1;
 }

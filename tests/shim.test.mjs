@@ -229,6 +229,20 @@ test('sendMessage：应用项应答只回传 key/title（iconSrc 一律剥掉）
   assert.deepEqual(body.payload, { items: [{ key: 'a', title: 'a' }], titles: ['a'] });
 });
 
+test('手动重汇报钩子在完美图标**尚未配置**时也必须上报（修复轮 22 的死锁修复）', () => {
+  // 死锁场景：列表要「已配置」才上报，而用户恰恰要靠这份列表完成第一次配置——
+  // 表现就是「完美图标功能不生效」。宿主明确来要（设置窗开着）时必须照发。
+  const w = loadShimWithDoc(HOST_SHELL); // SHELL.mods 里没有任何完美图标键
+  const sent = [];
+  w.chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+    if (msg && msg.type === 'FNOS_GET_LAUNCHPAD_APP_ITEMS') sendResponse({ items: [], titles: [] });
+  });
+  const original = w.chrome.runtime.sendMessage;
+  w.chrome.runtime.sendMessage = (msg) => { sent.push(msg); original(msg); };
+  assert.equal(w.__FNOS_REQUEST_APP_ITEMS__(), true, '未配置也要真的把请求送出去');
+  assert.deepEqual(sent.map((m) => m.type), ['FNOS_GET_LAUNCHPAD_APP_ITEMS']);
+});
+
 test('sendMessage：不在上报协议里的 type 一律不写标题（不给页面当任意信道用）', () => {
   const w = loadShimWithDoc(HOST_SHELL);
   for (const msg of [

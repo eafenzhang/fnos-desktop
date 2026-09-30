@@ -685,13 +685,15 @@
       },
       /**
        * 版本显示。上游在脚本开头同步调用它，所以它读**父 frame 事先写好的快照**
-       * （`config.meta.modsVersion`，与注入载荷同源，R38）；读不到时说「未知」而不是编一个版本号。
+       * （`config.meta`，与注入载荷同源，R38）；读不到时说「未知」而不是编一个版本号。
+       *
+       * T14c 修复轮 22：版本行显示**本应用**的版本（`meta.shellVersion`，与安装包、
+       * 托盘「检查更新」同源 = `Cargo.toml` 的 version），不再是上游 mods 的版本。
        */
       getManifest() {
         const meta = (snapshot().config && snapshot().config.meta) || {};
-        return { version: typeof meta.modsVersion === 'string' && meta.modsVersion
-          ? meta.modsVersion
-          : '未知' };
+        const pick = (key) => (typeof meta[key] === 'string' && meta[key] ? meta[key] : '');
+        return { version: pick('shellVersion') || pick('modsVersion') || '未知' };
       },
     },
 

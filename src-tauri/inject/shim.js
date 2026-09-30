@@ -459,6 +459,9 @@
     if (patch.shell && typeof W.__FNOS_APPLY_SHELL__ === 'function') {
       try { W.__FNOS_APPLY_SHELL__(patch.shell); } catch (e) { /* 壳功能异常不影响上游配置 */ }
     }
+    // 完美图标刚被配置（开关打开 / 选了应用）→ 立刻要一次应用项列表（T14c 修复轮 22）。
+    // 否则用户在设置里打开开关后，页面要等到下次加载才会上报，逐项列表一直空着。
+    if (patch.mods && perfectIconConfigured()) requestAppItems();
   };
 
   W.chrome = W.chrome || {};
@@ -605,9 +608,15 @@
   /**
    * 立刻向上游要一次应用项列表（只发请求、不改页面；应答由上游自己的监听器给出，
    * 本层只转发原文）。**不依赖重试循环的滴答**——宿主的 `request_app_items` 用的就是它。
+   *
+   * `force`（T14c 修复轮 22）：设置窗**明确来要**列表时必须跳过 `perfectIconConfigured()`
+   * 的门——那个门只该管「页面自己按固定节奏探测」（给不用完美图标的用户省一次探测）。
+   * 否则就是死锁：列表要「已配置」才上报，而用户恰恰要靠这份列表完成第一次配置——
+   * 表现就是「完美图标功能不生效」（开关打开了，应用列表永远是「暂无数据」）。
    */
-  function askForAppItemsNow() {
-    if (!HOST || !perfectIconConfigured()) return false;
+  function askForAppItemsNow(force) {
+    if (!HOST) return false;
+    if (!force && !perfectIconConfigured()) return false;
     try {
       W.chrome.runtime.sendMessage({ type: 'FNOS_GET_LAUNCHPAD_APP_ITEMS' });
       return true;
@@ -657,7 +666,8 @@
    */
   W.__FNOS_REQUEST_APP_ITEMS__ = function () {
     if (appItemsManualCalls >= APP_ITEMS_MANUAL_LIMIT) return false;
-    if (!askForAppItemsNow()) return false;
+    // force = true：设置窗开着、用户正在配完美图标——「还没配置过」不能成为拒绝上报的理由
+    if (!askForAppItemsNow(true)) return false;
     appItemsManualCalls += 1;
     return true;
   };

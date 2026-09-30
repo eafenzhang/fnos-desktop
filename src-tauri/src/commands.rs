@@ -1891,8 +1891,12 @@ pub fn open_settings<R: Runtime>(app: &AppHandle<R>) {
         WebviewUrl::App("settings.html".into()),
     )
     .title("fnOS 设置")
-    // T14c 修复轮 3：设置窗只剩上游 UI（372×522 的 iframe）+ 12px 内边距，窗口随之收窄。
-    .inner_size(400.0, 550.0)
+    // T14c 修复轮 22：窗口尺寸**精确等于**上游 popup 自身写死的 body 尺寸
+    // （popup.html:44-51 的 372×522）——此前 400×550 + 12px 外壳内边距，四周多出一圈
+    // 与弹窗主题不同色的死边（「套娃框」感）。
+    .inner_size(372.0, 522.0)
+    // T14c 修复轮 22：打开设置窗时默认**屏幕居中**（此前跟随 OS 默认级联位置）。
+    .center()
     .build()
     {
         Ok(_) => {}
@@ -2747,8 +2751,10 @@ mod tests {
         );
         // fix round 1 / Minor 5：3 次额度必须按**真的送出去的请求**结算，而不是按调用次数。
         // 顺序是硬约束：先问「送出去了没有」，再计数——反过来就会把空转的调用也记账。
+        // （修复轮 22 起钩子用 `askForAppItemsNow(true)` 绕过「已配置」门——设置窗明确
+        // 来要时必须照发，否则用户永远配不了完美图标；「先结算后计数」的次序不变。）
         let ask = shim
-            .find("if (!askForAppItemsNow()) return false;")
+            .find("if (!askForAppItemsNow(true)) return false;")
             .expect("钩子必须先判定请求有没有真的送出（Minor 5：额度不得被空转消耗）");
         let count = shim
             .find("appItemsManualCalls += 1;")
@@ -2756,6 +2762,22 @@ mod tests {
         assert!(
             ask < count,
             "计数的位置必须在「真的送出去了」判定之后（先加一再看结果 = 旧缺陷）"
+        );
+        // 修复轮 22：设置窗开着（宿主来要）时，「完美图标还没配置」不能成为拒绝上报的
+        // 理由——列表恰恰是配置完美图标的**前提**。只有页面自己的自动重试循环才受该门约束。
+        let gate = shim
+            .find("function askForAppItemsNow(force)")
+            .expect("askForAppItemsNow 必须带 force 参数");
+        let gate_body = &shim[gate..gate + 300];
+        assert!(
+            gate_body.contains("if (!force && !perfectIconConfigured()) return false;"),
+            "「已配置」门只在自动路径生效（force = 设置窗明确来要）"
+        );
+        let hook = shim.find("W.__FNOS_REQUEST_APP_ITEMS__ = function").expect("钩子存在");
+        let hook_body = &shim[hook..hook + 320];
+        assert!(
+            hook_body.contains("askForAppItemsNow(true)"),
+            "手动钩子必须 force 上报（死锁修复）"
         );
     }
 
