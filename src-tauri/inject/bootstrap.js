@@ -117,6 +117,15 @@
     // 背景已经是底色的前提下这条延迟只会让「列表→详情」的过渡期露出一瞬透明，所以把
     // `background-color` 从过渡属性里去掉（保留 transform/opacity 的滑动与淡入）。
     'transition-property:transform,opacity !important;}' +
+    // 应用 OAuth 授权确认页（/signin?client_id=…，T14d 实测：Seek/OCTOP 首次授权）的
+    // 「授权」主按钮被上游 lockscreen_mod.css:210 的锁屏美化规则
+    // `.login-form .semi-button-primary { visibility:hidden }` 一并藏掉——标准锁屏用头像
+    // 代替按钮没问题，但授权页没有密码框、全靠这个按钮确认，藏掉就是「无法确认授权」。
+    // 结构化区分：**没有密码框的 login-form**（= 授权确认页）主按钮必须可见；
+    // 标准锁屏（有 .semi-form-field-password）保持上游行为。特异性 0,4,0 压过上游 0,3,0。
+    '.login-form:not(:has(.semi-form-field-password)) ' +
+    '.semi-button-primary:not(.semi-button-disabled)' +
+    '{visibility:visible !important;}' +
     // 桌面壁纸（fnOS 的 live 壁纸 webp，object-fit: cover）**顶行本身就是一条亮蓝线**（实测
     // rgb(38,77,143)，只占 1px）。裁掉壁纸顶部 1px，那条线就没有了；下方由页面底色承接，
     // 视觉无缝。

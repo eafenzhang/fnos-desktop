@@ -117,6 +117,14 @@ test('本壳样式覆盖：绝对定位的整屏覆盖层恢复不透明（应�
   // 必须把 background-color 从过渡属性里去掉，否则「列表→详情」会露出一瞬透明。
   assert.ok(appCenterRule.indexOf('transition-property:transform,opacity !important;') >= 0,
     '必须去掉 background-color 的过渡延迟');
+  // 应用 OAuth 授权确认页（T14d 实测「无法确认授权」）：没有密码框的 login-form 里，
+  // 上游 lockscreen_mod.css 把「授权」主按钮 visibility:hidden —— 必须结构化放行；
+  // 标准锁屏（有密码框）保持上游行为。
+  assert.ok(
+    css.indexOf('.login-form:not(:has(.semi-form-field-password)) ' +
+      '.semi-button-primary:not(.semi-button-disabled){visibility:visible !important;}') >= 0,
+    '必须有「授权页主按钮放行」的规则（无密码框 login-form 才命中）',
+  );
   // 桌面壁纸顶行的亮蓝线：裁掉壁纸顶部 1px
   assert.ok(css.indexOf('#root .absolute.inset-0.z-0.object-contain{clip-path:inset(1px 0 0 0) !important;}') >= 0,
     '必须有「裁掉壁纸顶部 1px」的规则');
