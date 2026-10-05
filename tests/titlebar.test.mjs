@@ -20,7 +20,9 @@ function fakeTitlebar() {
     children: [],
     title: '',
     style: {},
+    attributes: {},
     appendChild(child) { this.children.push(child); },
+    setAttribute(k, v) { this.attributes[k] = v; },
     addEventListener(type, fn) { events.push([type, fn]); },
     // 真实 DOM 语义：置空 textContent 会清掉所有子节点（render 靠它做幂等）
     set textContent(v) { if (v === '') this.children.length = 0; this._text = v; },
@@ -55,38 +57,58 @@ function loadTitlebar(doc) {
   return fn(win);
 }
 
-test('渲染：状态由 __FNOS_TABS_SET__ 单向推送，标题/激活态/关闭钮如实', () => {
+test('渲染：main 合并为最左「桌面」元素（品牌图标 + NAS 名称），外部标签随后', () => {
   const { doc } = fakeTitlebar();
   const w = loadTitlebar(doc);
   assert.equal(typeof w.__FNOS_TABS_SET__, 'function', '推送口必须在（宿主 eval 调它）');
   w.__FNOS_TABS_SET__({
     tabs: [
-      { id: 'main', title: 'MiniNas', active: true, canClose: false },
+      { id: 'main', title: 'MiniNas - 飞牛 fnOS', active: true, canClose: false },
       { id: 'tab-1', title: 'hermes-studio', active: false, canClose: true },
     ],
   });
-  const tabs = doc.getElementById('tabs').children;
-  assert.equal(tabs.length, 2);
-  assert.ok(tabs[0].className.includes('active'), 'main 是活动标签');
-  assert.equal(tabs[0].dataset.tabId, 'main');
-  assert.equal(tabs[0].children.find((c) => c.className === 'tab-title').textContent, 'MiniNas');
-  assert.ok(!tabs[0].children.some((c) => c.className === 'tab-close'),
-    'fnOS 主页标签（canClose=false）不得有关闭按钮');
-  assert.ok(tabs[1].children.some((c) => c.className === 'tab-close' && c.dataset.tabId === 'tab-1'),
-    '可关标签必须带关闭按钮（并带所属标签 id）');
+  const kids = doc.getElementById('tabs').children;
+  assert.equal(kids.length, 2, 'main 合并成桌面元素 + 1 个外部标签');
+  const home = kids[0];
+  assert.ok(home.className.includes('home') && home.className.includes('active'), '桌面元素在桌面标签激活时高亮');
+  assert.equal(home.dataset.tabId, 'main');
+  assert.equal(home.dataset.action, 'switch', '点击桌面元素 = 切回桌面标签');
+  const img = home.children.find((c) => c.tagName === 'IMG');
+  assert.ok(img && img.src.includes('icons/icon16.png'), '桌面元素带 fnOS 品牌图标');
+  const name = home.children.find((c) => c.className === 'home-name');
+  assert.equal(name.textContent, 'MiniNas', 'NAS 名称 = 页面标题剥掉「- 飞牛 fnOS」后缀');
+  assert.ok(!home.children.some((c) => c.className === 'tab-close'), '桌面元素不可关闭');
+  // 外部标签照旧渲染在桌面元素之后
+  const tab = kids[1];
+  assert.equal(tab.dataset.tabId, 'tab-1');
+  assert.ok(tab.className.includes('tab') && !tab.className.includes('active'));
+  assert.ok(tab.children.some((c) => c.className === 'tab-close'));
   // 再推一次：幂等（不叠加）
-  w.__FNOS_TABS_SET__({ tabs: [{ id: 'main', title: 'MiniNas', active: true, canClose: false }] });
-  assert.equal(doc.getElementById('tabs').children.length, 1);
+  w.__FNOS_TABS_SET__({
+    tabs: [
+      { id: 'main', title: 'MiniNas - 飞牛 fnOS', active: true, canClose: false },
+      { id: 'tab-1', title: 'hermes-studio', active: false, canClose: true },
+    ],
+  });
+  assert.equal(doc.getElementById('tabs').children.length, 2);
+});
+
+test('nasName：剥「- 飞牛 fnOS」后缀；剥不出原样；空回退 fnOS', () => {
+  const { doc } = fakeTitlebar();
+  const w = loadTitlebar(doc);
+  const nasName = w.__FNOS_TITLEBAR__.nasName;
+  assert.equal(nasName('MiniNas - 飞牛 fnOS'), 'MiniNas');
+  assert.equal(nasName('FN Connect 远程访问 - 飞牛 fnOS'), 'FN Connect 远程访问');
+  assert.equal(nasName('MiniNas'), 'MiniNas', '没有后缀就原样用');
+  assert.equal(nasName(''), 'fnOS', '空标题回退 fnOS');
 });
 
 test('品牌图标：点击回桌面标签（main），不新开也不重载', () => {
-  const { doc } = fakeTitlebar();
-  const w = loadTitlebar(doc);
-  // HTML 里品牌钮 data-action=home；JS 里 home → tab_switch main
-  assert.ok(TB_HTML.includes('id="brand" data-action="home"'), '品牌图标必须是最左的回桌按钮');
-  assert.ok(TB_HTML.includes('icons/icon16.png'), '品牌图标用 frontendDist 里的 16px fnOS 图标');
+  // HTML 里不再有独立 brand 按钮——桌面元素由 render 从 main 标签合并生成
+  assert.ok(!TB_HTML.includes('id="brand"'), '不得再有独立品牌按钮（已与 main 合并）');
+  assert.ok(TB_JS.includes("icons/icon16.png"), '品牌图标用 frontendDist 里的 16px fnOS 图标');
   assert.ok(TB_JS.includes("action === 'home'") && TB_JS.includes("invoke('tab_switch', { label: 'main' })"),
-    'home 动作必须切回 main 标签');
+    'home 动作必须切回 main 标签（保留通用动作分支）');
 });
 
 test('窗口控制：系统图标字体的 ─ □ ×（46px 整高），点击翻译成窗口命令', () => {

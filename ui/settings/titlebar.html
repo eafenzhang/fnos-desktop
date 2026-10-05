@@ -7,18 +7,16 @@
 </head>
 <body>
 <!--
-  一行式标题栏（T14d 修复轮 3，用户要求「标签页合并到标题栏」）：
-  最左是 fnOS 品牌图标（点击回到桌面标签），然后是标签 + 新建按钮，右边是 Windows
-  系统默认观感的 ─ □ ×，空白处拖拽窗口。
+  一行式标题栏（T14d 修复轮 6，用户要求「icon 旁边显示 NAS 名称、与第一个标签合并」）：
+  最左是「桌面」元素 = fnOS 品牌图标 + NAS 名称（由 titlebar.js 渲染，点击回到桌面标签，
+  永远固定在最左、不可关闭），然后是外部应用的标签 + 新建按钮，右边是 Windows 系统默认
+  观感的 ─ □ ×，空白处拖拽窗口。
   这个 Webview 是主窗口（无边框）里唯一「属于本壳」的一小块 UI，铺在窗口顶部
-  TAB_STRIP_H 高的一条里；下面的全部区域归标签页 Webview（fnOS 主页 / 外部应用）。
+  TAB_STRIP_H 高的一条里；下面的全部区域归标签页 Webview。
   授权面见 capabilities/titlebar.json：三个标签页命令 + 窗口的最小化/最大化切换/关闭
   + 拖拽，仅此而已。
 -->
 <div id="titlebar" class="titlebar" data-tauri-drag-region>
-  <button id="brand" data-action="home" title="回到桌面">
-    <img src="icons/icon16.png" alt="fnOS Desktop" draggable="false">
-  </button>
   <div id="tabs" class="tabs"></div>
   <button id="newTab" class="new-tab" data-action="tab-new" title="新建标签页">+</button>
   <div class="drag-fill" data-tauri-drag-region></div>

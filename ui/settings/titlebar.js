@@ -38,13 +38,46 @@
     }
   };
 
-  /** 渲染一次标签条。state = { tabs: [{id, title, active, canClose}] }。 */
+  /** fnOS 页面标题的固定后缀（「MiniNas - 飞牛 fnOS」→ NAS 名称「MiniNas」）。 */
+  var TITLE_SUFFIX = /[-–]\s*飞牛\s*fnOS\s*$/;
+  var HOME_FALLBACK = 'fnOS';
+
+  /** 从 main 标签标题里剥出 NAS 名称（剥不出后缀就原样用；空了回退 fnOS）。 */
+  function nasName(title) {
+    var name = String(title == null ? '' : title).replace(TITLE_SUFFIX, '').trim();
+    return name || HOME_FALLBACK;
+  }
+
+  /** 渲染一次标签条。state = { tabs: [{id, title, active, canClose}] }。
+   *
+   * `main`（fnOS 桌面）**不渲染成普通标签**，而是合并成最左的「桌面」元素：
+   * 品牌图标 + NAS 名称（修复轮 6，用户要求），点击回到桌面；外部应用标签随后。
+   */
   function render(state) {
     var tabs = state && Array.isArray(state.tabs) ? state.tabs : [];
     var host = D.getElementById('tabs');
     if (!host) return;
     host.textContent = '';
     tabs.forEach(function (tab) {
+      if (tab.id === 'main') {
+        var name = nasName(tab.title);
+        var home = D.createElement('div');
+        home.className = 'home' + (tab.active ? ' active' : '');
+        home.dataset.tabId = 'main';
+        home.dataset.action = 'switch';
+        home.title = name;
+        var img = D.createElement('img');
+        img.src = 'icons/icon16.png';
+        img.alt = 'fnOS';
+        img.setAttribute('draggable', 'false');
+        home.appendChild(img);
+        var label = D.createElement('span');
+        label.className = 'home-name';
+        label.textContent = name;
+        home.appendChild(label);
+        host.appendChild(home);
+        return;
+      }
       var item = D.createElement('div');
       item.className = 'tab' + (tab.active ? ' active' : '');
       item.dataset.tabId = String(tab.id);
@@ -164,5 +197,5 @@
     boot();
   }
 
-  window.__FNOS_TITLEBAR__ = { render: render, renderControls: renderControls, setMaxState: setMaxState };
+  window.__FNOS_TITLEBAR__ = { render: render, renderControls: renderControls, setMaxState: setMaxState, nasName: nasName };
 })();

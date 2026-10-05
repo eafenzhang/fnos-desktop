@@ -24,14 +24,19 @@ body {
   padding: 0 0 0 6px; background: var(--bar-bg);
   border-bottom: 1px solid var(--bar-line);
 }
-/* 品牌图标（最左）：点击回到桌面标签 */
-#brand {
-  flex: 0 0 auto; width: 28px; height: 24px; border: 0; border-radius: 6px;
-  background: transparent; cursor: pointer; padding: 0;
-  display: flex; align-items: center; justify-content: center;
+/* 「桌面」元素（最左，修复轮 6）：fnOS 品牌图标 + NAS 名称合并为一体，
+ * 点击回到桌面标签；激活时高亮，永远不可关闭（main 不渲染关闭钮）。 */
+.home {
+  display: flex; align-items: center; gap: 6px; min-width: 0;
+  height: 24px; padding: 0 9px;
+  border-radius: 6px; color: var(--dim); background: transparent; cursor: pointer;
 }
-#brand:hover { background: var(--tab-active); }
-#brand img { width: 16px; height: 16px; display: block; pointer-events: none; }
+.home.active { background: var(--tab-active); color: var(--fg); }
+.home:not(.active):hover { background: color-mix(in srgb, var(--tab-active) 55%, transparent); }
+.home img { width: 16px; height: 16px; display: block; pointer-events: none; }
+.home .home-name {
+  font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
 .tabs { display: flex; align-items: center; gap: 6px; min-width: 0; overflow: hidden; }
 .tab {
   display: flex; align-items: center; gap: 6px; min-width: 0;
