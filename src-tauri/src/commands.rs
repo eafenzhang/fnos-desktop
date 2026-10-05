@@ -459,7 +459,7 @@ pub fn load_config<R: Runtime>(app: &AppHandle<R>) -> (Config, bool) {
     (cfg, report.recovered_from_backup)
 }
 
-fn current<R: Runtime>(app: &AppHandle<R>) -> Config {
+pub(crate) fn current<R: Runtime>(app: &AppHandle<R>) -> Config {
     app.state::<AppState>().config.lock().unwrap().clone()
 }
 

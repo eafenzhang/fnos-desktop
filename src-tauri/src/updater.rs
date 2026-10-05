@@ -43,6 +43,75 @@ pub const RELEASES_LATEST_API: &str =
 const DOWNLOAD_HOST: &str = "github.com";
 const DOWNLOAD_PATH_PREFIX: &str = "/releases/download/";
 
+/// 安装包下载的**连接级重试次数**（os error 10060 这类瞬态超时；持久被墙要靠镜像）。
+const DOWNLOAD_CONNECT_TRIES: u32 = 2;
+const DOWNLOAD_RETRY_DELAY_MS: u64 = 1200;
+
+/// 镜像前缀的 host 校验：拒绝本机 / 环回 / 内网 / 链路本地 / 保留地址（字符串级判定——
+/// 这些 host 形态出现即拒绝），其余公网 host 交由用户自己选择与信任（HTTPS 保证传输）。
+fn host_is_allowed_for_mirror(host: &str) -> bool {
+    let h = host.trim().trim_start_matches('[').trim_end_matches(']').to_ascii_lowercase();
+    if h.is_empty() || h == "localhost" || h.ends_with(".local") || h.ends_with(".arpa") {
+        return false;
+    }
+    if h == "::1" || h.starts_with("fe80:") || h.starts_with("fc") || h.starts_with("fd") {
+        return false; // 环回 / 链路本地 / ULA
+    }
+    // IPv4 私有 / 环回 / 保留段按首段数字判定
+    let first = h.split('.').next().and_then(|s| s.parse::<u32>().ok());
+    if let Some(octet) = first {
+        // 0.*（本网络）、10.*、127.*、169.254.*、172.16-31.*、192.168.*、100.64-127.*（CGNAT）
+        let private = matches!(octet, 0 | 10 | 127)
+            || h.starts_with("169.254.")
+            || h.starts_with("192.168.")
+            || (h.starts_with("172.") && {
+                let second = h.split('.').nth(1).and_then(|s| s.parse::<u32>().ok());
+                matches!(second, Some(n) if (16..=31).contains(&n))
+            })
+            || (h.starts_with("100.") && {
+                let second = h.split('.').nth(1).and_then(|s| s.parse::<u32>().ok());
+                matches!(second, Some(n) if (64..=127).contains(&n))
+            });
+        if private {
+            return false;
+        }
+    }
+    true
+}
+
+/// 校验用户配置的镜像前缀（`shell.updateMirrorPrefix`）：必须是 https 且 host 通过
+/// [`host_is_allowed_for_mirror`]；拼接形态为「前缀 + 完整原始 URL」（ghproxy 系加速
+/// 服务的通用格式，如 `https://your-mirror.example.com/https://github.com/...`）。
+pub fn validate_mirror_prefix(prefix: &str) -> Result<String, String> {
+    let p = prefix.trim();
+    if p.is_empty() {
+        return Ok(String::new());
+    }
+    let u = url::Url::parse(p).map_err(|e| format!("镜像前缀不是合法 URL：{e}"))?;
+    if u.scheme() != "https" {
+        return Err(format!("镜像前缀必须是 https（实际 {}）", u.scheme()));
+    }
+    if !u.username().is_empty() || u.password().is_some() {
+        return Err("镜像前缀不得携带用户信息".into());
+    }
+    let host = u.host_str().unwrap_or("");
+    if host.is_empty() || !host_is_allowed_for_mirror(host) {
+        return Err(format!("镜像前缀的 host 不可用（{host}）：不得为本机 / 内网 / 保留地址"));
+    }
+    Ok(p.trim_end_matches('/').to_string())
+}
+
+/// 组装最终下载 URL：未配置镜像 → 原始 GitHub URL；配置了 → `前缀/原始 URL`。
+fn resolve_download_url(raw: &str, mirror_prefix: &str) -> Result<String, String> {
+    let raw = validate_download_url(raw)?;
+    let prefix = validate_mirror_prefix(mirror_prefix)?;
+    if prefix.is_empty() {
+        Ok(raw)
+    } else {
+        Ok(format!("{prefix}/{raw}"))
+    }
+}
+
 /// API 请求超时（秒）。检查更新是低频操作，短超时失败好过长时间吊着。
 const API_TIMEOUT_SECS: u64 = 10;
 /// 安装包下载超时（秒）。安装包 ~3MB，120s 覆盖慢网络。
@@ -155,7 +224,11 @@ fn fetch_latest_release() -> Result<Value, String> {
 
 /// 把安装包下载到配置目录 `updates/<文件名>`（已存在同名且体积达标 → 直接复用），
 /// 返回落盘路径。写 `.part` 临时名、完成后改名，避免留下半截文件被当成完整安装包。
-fn download_installer(download_url: &str, file_name: &str) -> Result<std::path::PathBuf, String> {
+fn download_installer(
+    download_url: &str,
+    file_name: &str,
+    mirror_prefix: &str,
+) -> Result<std::path::PathBuf, String> {
     let dir = config_dir().join("updates");
     std::fs::create_dir_all(&dir).map_err(|e| format!("创建更新目录失败：{e}"))?;
     let dest = dir.join(file_name);
@@ -170,12 +243,40 @@ fn download_installer(download_url: &str, file_name: &str) -> Result<std::path::
         }
     }
 
-    let mut reader = ureq::get(download_url)
-        .set("User-Agent", concat!("fnos-desktop/", env!("CARGO_PKG_VERSION")))
+    // 直连不通（os error 10060 这类）时按配置的镜像前缀重试；瞬态超时做连接级重试。
+    let target = resolve_download_url(download_url, mirror_prefix)?;
+    // 连接超时单列 15s：os error 10060 这类连接失败必须快速返回，
+    // 不然按总超时 120s 重试一次就是最长 4 分钟白等。
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(std::time::Duration::from_secs(15))
         .timeout(std::time::Duration::from_secs(DOWNLOAD_TIMEOUT_SECS))
-        .call()
-        .map_err(|e| format!("下载失败：{e}"))?
-        .into_reader();
+        .build();
+    let mut last_err: Option<String> = None;
+    let mut reader = None;
+    for attempt in 1..=DOWNLOAD_CONNECT_TRIES {
+        match agent
+            .get(&target)
+            .set("User-Agent", concat!("fnos-desktop/", env!("CARGO_PKG_VERSION")))
+            .call()
+        {
+            Ok(resp) => {
+                reader = Some(resp.into_reader());
+                break;
+            }
+            Err(e) => {
+                last_err = Some(format!("{e}"));
+                if attempt < DOWNLOAD_CONNECT_TRIES {
+                    std::thread::sleep(std::time::Duration::from_millis(DOWNLOAD_RETRY_DELAY_MS));
+                }
+            }
+        }
+    }
+    let Some(mut reader) = reader else {
+        return Err(format!(
+            "{}。直连 GitHub 不稳定时，可在 config.json 的 shell.updateMirrorPrefix 配置加速前缀（形如 https://your-mirror.example.com/ ，前缀 + 原始 GitHub 地址）后重试",
+            last_err.unwrap_or_else(|| "未知错误".into())
+        ));
+    };
     let mut file = std::fs::File::create(&part)
         .map_err(|e| format!("写安装包失败：{e}"))?;
     std::io::copy(&mut reader, &mut file).map_err(|e| {
@@ -268,6 +369,7 @@ fn start_install<R: Runtime>(app: &AppHandle<R>, installer: &std::path::Path) ->
 /// 托盘「检查更新」的入口（**阻塞**函数；托盘侧用 `spawn_blocking` 调用）。
 pub fn check_from_tray<R: Runtime>(app: AppHandle<R>) {
     let current = current_version();
+    let mirror_prefix = crate::commands::current(&app).shell.update_mirror_prefix;
     let release = match fetch_latest_release() {
         Ok(r) => r,
         Err(e) => {
@@ -332,7 +434,7 @@ pub fn check_from_tray<R: Runtime>(app: AppHandle<R>) {
             return;
         }
     };
-    let installer = match download_installer(&validated, &file_name) {
+    let installer = match download_installer(&validated, &file_name, &mirror_prefix) {
         Ok(p) => p,
         Err(e) => {
             message_box("fnOS 检查更新", &format!("{e}"), MB_ICON_WARNING);
@@ -531,6 +633,49 @@ mod tests {
         assert!(
             code.contains("kill_stale_installer"),
             "重试之间必须清同名残留安装器进程（运行中的 exe 自锁）"
+        );
+    }
+
+    /// 镜像前缀校验（T14d：Release 资产域名直连 os error 10060，用户可手配加速前缀）。
+    /// 安全边界：只放行 https；拒绝 localhost / 环回 / 私有 / 内网 / 保留地址 / userinfo。
+    #[test]
+    fn mirror_prefix_is_https_and_public_hosts_only() {
+        assert_eq!(validate_mirror_prefix("").unwrap(), "", "空 = 不用镜像");
+        assert_eq!(validate_mirror_prefix("  ").unwrap(), "", "空白同空");
+        assert_eq!(
+            validate_mirror_prefix("https://gh-proxy.example.com/").unwrap(),
+            "https://gh-proxy.example.com",
+            "公网 https 且剥尾斜杠"
+        );
+        for bad in [
+            "http://gh-proxy.example.com/",                    // 非 https
+            "https://user:pass@gh-proxy.example.com/",         // 带 userinfo
+            "https://localhost:8080/",                         // 本机
+            "https://127.0.0.1/",                              // 环回
+            "https://::1/",
+            "https://192.168.1.5/",                            // 私有网段
+            "https://10.1.2.3/",
+            "https://172.16.0.9/",
+            "https://100.64.0.1/",                             // CGNAT
+            "https://169.254.0.1/",                            // 链路本地
+            "https://[fd00::1]/",                              // ULA
+            "not a url",
+        ] {
+            assert!(validate_mirror_prefix(bad).is_err(), "必须拒绝：{bad}");
+        }
+        // 拼接形态：前缀 + 完整原始 URL（ghproxy 系加速服务通用格式）
+        let raw = format!(
+            "https://{DOWNLOAD_HOST}/{APP_REPO_SLUG}{DOWNLOAD_PATH_PREFIX}v0.9.9/fnOS_0.9.9_x64-setup.exe"
+        );
+        let no_mirror = resolve_download_url(&raw, "").unwrap();
+        assert_eq!(no_mirror, raw, "未配镜像 = 原始地址直连");
+        let mirrored = resolve_download_url(&raw, "https://gh-proxy.example.com/").unwrap();
+        assert!(mirrored.starts_with("https://gh-proxy.example.com/https://github.com/"),
+            "镜像形态 = 前缀 + 原始地址（实测 {mirrored}）");
+        // 原始地址本身仍要过 GitHub 钉死校验（镜像不得洗掉它）
+        assert!(
+            resolve_download_url("https://evil.example.com/anything.exe", "https://gh-proxy.example.com/").is_err(),
+            "镜像不得绕过原始 URL 的 host/路径校验"
         );
     }
 }

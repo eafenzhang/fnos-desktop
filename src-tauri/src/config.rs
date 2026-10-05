@@ -161,6 +161,15 @@ pub struct ShellConfig {
     /// 上限 1440（一天）：手改配置写成天文数字没有意义，`normalize` 会夹住。
     /// 与 `dock_auto_hide` 同一条通道下发（载荷 + 免刷新推送），不需要重建窗口。
     pub keep_alive_minutes: u32,
+    /// T14d：检查更新的**下载加速镜像前缀**（默认空 = 直连 GitHub）。
+    ///
+    /// 为什么需要：Release 资产的下载域名（github.com → objects.githubusercontent.com）
+    /// 在部分网络环境直连超时（实测 os error 10060），而 API 域名可达。配置形如
+    /// `https://your-mirror.example.com/` 的「前缀 + 原始 URL」加速服务后，安装包改为
+    /// 从 `前缀/https://github.com/…` 下载（`updater.rs` 下载前会校验前缀 https 且
+    /// host 非本机/内网/保留地址；加速服务本身由用户选择并自担信任）。
+    /// 只影响**安装包下载**；版本比对 API 仍直连 api.github.com。
+    pub update_mirror_prefix: String,
     pub window: WindowGeom,
 }
 
@@ -173,6 +182,7 @@ impl Default for ShellConfig {
             close_to_tray: true,
             dock_auto_hide: false,
             keep_alive_minutes: 10,
+            update_mirror_prefix: String::new(),
             window: WindowGeom::default(),
         }
     }
