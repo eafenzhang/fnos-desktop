@@ -35,7 +35,7 @@ body {
   flex: 0 0 auto; width: 16px; height: 16px; border: 0; border-radius: 4px;
   background: transparent; color: inherit; line-height: 1;
   font-family: "Segoe Fluent Icons", "Segoe MDL2 Assets", sans-serif;
-  font-size: 13px;
+  font-size: 10px;
   display: none; align-items: center; justify-content: center; cursor: pointer;
 }
 .tab.active .tab-close, .tab:hover .tab-close { display: flex; }
@@ -56,7 +56,7 @@ body {
   width: 46px; border: 0; border-radius: 0; padding: 0;
   background: transparent; color: var(--fg); cursor: pointer;
   font-family: "Segoe Fluent Icons", "Segoe MDL2 Assets", "Arial Unicode MS", sans-serif;
-  font-size: 13px; /* 视觉字形 ≈10px，与 Windows 11 系统 caption 按钮一致（16px 实测偏大） */
+  font-size: 10px; /* 用户定值：10px（16 → 13 → 12 → 10 的三轮反馈收敛） */
   line-height: 1;
   display: flex; align-items: center; justify-content: center;
 }
