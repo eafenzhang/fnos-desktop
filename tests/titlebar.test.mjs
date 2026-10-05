@@ -164,6 +164,14 @@ test('纪律：不碰页面内容、高度 32 跨语言一致、授权面精确'
   assert.ok(TB_CSS.includes('"Segoe Fluent Icons"') && TB_CSS.includes('"Segoe MDL2 Assets"'),
     '窗口按钮必须用系统图标字体（与 Windows 标题栏同款字形）');
   assert.ok(TB_CSS.includes('width: 46px'), '按钮宽度必须与系统标题栏一致（46px）');
+  // 标签固定 144px（用户定值）：关闭钮常显（空间常驻）、标题 flex 截断省略号
+  assert.ok(TB_CSS.includes('width: 144px; min-width: 144px; max-width: 144px;'),
+    '标签必须固定 144px 宽');
+  assert.ok(TB_CSS.includes('flex: 1 1 auto; min-width: 0;') &&
+    TB_CSS.includes('text-overflow: ellipsis'),
+    '标题必须在预留空间内省略号截断');
+  assert.ok(!/\.tab \.tab-close \{[^}]*display: none/.test(TB_CSS),
+    '关闭钮必须常显（空间常驻，hover 时标题不跳动）');
   // 授权面：三个标签页命令 + 窗口控制 + 拖拽，别无其它
   const cap = JSON.parse(readFileSync(new URL('../src-tauri/capabilities/titlebar.json', import.meta.url), 'utf8'));
   assert.deepEqual(cap.webviews, ['titlebar']);
