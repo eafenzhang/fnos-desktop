@@ -22,7 +22,7 @@ body {
 .titlebar {
   height: 32px; display: flex; align-items: center; gap: 4px;
   padding: 0 0 0 6px; background: var(--bar-bg);
-  border-bottom: 1px solid var(--bar-line);
+  /* 不画底部分隔线（用户要求）：标签栏与页面内容之间不加边框 */
 }
 /* 「桌面」元素（最左，修复轮 6）：fnOS 品牌图标 + NAS 名称合并为一体，
  * 点击回到桌面标签；激活时高亮，永远不可关闭（main 不渲染关闭钮）。 */
