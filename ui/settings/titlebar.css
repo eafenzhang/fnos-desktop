@@ -1,5 +1,7 @@
-/* 一行式标题栏（T14d 修复轮 3）：左边标签 + 新建，右边 Windows 系统默认观感的 ─ □ ×。
- * 高度由 Rust 侧 TAB_STRIP_H 决定（40 逻辑像素），这里保持一致。 */
+/* 一行式标题栏（T14d 修复轮 5）：左品牌图标（回桌面）+ 标签 + 新建，右边 Windows
+ * 系统默认观感的 ─ □ ×。
+ * 高度由 Rust 侧 TAB_STRIP_H 决定（32 逻辑像素 = Windows 11 caption 高度，用户反馈
+ * 40 太高压成 32），这里保持一致。 */
 :root {
   color-scheme: dark;
   --bar-bg: #1b1c1e;
@@ -14,43 +16,53 @@
 html, body { height: 100%; }
 body {
   margin: 0; overflow: hidden;
-  font: 12px/1 "Microsoft YaHei", system-ui, sans-serif;
+  font: 11px/1 "Microsoft YaHei", system-ui, sans-serif;
   color: var(--fg);
 }
 .titlebar {
-  height: 40px; display: flex; align-items: center; gap: 4px;
+  height: 32px; display: flex; align-items: center; gap: 4px;
   padding: 0 0 0 6px; background: var(--bar-bg);
   border-bottom: 1px solid var(--bar-line);
 }
-.tabs { display: flex; align-items: center; gap: 2px; min-width: 0; overflow: hidden; }
+/* 品牌图标（最左）：点击回到桌面标签 */
+#brand {
+  flex: 0 0 auto; width: 28px; height: 24px; border: 0; border-radius: 6px;
+  background: transparent; cursor: pointer; padding: 0;
+  display: flex; align-items: center; justify-content: center;
+}
+#brand:hover { background: var(--tab-active); }
+#brand img { width: 16px; height: 16px; display: block; pointer-events: none; }
+.tabs { display: flex; align-items: center; gap: 6px; min-width: 0; overflow: hidden; }
 .tab {
   display: flex; align-items: center; gap: 6px; min-width: 0;
-  max-width: 180px; height: 28px; padding: 0 8px;
+  max-width: 180px; height: 24px; padding: 0 9px;
   border-radius: 6px; color: var(--dim); background: transparent; cursor: pointer;
 }
 .tab.active { background: var(--tab-active); color: var(--fg); }
 .tab:not(.active):hover { background: color-mix(in srgb, var(--tab-active) 55%, transparent); }
-.tab .tab-title { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tab .tab-title {
+  font-size: 11px; /* 用户反馈 12px 太大 */
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
 .tab .tab-close {
-  flex: 0 0 auto; width: 16px; height: 16px; border: 0; border-radius: 4px;
+  flex: 0 0 auto; width: 13px; height: 13px; border: 0; border-radius: 3px;
   background: transparent; color: inherit; line-height: 1;
   font-family: "Segoe Fluent Icons", "Segoe MDL2 Assets", sans-serif;
-  font-size: 10px;
+  font-size: 8px; /* 用户反馈：关闭 icon 调小 */
   display: none; align-items: center; justify-content: center; cursor: pointer;
 }
 .tab.active .tab-close, .tab:hover .tab-close { display: flex; }
 .tab .tab-close:hover { background: var(--close-hover); color: #fff; }
 .new-tab {
-  flex: 0 0 auto; width: 24px; height: 24px; border: 0; border-radius: 6px;
-  background: transparent; color: var(--fg); font-size: 14px; cursor: pointer;
+  flex: 0 0 auto; width: 22px; height: 22px; border: 0; border-radius: 5px;
+  background: transparent; color: var(--fg); font-size: 13px; cursor: pointer;
 }
 .new-tab:hover { background: var(--tab-active); }
 /* 空白区域全是拖拽区（data-tauri-drag-region 由授权的 start-dragging 承接） */
 .drag-fill { flex: 1 1 auto; align-self: stretch; cursor: default; }
 /* 窗口控制：**与系统标题栏一致**（T14d 修复轮 4）——46px 整高按钮 + 系统图标字体
  * （Segoe Fluent Icons / Segoe MDL2 Assets 与 Windows 标题栏同款字形、同码点），
- * 右对齐、悬停浅灰、关闭悬停红（Windows 11 观感）。字形比早先的文本字符 ─□× 明显
- * 更大更粗（用户反馈「icon 太小」）。 */
+ * 右对齐、悬停浅灰、关闭悬停红（Windows 11 观感）。字形 10px（用户定值）。 */
 .controls { display: flex; align-items: stretch; flex: 0 0 auto; align-self: stretch; }
 .controls .win-btn {
   width: 46px; border: 0; border-radius: 0; padding: 0;

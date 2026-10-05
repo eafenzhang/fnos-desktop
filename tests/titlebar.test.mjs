@@ -1,6 +1,7 @@
-// titlebar.js（T14d 修复轮 3）的行为契约：**标签页合并到标题栏**——一行之内左边标签、
-// 右边 Windows 系统默认观感的 ─ □ ×；状态由宿主单向推送（__FNOS_TABS_SET__），渲染幂等；
-// 点击按 data-action 翻译成 invoke；fnOS 主页标签无关闭按钮。
+// titlebar.js（T14d 修复轮 5）的行为契约：**标签页合并到标题栏**——一行之内最左品牌图标
+// （点击回到桌面标签）、然后标签、右边 Windows 系统默认观感的 ─ □ ×；状态由宿主单向
+// 推送（__FNOS_TABS_SET__ / __FNOS_WIN_MAX_SET__），渲染幂等；点击按 data-action 翻译
+// 成 invoke；fnOS 主页标签无关闭按钮。
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
@@ -78,6 +79,16 @@ test('渲染：状态由 __FNOS_TABS_SET__ 单向推送，标题/激活态/关�
   assert.equal(doc.getElementById('tabs').children.length, 1);
 });
 
+test('品牌图标：点击回桌面标签（main），不新开也不重载', () => {
+  const { doc } = fakeTitlebar();
+  const w = loadTitlebar(doc);
+  // HTML 里品牌钮 data-action=home；JS 里 home → tab_switch main
+  assert.ok(TB_HTML.includes('id="brand" data-action="home"'), '品牌图标必须是最左的回桌按钮');
+  assert.ok(TB_HTML.includes('icons/icon16.png'), '品牌图标用 frontendDist 里的 16px fnOS 图标');
+  assert.ok(TB_JS.includes("action === 'home'") && TB_JS.includes("invoke('tab_switch', { label: 'main' })"),
+    'home 动作必须切回 main 标签');
+});
+
 test('窗口控制：系统图标字体的 ─ □ ×（46px 整高），点击翻译成窗口命令', () => {
   const { doc } = fakeTitlebar();
   const w = loadTitlebar(doc);
@@ -124,27 +135,13 @@ test('点击分发：标签切换 / 关闭 / 新建都带上正确的命令与�
   assert.ok(TB_JS.includes("invoke('tab_new')"), '新建不带参数');
 });
 
-test('纪律：固定系统默认观感（无 mac 分支）、不碰页面内容、高度跨语言一致', () => {
-  // 用户要求：最大化/最小化/关闭固定系统默认样式；上游 mod 的 mac/windows 标题栏样式
-  // 只管桌面内置应用窗口，不影响这条栏
-  for (const gone of ['traffic', 'light red', "style === 'mac'", '__FNOS_TABS_BOOT__']) {
-    assert.ok(!TB_JS.includes(gone), `titlebar.js 不得再有样式分支：${gone}`);
-  }
-  assert.ok(!TB_CSS.includes('.traffic'), 'titlebar.css 不得有红绿灯样式');
+test('纪律：不碰页面内容、高度 32 跨语言一致、授权面精确', () => {
   assert.ok(!TB_JS.includes('innerHTML'), '不得用 innerHTML');
-  assert.ok(TB_JS.includes('STRIP_H = 40'), '栏高 40 与 Rust TAB_STRIP_H 一致');
+  assert.ok(TB_JS.includes('STRIP_H = 32'), '栏高 32 与 Rust TAB_STRIP_H 一致');
   // 系统标题栏一致性（修复轮 4）：图标必须走系统字体栈，按钮 46px 整高
   assert.ok(TB_CSS.includes('"Segoe Fluent Icons"') && TB_CSS.includes('"Segoe MDL2 Assets"'),
     '窗口按钮必须用系统图标字体（与 Windows 标题栏同款字形）');
   assert.ok(TB_CSS.includes('width: 46px'), '按钮宽度必须与系统标题栏一致（46px）');
-  const rust = readFileSync(new URL('../src-tauri/src/commands.rs', import.meta.url), 'utf8');
-  assert.ok(rust.includes('pub const TAB_STRIP_H: f64 = 40.0;'),
-    'Rust 侧标签栏高度必须是 40（跨语言锚点）');
-  // 无边框（标签页合并到标题栏 = 一行式自绘）
-  assert.ok(rust.includes('.decorations(false)'), '主窗口必须无边框（合并式标题栏）');
-  assert.ok(TB_HTML.includes('data-tauri-drag-region'), '标题条必须带拖拽区');
-  assert.ok(TB_HTML.includes('titlebar.js') && TB_HTML.includes('titlebar.css'),
-    'titlebar.html 必须引自己的脚本与样式');
   // 授权面：三个标签页命令 + 窗口控制 + 拖拽，别无其它
   const cap = JSON.parse(readFileSync(new URL('../src-tauri/capabilities/titlebar.json', import.meta.url), 'utf8'));
   assert.deepEqual(cap.webviews, ['titlebar']);

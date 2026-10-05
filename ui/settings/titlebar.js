@@ -18,7 +18,7 @@
 
   var W = typeof window !== 'undefined' ? window : globalThis;
   var D = W.document || (typeof document !== 'undefined' ? document : null);
-  var STRIP_H = 40; // 与 Rust 侧 TAB_STRIP_H 一致（有跨语言断言）
+  var STRIP_H = 32; // 与 Rust 侧 TAB_STRIP_H 一致（有跨语言断言；= Windows 11 caption 高度）
 
   // 系统标题栏同款字形：Segoe Fluent Icons（Win11）与 Segoe MDL2 Assets（Win10）共用
   // 这些码点，字体栈在 CSS 里逐级回落。字符就是私用区码点本身（U+E921/E922/E923/E8BB，
@@ -108,6 +108,11 @@
     }
     if (!el || !el.dataset || !el.dataset.action) return;
     var action = el.dataset.action;
+    if (action === 'home') {
+      // 品牌图标：回到桌面标签（main），不新开、不重载
+      invoke('tab_switch', { label: 'main' });
+      return;
+    }
     if (action === 'tab-new') {
       invoke('tab_new');
       return;

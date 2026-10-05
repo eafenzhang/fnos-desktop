@@ -20,8 +20,9 @@ pub const SETTINGS_WINDOW: &str = "settings";
 pub const TITLEBAR_WEBVIEW: &str = "titlebar";
 
 /// 标签页栏高度（逻辑像素）：所有标签页 Webview 从这条栏的下缘开始铺。
+/// 32 = Windows 11 caption 高度（用户反馈 40 太高后定值）。
 /// 前端 `ui/settings/titlebar.js` 的 `STRIP_H` 与这里必须一致（有跨语言断言）。
-pub const TAB_STRIP_H: f64 = 40.0;
+pub const TAB_STRIP_H: f64 = 32.0;
 
 /// 内置错误页的资产名（相对 `tauri.conf.json` 的 `frontendDist` = `../ui/settings`）。
 ///

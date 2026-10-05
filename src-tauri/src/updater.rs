@@ -198,19 +198,66 @@ fn download_installer(download_url: &str, file_name: &str) -> Result<std::path::
     Ok(dest)
 }
 
-/// 静默安装：NSIS `/S` + `/R`（装完自动重启应用）。tauri 的 NSIS 模板在静默模式下
-/// 会先结束正在运行的旧进程，所以文件锁不构成问题；这里再兜一层——800ms 后主动退出。
-fn start_install<R: Runtime>(app: &AppHandle<R>, installer: &std::path::Path) -> Result<(), String> {
-    #[cfg(windows)]
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let mut cmd = std::process::Command::new(installer);
-    cmd.arg("/S").arg("/R");
+/// 启动安装器时的瞬态文件锁对策（T14d 实测缺陷，用户截图「os error 32」）：
+/// ① 刚下载完的安装包会被杀毒 / Defender 短暂扫描锁定（用户点「确定」时扫描可能未结束）；
+/// ② 上一次启动的安装器实例没退干净——运行中的 exe 文件本身就是锁。
+/// 对策：结束同名残留安装器进程 + 有界重试；仍失败才如实报错（附手动运行的建议）。
+const INSTALL_SPAWN_TRIES: u32 = 3;
+const INSTALL_SPAWN_RETRY_DELAY_MS: u64 = 1500;
+
+/// 结束与安装包**同名**的残留安装器进程（运行中的 exe 文件被自己锁着）。
+/// taskkill 按映像名精确匹配我们的安装包文件名（`fnOS_x.y.z_x64-setup.exe`），
+/// 不会碰到别的进程；找不到该进程时 taskkill 非零码退出——无所谓。
+fn kill_stale_installer(installer: &std::path::Path) {
+    let Some(name) = installer.file_name().and_then(|n| n.to_str()) else {
+        return;
+    };
+    let mut cmd = std::process::Command::new("taskkill");
+    cmd.args(["/F", "/IM", name]);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        cmd.creation_flags(CREATE_NO_WINDOW); // 静默安装本就无窗口，这里兜住控制台闪现
+        cmd.creation_flags(CREATE_NO_WINDOW);
     }
-    cmd.spawn().map_err(|e| format!("启动安装器失败：{e}"))?;
+    let _ = cmd.spawn();
+}
+
+/// 带重试地启动安装器（`/S` 静默 + `/R` 装完自动重启）。每次失败后：结束同名残留
+/// 进程 → 等 [`INSTALL_SPAWN_RETRY_DELAY_MS`] → 再试；[`INSTALL_SPAWN_TRIES`] 次仍失败
+/// 才把错误交回调用方（弹窗里会带上手动运行的路径建议）。
+fn spawn_installer_with_retry(installer: &std::path::Path, retry_delay: std::time::Duration) -> Result<(), String> {
+    let mut last: Option<std::io::Error> = None;
+    for attempt in 1..=INSTALL_SPAWN_TRIES {
+        let mut cmd = std::process::Command::new(installer);
+        cmd.arg("/S").arg("/R");
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(CREATE_NO_WINDOW); // 静默安装本就无窗口，兜住控制台闪现
+        }
+        match cmd.spawn() {
+            Ok(_) => return Ok(()),
+            Err(e) => {
+                last = Some(e);
+                if attempt < INSTALL_SPAWN_TRIES {
+                    kill_stale_installer(installer);
+                    std::thread::sleep(retry_delay);
+                }
+            }
+        }
+    }
+    Err(format!(
+        "重试 {} 次仍无法启动安装器：{}（安装包可能被杀毒软件或上一次安装进程占用）",
+        INSTALL_SPAWN_TRIES,
+        last.map(|e| e.to_string()).unwrap_or_else(|| "未知错误".into())
+    ))
+}
+
+/// 静默安装：NSIS `/S` + `/R`（装完自动重启应用）。tauri 的 NSIS 模板在静默模式下
+/// 会先结束正在运行的旧进程，所以文件锁不构成问题；这里再兜一层——800ms 后主动退出。
+fn start_install<R: Runtime>(app: &AppHandle<R>, installer: &std::path::Path) -> Result<(), String> {
+    spawn_installer_with_retry(installer, std::time::Duration::from_millis(INSTALL_SPAWN_RETRY_DELAY_MS))
+        .map_err(|e| format!("{e}（安装包路径：{}；也可以稍后在文件管理器里手动运行它）", installer.display()))?;
     // 安装器（onInit 阶段）会结束本进程；万一没结束，这里主动退，把文件锁让出来。
     std::thread::sleep(std::time::Duration::from_millis(800));
     save_window_geom(app);
@@ -313,6 +360,10 @@ const MB_ICON_INFO: u32 = 0x40; // MB_ICONINFORMATION
 const MB_ICON_WARNING: u32 = 0x30; // MB_ICONWARNING
 const MB_OKCANCEL: u32 = 0x1;
 const ID_OK: i32 = 1;
+
+/// 子进程不闪控制台窗口（taskkill / 安装器 spawn 共用）。
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// 弹一个原生消息框（阻塞直到用户关闭；`MB_TOPMOST` 保证不被主窗口压在底下）。
 /// 返回被点击的按钮 ID（`MB_OKCANCEL` 时用于区分确定/取消）。
@@ -455,6 +506,31 @@ mod tests {
         assert!(
             !code.contains("releases/latest\") // 打开页面") && !code.contains("open_in_browser"),
             "不得退回「打开发布页」的旧方案"
+        );
+    }
+
+    /// 安装器启动重试（T14d 实测：os error 32 = 文件被占用——杀毒扫描/上次安装进程残留）。
+    #[test]
+    fn spawn_installer_retries_then_reports_clearly() {
+        // 不存在的路径：每次 spawn 都失败 → 走满重试 → 错误信息带次数与原因
+        let missing = std::env::temp_dir().join(format!("fnos-no-installer-{}.exe", std::process::id()));
+        let err = spawn_installer_with_retry(&missing, std::time::Duration::ZERO).unwrap_err();
+        assert!(err.contains("3 次"), "错误信息必须说明重试次数：{err}");
+        assert!(err.contains("os error"), "错误信息必须带上底层原因：{err}");
+        assert!(
+            err.contains("杀毒软件") || err.contains("占用"),
+            "错误信息必须提示占用来源：{err}"
+        );
+        let src = include_str!("updater.rs");
+        let code_end = src.find("#[cfg(test)]").unwrap();
+        let code = &src[..code_end];
+        assert!(
+            code.contains("安装包路径：{}"),
+            "start_install 的错误必须带安装包路径（用户手动运行的后路）"
+        );
+        assert!(
+            code.contains("kill_stale_installer"),
+            "重试之间必须清同名残留安装器进程（运行中的 exe 自锁）"
         );
     }
 }
