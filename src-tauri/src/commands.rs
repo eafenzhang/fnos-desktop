@@ -659,7 +659,10 @@ fn build_main_window_with<R: Runtime>(
         // 都经过它（`load` / `set_config` / `reset_config` / `reload_main` /
         // `save_window_geom`），所以这里不会再拿到 `0x0` 或负数。
         .inner_size(cfg.shell.window.w, cfg.shell.window.h)
-        // T14d：无边框——标题栏由 `titlebar` Webview 自绘（标签条 + 窗口控制 + 拖拽区）。
+        // T14d 修复轮 3（用户要求「标签页合并到标题栏」）：**无边框 + 一行式自绘标题栏**——
+        // 标签与窗口控制（─ □ ×，系统默认观感）同处一条 40px 的栏里，不再有单独的原生
+        // 标题行。窗口控制由 titlebar Webview 的按钮经授权的窗口命令承担；拖拽区是栏内
+        // 空白。桌面内置应用窗口的样式仍由上游 mod 的「标题栏样式」设置接管，与本栏无关。
         .decorations(false);
     // 位置建窗时就带上（T14c 修复轮 20）：不让窗口先在 OS 默认位置落脚再跳。
     match (cfg.shell.window.x, cfg.shell.window.y) {
@@ -676,18 +679,10 @@ fn build_main_window_with<R: Runtime>(
     // 标签页状态复位：重建出来的窗口永远只有一个 `main` 标签（T14d）。
     *app.state::<AppState>().tabs.lock().unwrap() = TabState::with_main();
 
-    // —— 标签页栏（自绘标题栏）：本地资产页，无注入、无上报通道，授权面见
-    //    `capabilities/titlebar.json`（窗口控制 + 三个标签页命令，仅此而已）。
+    // —— 标签页栏：本地资产页，无注入、无上报通道，授权面见
+    //    `capabilities/titlebar.json`（拖拽 + 三个标签页命令，仅此而已）。
     let (lw, lh) = logical_inner_size(&window)?;
-    let style = if cfg.mods.titlebar_style == "mac" {
-        TITLEBAR_STYLE_MAC
-    } else {
-        TITLEBAR_STYLE_WINDOWS
-    };
-    let titlebar = WebviewBuilder::new(TITLEBAR_WEBVIEW, WebviewUrl::App("titlebar.html".into()))
-        .initialization_script(format!(
-            "window.__FNOS_TABS_BOOT__ = {{ style: '{style}' }};"
-        ));
+    let titlebar = WebviewBuilder::new(TITLEBAR_WEBVIEW, WebviewUrl::App("titlebar.html".into()));
     window.add_child(
         titlebar,
         LogicalPosition::new(0.0, 0.0),
@@ -722,11 +717,6 @@ fn build_main_window_with<R: Runtime>(
     push_tabs(app);
     Ok(window)
 }
-
-/// 标签页栏的主题形态（与上游 mods 的 `titlebarStyle` 同源：mac = 控制在左的「红绿灯」，
-/// windows = 控制在右）。值域与 `ui/settings/titlebar.js` 的渲染分支逐字一致。
-pub const TITLEBAR_STYLE_MAC: &str = "mac";
-pub const TITLEBAR_STYLE_WINDOWS: &str = "windows";
 
 /// 窗口内容区的**逻辑**尺寸（物理 / 缩放），供子 Webview 摆位用。
 fn logical_inner_size<R: Runtime>(window: &tauri::Window<R>) -> Result<(f64, f64), tauri::Error> {
@@ -1029,8 +1019,9 @@ fn build_error_window<R: Runtime>(
 ) -> tauri::Result<tauri::Window<R>> {
     set_error_state(app, info);
     let payload = serde_json::to_string(info).unwrap_or_else(|_| "{}".into());
-    // T14d：错误页与主窗口同构 —— 无边框 Window + 标签页栏 Webview + 内容 Webview
-    // （错误页内容就是 `main` 标签，只是加载的是本地错误资产、且**没有任何注入**）。
+    // T14d：错误页与主窗口同构 —— 无边框 Window + 一行式标题栏 Webview（标签 +
+    // ─ □ ×）+ 内容 Webview（错误页内容就是 `main` 标签，只是加载的是本地错误资产、
+    // 且**没有任何注入**）。
     let mut builder = WindowBuilder::new(app, MAIN_WINDOW)
         .title("fnOS — 页面加载失败")
         .inner_size(cfg.shell.window.w, cfg.shell.window.h)
@@ -1048,14 +1039,8 @@ fn build_error_window<R: Runtime>(
     }
     let window = builder.build()?;
     *app.state::<AppState>().tabs.lock().unwrap() = TabState::with_main();
-    let style = if cfg.mods.titlebar_style == "mac" {
-        TITLEBAR_STYLE_MAC
-    } else {
-        TITLEBAR_STYLE_WINDOWS
-    };
     let (lw, lh) = logical_inner_size(&window)?;
-    let titlebar = WebviewBuilder::new(TITLEBAR_WEBVIEW, WebviewUrl::App("titlebar.html".into()))
-        .initialization_script(format!("window.__FNOS_TABS_BOOT__ = {{ style: '{style}' }};"));
+    let titlebar = WebviewBuilder::new(TITLEBAR_WEBVIEW, WebviewUrl::App("titlebar.html".into()));
     window.add_child(
         titlebar,
         LogicalPosition::new(0.0, 0.0),
@@ -2236,6 +2221,12 @@ pub fn save_window_geom<R: Runtime>(app: &AppHandle<R>) {
     if win.is_minimized().unwrap_or(false) {
         return;
     }
+    // 最大化时同样**不能**保存几何（T14d 实测）：`inner_size` 报的是最大化后的尺寸、
+    // `outer_position` 报 (0,0)——存下去下次启动就是一个近似全屏的「普通」窗口
+    //（实测：最大化退出 → config 被写成 1936×1018）。跳过保存即保留上一次的普通态几何。
+    if win.is_maximized().unwrap_or(false) {
+        return;
+    }
     let Ok(size) = win.inner_size() else {
         return;
     };
@@ -3211,7 +3202,9 @@ mod tests {
             close_body.contains("if label == MAIN_WINDOW"),
             "tab_close 必须拒绝关闭 fnOS 主页标签"
         );
-        // 标签条授权只给 titlebar；各标签页承载的第三方页面没有任何授权
+        // 标签条授权只给 titlebar；各标签页承载的第三方页面没有任何授权。
+        // 修复轮 3（用户要求「标签页合并到标题栏」）：右上 ─ □ × 在一行式栏内，
+        // 窗口控制权限回到标签条（系统默认观感的自绘按钮）。
         let cap = include_str!("../capabilities/titlebar.json");
         assert!(cap.contains("\"titlebar\""), "能力必须只授 titlebar Webview");
         for perm in [
@@ -3229,25 +3222,33 @@ mod tests {
             !cap.contains("allow-get-config") && !cap.contains("allow-open-url"),
             "标签页栏不得得到任何应用命令授权"
         );
-        // 标签条前端：拖拽区 + 标签页/窗口命令 + 状态推送口（跨语言锚点）
+        // 标签条前端：拖拽区 + 标签页命令 + 窗口命令 + 状态推送口（跨语言锚点）
         let tb_js = include_str!("../../ui/settings/titlebar.js");
         for needle in [
             "data-tauri-drag-region",
             "tab_new",
             "tab_switch",
             "tab_close",
+            "__FNOS_TABS_SET__",
             "plugin:window|minimize",
             "plugin:window|toggle_maximize",
             "plugin:window|close",
-            "__FNOS_TABS_SET__",
         ] {
             assert!(tb_js.contains(needle), "标签条脚本缺少：{needle}");
+        }
+        // 系统默认观感：不跟随上游 mod 的标题栏样式（红绿灯 / 样式开关一律没有）
+        for gone in ["traffic", "__FNOS_TABS_BOOT__", "TITLEBAR_STYLE_MAC"] {
+            assert!(!tb_js.contains(gone), "标签条脚本不得有样式分支：{gone}");
         }
         assert!(!tb_js.contains("innerHTML"), "标签条脚本不得用 innerHTML");
         let tb_html = include_str!("../../ui/settings/titlebar.html");
         assert!(
             tb_html.contains("data-tauri-drag-region"),
             "标签条 HTML 必须带拖拽区"
+        );
+        assert!(
+            tb_html.contains("id=\"controls\""),
+            "一行式标题栏必须带窗口控制区（用户要求合并）"
         );
     }
 }

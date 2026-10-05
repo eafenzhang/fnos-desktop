@@ -1,16 +1,15 @@
-/* fnOS Desktop — 自绘标题栏（标签条 + 窗口控制）的渲染与指令分发（T14d）。
+/* fnOS Desktop — 一行式标题栏（标签 + 窗口控制）的渲染与指令分发（T14d 修复轮 3）。
  *
  * 这个脚本跑在 `titlebar` Webview 里（主窗口顶部 TAB_STRIP_H 高的一条）。状态由宿主
  * （Rust `commands::push_tabs`）通过 `__FNOS_TABS_SET__` 推送——它是**单向**的：本脚本
  * 不维护任何状态，只渲染最近一次推送，并把用户点击翻译成 invoke 命令。
  *
- * 主题形态（mac / windows）由建窗时的初始化脚本给（`__FNOS_TABS_BOOT__.style`）：
- *   mac     —— 左侧红绿灯（关闭 / 最小化 / 最大化），标签随后；
- *   windows —— 标签在左、`─ □ ×` 在右。
- * 与上游 mods 的 `titlebarStyle` 同源，桌面里的窗口长什么样，这条栏就长什么样。
+ * 用户要求（修复轮 2 + 3）：最大化 / 最小化 / 关闭用**系统默认样式**——右对齐的
+ * ─ □ ×（Windows 11 原生观感：悬停浅灰、关闭悬停红），固定不变、不跟随上游 mod 的
+ * 标题栏样式；桌面内置应用窗口的样式仍由上游 mod 的「标题栏样式」设置接管。
  *
- * 命令授权（capabilities/titlebar.json）：tab_new / tab_switch / tab_close +
- * 窗口的 minimize / toggle_maximize / close + 拖拽（data-tauri-drag-region）。
+ * 命令授权（capabilities/titlebar.json）：tab_new / tab_switch / tab_close + 窗口的
+ * minimize / toggle_maximize / close + 拖拽（data-tauri-drag-region）。
  * 除这些之外没有任何能力——这里连配置都读不到。
  */
 (function () {
@@ -41,6 +40,7 @@
       item.className = 'tab' + (tab.active ? ' active' : '');
       item.dataset.tabId = String(tab.id);
       item.dataset.action = 'switch';
+      item.title = String(tab.title == null ? tab.id : tab.title);
       var title = D.createElement('span');
       title.className = 'tab-title';
       title.textContent = String(tab.title == null ? tab.id : tab.title);
@@ -58,14 +58,15 @@
     });
   }
 
-  /** 渲染窗口控制区（按 body.mac 分支：红绿灯在左，否则 ─ □ × 在右）。 */
-  function renderControls(style) {
+  /**
+   * 窗口控制区（**系统默认观感**，固定 windows 形态）：右对齐 ─ □ ×。
+   * 关闭走主窗口的 CloseRequested：照样服从 closeToTray（收起而不是退出）。
+   */
+  function renderControls() {
     var host = D.getElementById('controls');
     if (!host) return;
     host.textContent = '';
-    var mac = style === 'mac';
-    D.body.classList.toggle('mac', mac);
-    var button = (cls, glyph, action, title) => {
+    var button = function (cls, glyph, action, title) {
       var b = D.createElement('button');
       b.className = cls;
       b.dataset.action = action;
@@ -73,22 +74,6 @@
       b.title = title;
       host.appendChild(b);
     };
-    if (mac) {
-      var group = D.createElement('div');
-      group.className = 'traffic';
-      var light = (color, action, title) => {
-        var l = D.createElement('button');
-        l.className = 'light ' + color;
-        l.dataset.action = action;
-        l.title = title;
-        group.appendChild(l);
-      };
-      light('red', 'close', '关闭');
-      light('yellow', 'minimize', '最小化');
-      light('green', 'maximize', '最大化 / 还原');
-      host.appendChild(group);
-      return;
-    }
     button('win-btn', '─', 'minimize', '最小化');
     button('win-btn', '□', 'maximize', '最大化 / 还原');
     button('win-btn close', '×', 'close', '关闭');
@@ -97,7 +82,7 @@
   /** 点击分发：`data-action` → invoke。close/switch 带上所在标签的 id。 */
   function onClick(ev) {
     var el = ev.target;
-    while (el && el !== D.body && !el.dataset.action) {
+    while (el && el !== D.body && !(el.dataset && el.dataset.action)) {
       el = el.parentElement;
     }
     if (!el || !el.dataset || !el.dataset.action) return;
@@ -111,9 +96,9 @@
       if (tabId) invoke('tab_switch', { label: tabId });
       return;
     }
-    if (action === 'close') {
-      var closeId = el.dataset.tabId || (el.closest('.tab') && el.closest('.tab').dataset.tabId);
-      if (closeId) invoke('tab_close', { label: closeId });
+    if (action === 'close' && el.dataset.tabId) {
+      // 标签页上的 ×：关的是那个标签
+      invoke('tab_close', { label: el.dataset.tabId });
       return;
     }
     if (action === 'minimize') {
@@ -125,7 +110,7 @@
       return;
     }
     if (action === 'close') {
-      // 关闭走主窗口的 CloseRequested：照样服从 closeToTray（收起而不是退出）
+      // 窗口 ×：走主窗口的 CloseRequested，照样服从 closeToTray
       invoke('plugin:window|close');
     }
   }
@@ -138,14 +123,12 @@
     var bar = D.getElementById('titlebar');
     if (!bar) return; // 没有宿主结构就什么都不做（单测环境）
     bar.style.height = STRIP_H + 'px';
-    var boot = window.__FNOS_TABS_BOOT__ || {};
-    renderControls(boot.style === 'mac' ? 'mac' : 'windows');
+    renderControls();
     D.addEventListener('click', onClick);
-    // 双击空白区 = 最大化 / 还原（拖拽区自身的标准语义）
+    // 双击标签条空白区 = 最大化 / 还原（系统标题栏的标准语义）
     bar.addEventListener('dblclick', function (ev) {
       if (ev.target.dataset && ev.target.dataset.action) return;
-      var inTabs = ev.target.closest && ev.target.closest('.tabs');
-      if (inTabs) return;
+      if (ev.target.closest && ev.target.closest('.tabs')) return;
       invoke('plugin:window|toggle_maximize');
     });
   }

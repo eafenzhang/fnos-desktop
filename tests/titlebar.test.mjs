@@ -1,5 +1,6 @@
-// titlebar.js（T14d）的行为契约：状态由宿主单向推送（__FNOS_TABS_SET__），渲染幂等；
-// 点击按 data-action 翻译成 invoke；mac / windows 两种标题栏形态；fnOS 主页标签无关闭按钮。
+// titlebar.js（T14d 修复轮 3）的行为契约：**标签页合并到标题栏**——一行之内左边标签、
+// 右边 Windows 系统默认观感的 ─ □ ×；状态由宿主单向推送（__FNOS_TABS_SET__），渲染幂等；
+// 点击按 data-action 翻译成 invoke；fnOS 主页标签无关闭按钮。
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
@@ -40,10 +41,9 @@ function fakeTitlebar() {
   return { doc, bar, events };
 }
 
-function loadTitlebar(doc, boot = {}) {
+function loadTitlebar(doc) {
   const win = {
     document: doc,
-    __FNOS_TABS_BOOT__: boot,
     _invokes: [],
     __TAURI_INTERNALS__: {
       invoke(cmd, args) { win._invokes.push([cmd, args]); },
@@ -78,33 +78,23 @@ test('渲染：状态由 __FNOS_TABS_SET__ 单向推送，标题/激活态/关�
   assert.equal(doc.getElementById('tabs').children.length, 1);
 });
 
-test('windows 形态：─ □ × 三个控制钮 + 各自的窗口命令', () => {
+test('窗口控制：─ □ × 右对齐（系统默认观感），点击翻译成窗口命令', () => {
   const { doc } = fakeTitlebar();
-  const w = loadTitlebar(doc, { style: 'windows' });
+  const w = loadTitlebar(doc);
+  w.__FNOS_TITLEBAR__.renderControls();
   const controls = doc.getElementById('controls').children;
   assert.deepEqual(controls.map((b) => b.dataset.action), ['minimize', 'maximize', 'close']);
-  assert.equal(doc.body.classList.includes?.('mac'), undefined,
-    'windows 形态不得加 mac class（classList.toggle 语义由真实 DOM 承担）');
-  // 点击 ×：close 走窗口命令（CloseRequested 照样服从 closeToTray）
-  controls[2].dataset.action = 'close';
-  // onClick 走真实源码：直接触发收集到的监听器
-  const click = w.__FNOS_TITLEBAR__; // 仅确认导出口存在
-  assert.ok(click && click.render && click.renderControls);
-});
-
-test('mac 形态：红绿灯在左（红=关 黄=最小 绿=最大）', () => {
-  const { doc } = fakeTitlebar();
-  loadTitlebar(doc, { style: 'mac' });
-  const controls = doc.getElementById('controls').children;
-  assert.equal(controls.length, 1, 'mac 形态渲染一组红绿灯容器');
-  const lights = controls[0].children;
-  assert.deepEqual(lights.map((l) => l.className), ['light red', 'light yellow', 'light green']);
-  assert.deepEqual(lights.map((l) => l.dataset.action), ['close', 'minimize', 'maximize']);
+  assert.equal(controls[0].className, 'win-btn');
+  assert.equal(controls[2].className, 'win-btn close', '关闭钮必须带 close class（悬停红）');
+  // 源码级：三条窗口命令
+  for (const cmd of ['plugin:window|minimize', 'plugin:window|toggle_maximize', 'plugin:window|close']) {
+    assert.ok(TB_JS.includes(`invoke('${cmd}')`), `缺少窗口命令：${cmd}`);
+  }
 });
 
 test('点击分发：标签切换 / 关闭 / 新建都带上正确的命令与参数', () => {
   const { doc } = fakeTitlebar();
-  const w = loadTitlebar(doc, { style: 'windows' });
+  const w = loadTitlebar(doc);
   w.__FNOS_TABS_SET__({
     tabs: [
       { id: 'main', title: 'MiniNas', active: true, canClose: false },
@@ -112,28 +102,35 @@ test('点击分发：标签切换 / 关闭 / 新建都带上正确的命令与�
     ],
   });
   const tabs = doc.getElementById('tabs').children;
-  // 标签项有 data-action=switch；关闭钮 data-action=close
   assert.equal(tabs[1].dataset.action, 'switch');
   const closeBtn = tabs[1].children.find((c) => c.className === 'tab-close');
   assert.equal(closeBtn.dataset.action, 'close');
   assert.equal(closeBtn.dataset.tabId, 'tab-3');
-  // 源码级：点击翻译的三条命令名与参数键
+  // 源码级：点击翻译的命令名与参数键
   assert.ok(TB_JS.includes("invoke('tab_switch', { label: tabId })"), '切换带 label');
-  assert.ok(TB_JS.includes("invoke('tab_close', { label: closeId })"), '关闭带 label');
+  assert.ok(TB_JS.includes("invoke('tab_close', { label: el.dataset.tabId })"),
+    '关闭带 label（关的是那个标签）');
   assert.ok(TB_JS.includes("invoke('tab_new')"), '新建不带参数');
 });
 
-test('纪律：脚本不碰页面内容、HTML 带拖拽区、高度常量跨语言一致', () => {
+test('纪律：固定系统默认观感（无 mac 分支）、不碰页面内容、高度跨语言一致', () => {
+  // 用户要求：最大化/最小化/关闭固定系统默认样式；上游 mod 的 mac/windows 标题栏样式
+  // 只管桌面内置应用窗口，不影响这条栏
+  for (const gone of ['traffic', 'light red', "style === 'mac'", '__FNOS_TABS_BOOT__']) {
+    assert.ok(!TB_JS.includes(gone), `titlebar.js 不得再有样式分支：${gone}`);
+  }
+  assert.ok(!TB_CSS.includes('.traffic'), 'titlebar.css 不得有红绿灯样式');
   assert.ok(!TB_JS.includes('innerHTML'), '不得用 innerHTML');
   assert.ok(TB_JS.includes('STRIP_H = 40'), '栏高 40 与 Rust TAB_STRIP_H 一致');
   const rust = readFileSync(new URL('../src-tauri/src/commands.rs', import.meta.url), 'utf8');
   assert.ok(rust.includes('pub const TAB_STRIP_H: f64 = 40.0;'),
     'Rust 侧标签栏高度必须是 40（跨语言锚点）');
+  // 无边框（标签页合并到标题栏 = 一行式自绘）
+  assert.ok(rust.includes('.decorations(false)'), '主窗口必须无边框（合并式标题栏）');
   assert.ok(TB_HTML.includes('data-tauri-drag-region'), '标题条必须带拖拽区');
   assert.ok(TB_HTML.includes('titlebar.js') && TB_HTML.includes('titlebar.css'),
     'titlebar.html 必须引自己的脚本与样式');
-  // 授权面：三个标签页命令 + 窗口操作，别无其它（webviews 字段：capability 的 windows
-  // 匹配的是**窗口** label，titlebar 是主窗口里的 Webview，必须用 webviews）
+  // 授权面：三个标签页命令 + 窗口控制 + 拖拽，别无其它
   const cap = JSON.parse(readFileSync(new URL('../src-tauri/capabilities/titlebar.json', import.meta.url), 'utf8'));
   assert.deepEqual(cap.webviews, ['titlebar']);
   assert.deepEqual(cap.permissions, [
@@ -145,8 +142,6 @@ test('纪律：脚本不碰页面内容、HTML 带拖拽区、高度常量跨语
     'allow-tab-switch',
     'allow-tab-close',
   ]);
-  // CSS 形态锚点：mac 红绿灯的三色与 windows 控制钮
-  for (const needle of ['.light.red', '.light.yellow', '.light.green', '.win-btn.close']) {
-    assert.ok(TB_CSS.includes(needle), `titlebar.css 缺少 ${needle}`);
-  }
+  assert.ok(!cap.permissions.some((p) => p.includes('get-config') || p.includes('open-url')),
+    '标签页栏不得得到任何应用命令授权');
 });

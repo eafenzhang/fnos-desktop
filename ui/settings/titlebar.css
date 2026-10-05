@@ -1,4 +1,4 @@
-/* 自绘标题栏（T14d）：与上游 mods 的深色桌面同一套视觉语言。
+/* 一行式标题栏（T14d 修复轮 3）：左边标签 + 新建，右边 Windows 系统默认观感的 ─ □ ×。
  * 高度由 Rust 侧 TAB_STRIP_H 决定（40 逻辑像素），这里保持一致。 */
 :root {
   color-scheme: dark;
@@ -8,7 +8,6 @@
   --tab-active: #2e3034;
   --fg: #e8e8ea;
   --dim: #8b9096;
-  --accent: rgb(0, 102, 255);
   --close-hover: #e81123;
 }
 * { box-sizing: border-box; user-select: none; }
@@ -20,14 +19,14 @@ body {
 }
 .titlebar {
   height: 40px; display: flex; align-items: center; gap: 4px;
-  padding: 0 6px; background: var(--bar-bg);
+  padding: 0 0 0 6px; background: var(--bar-bg);
   border-bottom: 1px solid var(--bar-line);
 }
 .tabs { display: flex; align-items: center; gap: 2px; min-width: 0; overflow: hidden; }
 .tab {
   display: flex; align-items: center; gap: 6px; min-width: 0;
   max-width: 180px; height: 28px; padding: 0 8px;
-  border-radius: 6px; color: var(--dim); background: transparent;
+  border-radius: 6px; color: var(--dim); background: transparent; cursor: pointer;
 }
 .tab.active { background: var(--tab-active); color: var(--fg); }
 .tab:not(.active):hover { background: color-mix(in srgb, var(--tab-active) 55%, transparent); }
@@ -46,18 +45,11 @@ body {
 .new-tab:hover { background: var(--tab-active); }
 /* 空白区域全是拖拽区（data-tauri-drag-region 由授权的 start-dragging 承接） */
 .drag-fill { flex: 1 1 auto; align-self: stretch; cursor: default; }
-.controls { display: flex; align-items: center; gap: 2px; flex: 0 0 auto; }
+/* 窗口控制：系统默认观感——右对齐、整高按钮、悬停浅灰、关闭悬停红（Windows 11） */
+.controls { display: flex; align-items: stretch; flex: 0 0 auto; align-self: stretch; }
 .controls .win-btn {
-  width: 34px; height: 30px; border: 0; border-radius: 0;
+  width: 46px; border: 0; border-radius: 0; padding: 0;
   background: transparent; color: var(--fg); font-size: 12px; cursor: pointer;
 }
-.controls .win-btn:hover { background: var(--tab-active); }
+.controls .win-btn:hover { background: color-mix(in srgb, var(--fg) 12%, transparent); }
 .controls .win-btn.close:hover { background: var(--close-hover); color: #fff; }
-/* mac 风格：红绿灯在左（body.mac 下 controls 内渲染三颗灯），标签随后 */
-body.mac .titlebar { flex-direction: row; padding-left: 8px; }
-.traffic { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; margin-right: 4px; }
-.traffic .light { width: 12px; height: 12px; border-radius: 50%; border: 0; cursor: pointer; padding: 0; }
-.traffic .light.red { background: #ff5f57; }
-.traffic .light.yellow { background: #febc2e; }
-.traffic .light.green { background: #28c840; }
-.traffic .light:hover { filter: brightness(1.15); }
