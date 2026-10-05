@@ -10,8 +10,9 @@ mod report;
 mod tray;
 mod updater;
 
-// `Manager` 提供 `get_webview_window`（单实例回调）与 `app_handle`（关闭回调）；
-// 建窗用的 `WebviewWindowBuilder` 已集中到 `commands::build_main_window`（首启/重建共用）。
+// `Manager` 提供 `get_window`（单实例回调）与 `app_handle`（关闭回调）；
+// 建窗用的 `WindowBuilder` / `WebviewBuilder` 已集中到 `commands::build_main_window`
+//（首启/重建共用；T14d 起主窗口 = 无边框 Window + 标签页栏/标签页多 Webview）。
 use tauri::Manager;
 
 /// 主窗口 label（spec §7）：main.rs / tray.rs / commands.rs 共用，避免字面量散落。
@@ -20,7 +21,7 @@ pub const MAIN_WINDOW: &str = "main";
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
-            if let Some(w) = app.get_webview_window(MAIN_WINDOW) {
+            if let Some(w) = app.get_window(MAIN_WINDOW) {
                 let _ = w.show();
                 let _ = w.unminimize();
                 let _ = w.set_focus();
@@ -69,6 +70,8 @@ fn main() {
                 }
                 // gap (a)：tauri 的 label 注册表在 `Destroyed` 才释放，新窗口必须在这里建
                 tauri::WindowEvent::Destroyed => commands::on_main_destroyed(app),
+                // T14d：子 Webview 不会随窗口自动重排——最大化 / 还原 / 拖边缘都要重摆。
+                tauri::WindowEvent::Resized(size) => commands::relayout_main_window(window, *size),
                 _ => {}
             }
         })
@@ -100,6 +103,10 @@ fn main() {
             commands::get_local_store,
             commands::set_local_store,
             commands::request_app_items,
+            // T14d：标签页栏（titlebar Webview）专用的三个命令。
+            commands::tab_new,
+            commands::tab_switch,
+            commands::tab_close,
         ])
         .run(tauri::generate_context!())
         .expect("fnOS 启动失败");

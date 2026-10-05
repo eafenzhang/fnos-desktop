@@ -8,7 +8,9 @@ build = "build.rs"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["tray-icon", "image-png"] }
+# T14d：`unstable` 开启多 Webview（`Window::add_child`）——标签页栏 = 独立 Webview，
+# 每个标签页 = 主窗口里的一个子 Webview。这是 tauri 2 对多 Webview 的门（桌面端稳定可用）。
+tauri = { version = "2", features = ["tray-icon", "image-png", "unstable"] }
 tauri-plugin-single-instance = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

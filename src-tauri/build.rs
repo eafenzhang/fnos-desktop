@@ -28,6 +28,10 @@ fn main() {
             "get_local_store",
             "set_local_store",
             "request_app_items",
+            // T14d：标签页栏（titlebar Webview 专用，见 capabilities/titlebar.json）
+            "tab_new",
+            "tab_switch",
+            "tab_close",
         ]),
     ))
     .expect("failed to run tauri-build");

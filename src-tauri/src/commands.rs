@@ -3,14 +3,25 @@
 use crate::{base64, config, config::Config, injector, paths, report, tray, MAIN_WINDOW};
 use serde::Serialize;
 use serde_json::Value;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
-use tauri::webview::PageLoadEvent;
-use tauri::{AppHandle, Manager, Runtime, State, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
+use tauri::webview::{PageLoadEvent, WebviewBuilder};
+use tauri::window::WindowBuilder;
+use tauri::{AppHandle, LogicalPosition, LogicalSize, Manager, Runtime, State, Webview, WebviewUrl, WebviewWindowBuilder};
 
 /// 设置窗 label（spec §7）：与 `capabilities/default.json` 的 `"windows": ["settings"]` 一致。
 pub const SETTINGS_WINDOW: &str = "settings";
+
+/// 标签页栏 Webview 的 label（T14d）：主窗口里的一个子 Webview，承载自绘标题栏
+/// （标签条 + 窗口控制 + 拖拽区）。授权面见 `capabilities/titlebar.json`——它拿的是
+/// 窗口控制与三个标签页命令，仅此而已。
+pub const TITLEBAR_WEBVIEW: &str = "titlebar";
+
+/// 标签页栏高度（逻辑像素）：所有标签页 Webview 从这条栏的下缘开始铺。
+/// 前端 `ui/settings/titlebar.js` 的 `STRIP_H` 与这里必须一致（有跨语言断言）。
+pub const TAB_STRIP_H: f64 = 40.0;
 
 /// 内置错误页的资产名（相对 `tauri.conf.json` 的 `frontendDist` = `../ui/settings`）。
 ///
@@ -116,6 +127,30 @@ pub struct AppState {
     /// [`drop_report_if_document_changed`] / [`get_page_report`]）。分片本身还有片数、单片字节、
     /// 累计字节与时间窗口四道硬上限——半截载荷永远不会被当成一条完整上报。
     pub chunk_report: Mutex<Option<report::ChunkAssembly>>,
+    /// 标签页注册表（T14d）：主窗口里的标签条状态。`order` 是创建顺序（首项恒为
+    /// `"main"`——fnOS 主页那一个，**不可关闭**），`titles` 是各标签的显示标题
+    /// （来自 `document.title`），`active` 是当前显示的标签 label。
+    /// 只在内存里；窗口重建时整体复位（重建出来的窗口只有一个 `main` 标签）。
+    pub tabs: Mutex<TabState>,
+    /// 下一个标签页的编号（`tab-N` 的 N；跨重建累加，保证 label 不与历史冲突）。
+    pub next_tab: AtomicU64,
+}
+
+/// 主窗口的标签页状态（见 [`AppState::tabs`]）。
+pub struct TabState {
+    pub order: Vec<String>,
+    pub titles: HashMap<String, String>,
+    pub active: String,
+}
+
+impl TabState {
+    fn with_main() -> Self {
+        Self {
+            order: vec![MAIN_WINDOW.to_string()],
+            titles: HashMap::new(),
+            active: MAIN_WINDOW.to_string(),
+        }
+    }
 }
 
 /// 主窗口一次加载所处的阶段（Task 11）。
@@ -339,7 +374,7 @@ impl DisplayState {
     /// 把旧窗口的显示态原样套到新窗口上。顺序即优先级：
     /// 最小化（不 `show()` / 不 `set_focus()`，否则会把用户主动最小化的窗口提到前台）
     /// → 隐藏（保持隐藏）→ 最大化（还原最大化）→ 普通可见窗口（建窗时已可见，无需动作）。
-    fn apply_to<R: Runtime>(self, window: &WebviewWindow<R>) {
+    fn apply_to<R: Runtime>(self, window: &tauri::Window<R>) {
         if self.minimized {
             let _ = window.minimize();
         } else if !self.visible {
@@ -550,9 +585,12 @@ fn merge(base: &mut Value, patch: Value) {
 /// `injectEnabled` / `homeUrl` **不在**此列：已注册到 WebView2 的
 /// `AddScriptToExecuteOnDocumentCreated` 脚本无法在活窗口上替换，只能重建窗口（gap (a)）。
 fn apply_to_page<R: Runtime>(app: &AppHandle<R>, cfg: &Config) {
-    let Some(win) = app.get_webview_window(MAIN_WINDOW) else {
+    // T14d：每个标签页 Webview 都是独立页面（都可能承载 fnOS / 应用页），配置推送要
+    // 铺到**所有**标签页；标签页栏（titlebar）不消费配置，跳过。
+    let Some(window) = app.get_window(MAIN_WINDOW) else {
         return;
     };
+    let win = window.webviews();
     let payload = serde_json::json!({
         "mods": &cfg.mods,
         "local": &cfg.local,
@@ -566,9 +604,14 @@ fn apply_to_page<R: Runtime>(app: &AppHandle<R>, cfg: &Config) {
     });
     match serde_json::to_string(&payload) {
         Ok(json) => {
-            let _ = win.eval(format!(
-                "window.__FNOS_APPLY_CONFIG__ && window.__FNOS_APPLY_CONFIG__({json});"
-            ));
+            for wv in &win {
+                if wv.label() == TITLEBAR_WEBVIEW {
+                    continue;
+                }
+                let _ = wv.eval(format!(
+                    "window.__FNOS_APPLY_CONFIG__ && window.__FNOS_APPLY_CONFIG__({json});"
+                ));
+            }
         }
         // `Config` 全是普通字段，序列化不可能失败；真失败也只是这一次免刷新没生效
         Err(e) => eprintln!("[fnos] 配置推送序列化失败: {e}"),
@@ -583,89 +626,172 @@ pub fn build_main_window<R: Runtime>(
     app: &AppHandle<R>,
     url: tauri::Url,
     cfg: &Config,
-) -> tauri::Result<WebviewWindow<R>> {
+) -> tauri::Result<tauri::Window<R>> {
     // 首启路径：建窗即可见（`start_visible = true`）。
     build_main_window_with(app, url, cfg, true)
 }
 
 /// `build_main_window` 的实体；`start_visible = false` 供重建路径使用——旧的隐藏 / 最小化
 /// 窗口不该让新窗口先可见地闪一下（Item 3）。
+///
+/// T14d：主窗口是**无边框 Window + 多个 Webview**——
+///   * `titlebar` Webview：自绘标题栏（标签条 + 窗口控制 + 拖拽区），见
+///     `ui/settings/titlebar.html`，铺在窗口顶部 [`TAB_STRIP_H`] 高的一条里；
+///   * `main` Webview：fnOS 主页（第一个标签页），铺在标签栏以下的全部区域；
+///   * 之后 `window.open` 的外部应用各占一个 `tab-N` Webview（见 [`open_app_tab`]），
+///     不再是独立窗口。
+/// 这要求 tauri 的 `unstable` feature（`Window::add_child`，桌面端可用）。
+/// 所有子 Webview 都**不会**随窗口 resize 自动重排——[`relayout_main_window`] 在
+/// `Resized` 事件里统一摆位。
 fn build_main_window_with<R: Runtime>(
     app: &AppHandle<R>,
     url: tauri::Url,
     cfg: &Config,
     start_visible: bool,
-) -> tauri::Result<WebviewWindow<R>> {
+) -> tauri::Result<tauri::Window<R>> {
     // 建窗即登记一次「加载开始」：`generation` 会被下面的回调捕获，用于丢弃旧世代的
     // 迟到事件（重建 / 自动重试期间尤其重要）。
     let generation = begin_load(app, url.as_str());
-    let mut builder = WebviewWindowBuilder::new(app, MAIN_WINDOW, WebviewUrl::External(url))
+    let mut builder = WindowBuilder::new(app, MAIN_WINDOW)
         .title("fnOS")
         // 不变式（Item 2）：`cfg.shell.window` 已经由 `Config::normalize`
         //（`WindowGeom::clamp_to_usable`）夹成可用几何，而所有进入 `AppState` 的 `Config`
         // 都经过它（`load` / `set_config` / `reset_config` / `reload_main` /
         // `save_window_geom`），所以这里不会再拿到 `0x0` 或负数。
         .inner_size(cfg.shell.window.w, cfg.shell.window.h)
-        // spec §7「主窗口：标题跟随页面」。tauri/wry **不会**自动把 `document.title`
-        // 同步到窗口标题：wry 只在 `WebviewBuilder::with_document_title_changed_handler`
-        // 被注册时才转发 `DocumentTitleChanged`（wry-0.57.0/src/webview2/mod.rs:689），
-        // 而 tauri 默认不注册（`webview/mod.rs:361` 里 `document_title_changed_handler: None`）。
-        // 不注册的话标题恒为上面的 `"fnOS"`。Task 11 起这条通路还多一个用途：页面自检探针
-        // 的回话（见 `LOAD_PROBE_JS` / `handle_title`）。
-        .on_document_title_changed(|window, title| handle_title(&window, &title))
-        // 每次页面加载打一行：既是现场排障手段，也是「重建确实换了一张新窗口」的证据。
-        .on_page_load(move |window, payload| {
-            on_page_event(
-                window.app_handle(),
-                generation,
-                payload.event(),
-                payload.url().as_str(),
-            );
-        });
-    // `window.open` / `target=_blank` → **开成本壳窗口**（T14c 修复轮 11，见
-    // [`new_window_verdict`]）：Hermes Studio 这类外部 Web 应用就是这么启动的。
-    let app_for_new_window = app.clone();
-    builder =
-        builder.on_new_window(move |url, _features| new_window_verdict(&app_for_new_window, url));
-
-    // 位置必须在**建窗时**就带上（T14c 修复轮 20）：此前位置是 build 之后由
-    // [`tray::apply_window_geom`] 补套的——首启路径「建窗即可见」，窗口先在 OS 默认的
-    // 左上角落脚、再被挪到保存的位置，用户看到的就是「启动时从左上跳到居中」。
-    // 首次运行（还没有保存位置）直接居中。哨兵值与 apply_window_geom 一致（-32000 是
-    // Windows 给最小化窗口的坐标，不能当合法位置用）。
+        // T14d：无边框——标题栏由 `titlebar` Webview 自绘（标签条 + 窗口控制 + 拖拽区）。
+        .decorations(false);
+    // 位置建窗时就带上（T14c 修复轮 20）：不让窗口先在 OS 默认位置落脚再跳。
     match (cfg.shell.window.x, cfg.shell.window.y) {
         (Some(x), Some(y)) if x > -10000.0 && y > -10000.0 => {
             builder = builder.position(x, y);
         }
         _ => builder = builder.center(),
     }
-
-    let script = injector::build_init_script(cfg);
-    if !script.is_empty() {
-        builder = builder.initialization_script(script);
-    }
     if !start_visible {
         builder = builder.visible(false);
     }
-
     let window = builder.build()?;
-    tray::apply_window_geom(&window, cfg);
+
+    // 标签页状态复位：重建出来的窗口永远只有一个 `main` 标签（T14d）。
+    *app.state::<AppState>().tabs.lock().unwrap() = TabState::with_main();
+
+    // —— 标签页栏（自绘标题栏）：本地资产页，无注入、无上报通道，授权面见
+    //    `capabilities/titlebar.json`（窗口控制 + 三个标签页命令，仅此而已）。
+    let (lw, lh) = logical_inner_size(&window)?;
+    let style = if cfg.mods.titlebar_style == "mac" {
+        TITLEBAR_STYLE_MAC
+    } else {
+        TITLEBAR_STYLE_WINDOWS
+    };
+    let titlebar = WebviewBuilder::new(TITLEBAR_WEBVIEW, WebviewUrl::App("titlebar.html".into()))
+        .initialization_script(format!(
+            "window.__FNOS_TABS_BOOT__ = {{ style: '{style}' }};"
+        ));
+    window.add_child(
+        titlebar,
+        LogicalPosition::new(0.0, 0.0),
+        LogicalSize::new(lw, TAB_STRIP_H),
+    )?;
+
+    // —— fnOS 主页（第一个标签页）。
+    //
+    // spec §7「标题跟随页面」+ Task 11 加载观测 + T14c 修复轮 11 的 window.open 裁定
+    // 全部挂在**这一个** Webview 上（与标签页 Webview 共用同一组回调定义，见
+    // [`tab_webview_callbacks`]）。`main` 这个 label 同时是注入页的 IPC 身份：
+    // `capabilities/default.json` 之外它没有任何授权，远程页面的显式拒绝在
+    // `capabilities/remote-deny.json`。
+    let script = injector::build_init_script(cfg);
+    let mut main_webview = tab_webview_builder(MAIN_WINDOW, url.clone(), app, Some(generation));
+    if !script.is_empty() {
+        // gap (a)：`inject_enabled=false` 时 `build_init_script` 返回空串，此时**不注册**
+        // 空脚本——「取消勾选能真正停掉注入」的前提。
+        main_webview = main_webview.initialization_script(script);
+    }
+    window.add_child(
+        main_webview,
+        LogicalPosition::new(0.0, TAB_STRIP_H),
+        LogicalSize::new(lw, lh - TAB_STRIP_H),
+    )?;
+
     // 「加载完成」迟迟不来就切错误页（spec §12.3）。看门狗是**独立线程**，睡满即自行退出；
     // 它靠 `generation` 判断自己是否还属于当前这一轮，所以重建 / 自动重试不会留下会误触发
     // 上一轮的定时器，也没有任何常驻计时器（无泄漏）。
     arm_load_watchdog(app, generation);
+    // T14d：标签条先推一次初态（main 一个标签），不等第一条标题事件。
+    push_tabs(app);
     Ok(window)
 }
 
-/// 新窗口请求的裁定（`window.open` / `target=_blank`）→ 开成**本壳窗口**。
+/// 标签页栏的主题形态（与上游 mods 的 `titlebarStyle` 同源：mac = 控制在左的「红绿灯」，
+/// windows = 控制在右）。值域与 `ui/settings/titlebar.js` 的渲染分支逐字一致。
+pub const TITLEBAR_STYLE_MAC: &str = "mac";
+pub const TITLEBAR_STYLE_WINDOWS: &str = "windows";
+
+/// 窗口内容区的**逻辑**尺寸（物理 / 缩放），供子 Webview 摆位用。
+fn logical_inner_size<R: Runtime>(window: &tauri::Window<R>) -> Result<(f64, f64), tauri::Error> {
+    let size = window.inner_size()?;
+    let scale = window.scale_factor()?;
+    Ok((size.width as f64 / scale, size.height as f64 / scale))
+}
+
+/// 标签页 Webview 的回调组（T14d）：主标签与所有 `tab-N` 共用同一套——
+/// 标题跟随（兼探针 / 上报通道）、加载日志（加载观测**只属于 `main` 标签**：
+/// 错误页 / 看门狗 / 退避是为「fnOS 主页」设计的，外部应用的失败在它自己的标签页里呈现，
+/// 不该把整个窗口顶掉），以及 window.open → 标签页的裁定。
+///
+/// `generation`：`Some` = 主标签（加载事件喂给 [`on_page_event`] 的世代闸门，
+/// 值必须是建窗那一刻 [`begin_load`] 发出的世代）；`None` = 普通标签页（只记日志）。
+fn tab_webview_builder<R: Runtime>(
+    label: &str,
+    url: tauri::Url,
+    app: &AppHandle<R>,
+    generation: Option<u64>,
+) -> WebviewBuilder<R> {
+    let app_for_title = app.clone();
+    let app_for_load = app.clone();
+    let app_for_new_window = app.clone();
+    let label = label.to_string();
+    WebviewBuilder::new(&label, WebviewUrl::External(url))
+        .on_document_title_changed(move |webview, title| {
+            handle_title(&webview, &title, &app_for_title);
+        })
+        .on_page_load(move |_webview, payload_event| {
+            if payload_event.event() != PageLoadEvent::Finished {
+                return;
+            }
+            match generation {
+                Some(g) => on_page_event(
+                    &app_for_load,
+                    g,
+                    payload_event.event(),
+                    payload_event.url().as_str(),
+                ),
+                None => eprintln!(
+                    "[fnos] 标签页已加载: {}",
+                    report::log_safe(payload_event.url().as_str())
+                ),
+            }
+        })
+        .on_new_window(move |url, _features| new_window_verdict(&app_for_new_window, url))
+}
+
+/// 新窗口请求的裁定（`window.open` / `target=_blank`）→ **开成标签页**（T14d）。
 ///
 /// 背景（T14c 修复轮 11，实测）：Hermes Studio 这类「外部 Web 应用」的启动路径就是
 /// `window.open('https://hermes-studio.<nas>.fnos.net/', '_blank')`——在浏览器里是新标签页，
-/// 而 WebView2 默认把这类请求**丢弃**（点图标什么都没发生）。本壳没有标签页概念，按用户
-/// 要求一律改为开窗口：同一个 WebView 配置 → 共享会话 cookie，应用照它自己的样子加载。
+/// 而 WebView2 默认把这类请求**丢弃**（点图标什么都没发生）。本壳把这类请求接住：
+/// T14d 起不再是独立窗口，而是主窗口标签条里的一个新标签页（[`open_app_tab`]）。
 ///
-/// 安全边界：只给 `http` / `https` / `about`（`about:blank` 是弹窗流程常见的起始页）开窗，
-/// 其余协议（`file:` / `data:` / `javascript:` …）一律 `Deny` 并留一行日志。
+/// 为什么返回 `Deny` 而不是 `Create`：`Window::add_child` 在 Windows 的**同步事件回调**
+/// 里会死锁（tauri 文档的 Known issues 明确警告），而 `on_new_window` 恰恰是同步回调。
+/// 所以这里把请求**转交**给异步任务后立即拒绝原生新窗口——标签页由 [`open_app_tab`]
+/// 在异步上下文里创建。代价是页面侧 `window.open` 的返回值是 `null`（fnOS 启动台与
+/// 已知应用都不使用返回值）。
+///
+/// 安全边界：只给 `http` / `https` / `about`（`about:blank` 是弹窗流程常见的起始页）
+/// 开标签页，其余协议（`file:` / `data:` / `javascript:` …）一律 `Deny` 并留一行日志，
+/// 且**不**转交。
 fn new_window_verdict<R: Runtime>(
     app: &AppHandle<R>,
     url: tauri::Url,
@@ -677,89 +803,214 @@ fn new_window_verdict<R: Runtime>(
             return tauri::webview::NewWindowResponse::Deny;
         }
     }
-    match open_app_window(app, url.clone()) {
-        Ok(window) => {
-            eprintln!("[fnos] window.open -> 开成应用窗口：{url}");
-            tauri::webview::NewWindowResponse::Create { window }
+    let app = app.clone();
+    let url_for_log = url.clone();
+    tauri::async_runtime::spawn(async move {
+        if let Err(e) = open_app_tab(&app, url).await {
+            eprintln!("[fnos] 标签页创建失败（已拒绝该请求）：{e}");
         }
-        Err(e) => {
-            eprintln!("[fnos] 应用窗口创建失败（已拒绝该请求）：{e}");
-            tauri::webview::NewWindowResponse::Deny
+    });
+    eprintln!("[fnos] window.open -> 开成标签页：{url_for_log}");
+    tauri::webview::NewWindowResponse::Deny
+}
+
+/// 为一个 `window.open` 请求（或标签条上的「+」）开一个**标签页**：主窗口里的新 Webview，
+/// 铺在标签栏（[`TAB_STRIP_H`]）以下的全部区域，创建即激活。
+///
+/// - 与主标签共用同一组回调（[`tab_webview_builder`]）与注入载荷（mods / dock /
+///   keepalive / windowpos 照常生效；外部应用页面是否注入由 content-script 的 origin
+///   判定自行决定）；
+/// - 标签唯一（`tab-1`、`tab-2`…，进程内计数）；
+/// - 标题先取主机名第一段，之后跟随 `document.title`（[`handle_title`]）。
+pub async fn open_app_tab<R: Runtime>(app: &AppHandle<R>, url: tauri::Url) -> Result<String, String> {
+    let window = app
+        .get_window(MAIN_WINDOW)
+        .ok_or_else(|| "主窗口未打开".to_string())?;
+    let n = app
+        .state::<AppState>()
+        .next_tab
+        .fetch_add(1, Ordering::Relaxed);
+    let label = format!("tab-{n}");
+    let cfg = current(app);
+    let script = injector::build_init_script(&cfg);
+    let mut builder = tab_webview_builder(&label, url.clone(), app, None);
+    if !script.is_empty() {
+        builder = builder.initialization_script(script);
+    }
+    let (lw, lh) = logical_inner_size(&window).map_err(|e| e.to_string())?;
+    // Windows 上 add_child 只能在异步上下文里调（同步命令 / 事件回调里会死锁）——
+    // 本函数是 `async fn`，调用方（`new_window_verdict` 的转交任务 / `tab_new` 命令）
+    // 都在异步运行时里。
+    window
+        .add_child(
+            builder,
+            LogicalPosition::new(0.0, TAB_STRIP_H),
+            LogicalSize::new(lw, lh - TAB_STRIP_H),
+        )
+        .map_err(|e| format!("创建标签页失败：{e}"))?;
+    activate_tab(app, &label);
+    Ok(label)
+}
+
+/// 激活一个标签页：显示它、隐藏其余标签页、更新窗口标题并把标签条状态推给 titlebar。
+fn activate_tab<R: Runtime>(app: &AppHandle<R>, label: &str) {
+    let state = app.state::<AppState>();
+    let mut tabs = state.tabs.lock().unwrap();
+    if !tabs.order.iter().any(|l| l == label) {
+        tabs.order.push(label.to_string());
+    }
+    tabs.active = label.to_string();
+    drop(tabs);
+    let window = match app.get_window(MAIN_WINDOW) {
+        Some(w) => w,
+        None => return,
+    };
+    for wv in window.webviews() {
+        let wv_label = wv.label().to_string();
+        if wv_label == TITLEBAR_WEBVIEW {
+            continue;
         }
+        if wv_label == label {
+            let _ = wv.show();
+            let _ = wv.set_focus(); // 切换后键盘/滚动焦点跟到新标签
+        } else {
+            let _ = wv.hide();
+        }
+    }
+    let title = app
+        .state::<AppState>()
+        .tabs
+        .lock()
+        .unwrap()
+        .titles
+        .get(label)
+        .cloned();
+    if let Some(t) = title {
+        let _ = window.set_title(&t);
+    }
+    push_tabs(app);
+}
+
+/// 把标签条状态推给 titlebar Webview（`__FNOS_TABS_SET__`；标签的增删 / 切换 / 改名都会调）。
+fn push_tabs<R: Runtime>(app: &AppHandle<R>) {
+    let Some(titlebar) = app.get_webview(TITLEBAR_WEBVIEW) else {
+        return;
+    };
+    let state = app.state::<AppState>();
+    let tabs = state.tabs.lock().unwrap();
+    let payload = serde_json::json!({
+        "tabs": tabs.order.iter().map(|label| {
+            serde_json::json!({
+                "id": label,
+                "title": tabs.titles.get(label).cloned().unwrap_or_else(|| label.clone()),
+                "active": *label == tabs.active,
+                // `main` 是 fnOS 主页标签，不可关闭（关了它就没有「回桌面」的地方了）
+                "canClose": label != MAIN_WINDOW,
+            })
+        }).collect::<Vec<_>>(),
+    });
+    drop(tabs);
+    match serde_json::to_string(&payload) {
+        Ok(json) => {
+            let _ = titlebar.eval(format!(
+                "window.__FNOS_TABS_SET__ && window.__FNOS_TABS_SET__({json});"
+            ));
+        }
+        Err(e) => eprintln!("[fnos] 标签条状态序列化失败: {e}"),
     }
 }
 
-/// 为一个 `window.open` 请求建窗口（T14c 修复轮 13：**无边框 + 本壳自绘标题栏**）。
-///
-/// 四条纪律：
-/// - **无边框 + 自绘标题栏**：原先带的是 Windows 原生标题栏，与桌面里的窗口（上游 mod 的
-///   mac / windows 风格）**长得不一样**；用户要求统一。标题栏画在**应用自己的页面里**
-///   （`inject/appchrome.js`），因此不受「应用会跳出 iframe」的限制；
-/// - **不注入桌面脚本**：mods / dock / keepalive 只属于主窗口；这里注入的只是标题栏规格
-///   （`window.__FNOS_APP_CHROME__`）与那一个脚本；
-/// - 标签唯一（`app-1`、`app-2`…）：tauri 要求标签唯一，进程内计数即可；
-/// - 标题先取主机名；**不**走 [`handle_title`]——那是主窗口的探针/上报通道，
-///   应用页面的标题不该写进主窗口的上报槽位。
-fn open_app_window<R: Runtime>(
-    app: &AppHandle<R>,
-    url: tauri::Url,
-) -> tauri::Result<WebviewWindow<R>> {
-    static NEXT_APP_WINDOW: AtomicUsize = AtomicUsize::new(1);
-    let label = format!("app-{}", NEXT_APP_WINDOW.fetch_add(1, Ordering::Relaxed));
-    // 标题取主机名的第一段（`hermes-studio.ea121314.fnos.net` → `hermes-studio`）
-    let host = url.host_str().unwrap_or("");
-    let title = host
-        .split('.')
-        .next()
-        .filter(|s| !s.is_empty())
-        .unwrap_or("fnOS 应用")
-        .to_string();
-    // 标题栏样式跟随配置（`mods.titlebarStyle`）：桌面里的窗口长什么样，应用窗口就长什么样
-    let style = current(app).mods.titlebar_style.clone();
-    let spec = serde_json::json!({ "style": style, "label": label, "title": title });
-    // 默认摆在**主窗口（桌面）中间**：用户要的是「在应用内居中显示」——窗口可能不在屏幕中央，
-    // 那就相对桌面居中；桌面窗口取不到时退回屏幕居中。
-    let size = (APP_WINDOW_W, APP_WINDOW_H);
-    let centered = desktop_centered_position(app, size);
-    // 嵌套弹窗（应用自己再自己开小窗）同样走这条裁定
-    let app_for_nested = app.clone();
-    let mut builder = WebviewWindowBuilder::new(app, &label, WebviewUrl::External(url))
-        .title(title)
-        .inner_size(size.0, size.1)
-        // 无边框：标题栏由 `inject/appchrome.js` 自绘（Windows 保留可缩放边框，拖边缘仍能改大小）
-        .decorations(false)
-        .initialization_script(format!(
-            "window.__FNOS_APP_CHROME__ = {spec};\n{script}\n",
-            spec = spec,
-            script = injector::APP_CHROME_JS
-        ))
-        .on_new_window(move |url, _features| new_window_verdict(&app_for_nested, url));
-    builder = match centered {
-        Some((x, y)) => builder.position(x, y),
-        None => builder.center(),
+// ---------- 标签页命令（只授 titlebar Webview，见 capabilities/titlebar.json） ----------
+
+/// 标签条上的「+」：新开一个标签页，加载 fnOS 主页地址（与主标签同一份解析规则）。
+#[tauri::command]
+pub async fn tab_new<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
+    let url = {
+        let cfg = current(&app);
+        resolve_main_url(&cfg, None)
     };
-    builder.build()
+    open_app_tab(&app, url).await.map(|_| ())
 }
 
-/// 应用窗口的默认尺寸（逻辑像素）。
-const APP_WINDOW_W: f64 = 1100.0;
-const APP_WINDOW_H: f64 = 700.0;
+/// 切换到指定标签页（显示它、隐藏其余）。
+#[tauri::command]
+pub async fn tab_switch<R: Runtime>(app: AppHandle<R>, label: String) -> Result<(), String> {
+    let exists = app
+        .state::<AppState>()
+        .tabs
+        .lock()
+        .unwrap()
+        .order
+        .iter()
+        .any(|l| *l == label);
+    if !exists {
+        return Err(format!("标签页不存在：{label}"));
+    }
+    activate_tab(&app, &label);
+    Ok(())
+}
 
-/// 「在主窗口（桌面）里居中」的位置（逻辑坐标）；主窗口不在时返回 `None`（调用方退回屏幕居中）。
-///
-/// 取的是主窗口的**外框**位置与尺寸：应用窗口比桌面大时按 0 偏移（左上对齐），
-/// 免得算出屏幕外的负坐标。
-fn desktop_centered_position<R: Runtime>(
-    app: &AppHandle<R>,
-    size: (f64, f64),
-) -> Option<(f64, f64)> {
-    let main = app.get_webview_window(MAIN_WINDOW)?;
-    let scale = main.scale_factor().ok()?;
-    let pos = main.outer_position().ok()?.to_logical::<f64>(scale);
-    let outer = main.outer_size().ok()?.to_logical::<f64>(scale);
-    let x = pos.x + ((outer.width - size.0) / 2.0).max(0.0);
-    let y = pos.y + ((outer.height - size.1) / 2.0).max(0.0);
-    Some((x, y))
+/// 关闭指定标签页（`main` 不可关）。关掉的是当前标签时，优先激活它左边的邻居。
+#[tauri::command]
+pub async fn tab_close<R: Runtime>(app: AppHandle<R>, label: String) -> Result<(), String> {
+    if label == MAIN_WINDOW {
+        return Err("fnOS 主页标签不可关闭".to_string());
+    }
+    let (activate, webview) = {
+        let state = app.state::<AppState>();
+        let mut tabs = state.tabs.lock().unwrap();
+        let Some(pos) = tabs.order.iter().position(|l| *l == label) else {
+            return Err(format!("标签页不存在：{label}"));
+        };
+        tabs.order.remove(pos);
+        tabs.titles.remove(&label);
+        let activate = if tabs.active == label {
+            // 优先左邻（浏览器语义），越界回第一个
+            Some(tabs.order[pos.saturating_sub(1)].clone())
+        } else {
+            None
+        };
+        let webview = app.get_webview(&label);
+        (activate, webview)
+    };
+    if let Some(wv) = webview {
+        let _ = wv.close(); // 从窗口移除这个 Webview（资源由 tauri 回收）
+    }
+    if let Some(next) = activate {
+        activate_tab(&app, &next);
+    } else {
+        push_tabs(&app);
+    }
+    Ok(())
+}
+
+/// 窗口 resize 后把所有子 Webview 摆回正确位置（`main.rs` 的 `Resized` 事件转发到这里）。
+/// 子 Webview **不会**随窗口自动重排——最大化 / 还原 / 拖边缘都靠这一趟。
+pub fn relayout_main_window<R: Runtime>(window: &tauri::Window<R>, size: tauri::PhysicalSize<u32>) {
+    let Ok(scale) = window.scale_factor() else {
+        return;
+    };
+    let strip = (TAB_STRIP_H * scale) as i32;
+    for wv in window.webviews() {
+        let bounds = if wv.label() == TITLEBAR_WEBVIEW {
+            tauri::Rect {
+                position: tauri::Position::Physical(tauri::PhysicalPosition::new(0, 0)),
+                size: tauri::Size::Physical(tauri::PhysicalSize::new(
+                    size.width,
+                    strip as u32,
+                )),
+            }
+        } else {
+            tauri::Rect {
+                position: tauri::Position::Physical(tauri::PhysicalPosition::new(0, strip)),
+                size: tauri::Size::Physical(tauri::PhysicalSize::new(
+                    size.width,
+                    (size.height as f64 - strip as f64) as u32,
+                )),
+            }
+        };
+        let _ = wv.set_bounds(bounds);
+    }
 }
 
 /// 建**内置错误页**窗口（Task 11 / spec §12.3「主窗口加载失败/离线」）。
@@ -775,26 +1026,15 @@ fn build_error_window<R: Runtime>(
     info: &ErrorInfo,
     cfg: &Config,
     start_visible: bool,
-) -> tauri::Result<WebviewWindow<R>> {
+) -> tauri::Result<tauri::Window<R>> {
     set_error_state(app, info);
     let payload = serde_json::to_string(info).unwrap_or_else(|_| "{}".into());
-    let mut builder =
-        WebviewWindowBuilder::new(app, MAIN_WINDOW, WebviewUrl::App(ERROR_PAGE_ASSET.into()))
-            .title("fnOS — 页面加载失败")
-            .inner_size(cfg.shell.window.w, cfg.shell.window.h)
-            .on_document_title_changed(|window, title| handle_title(&window, &title))
-            .on_page_load(move |window, payload_event| {
-                if payload_event.event() != PageLoadEvent::Finished {
-                    return;
-                }
-                eprintln!(
-                    "[fnos] 错误页已加载（地址 {}；本页不注册 mods 初始化脚本）",
-                    payload_event.url()
-                );
-                let _ = window.eval(format!(
-                    "window.__FNOS_SET_ERROR__ && window.__FNOS_SET_ERROR__({payload});"
-                ));
-            });
+    // T14d：错误页与主窗口同构 —— 无边框 Window + 标签页栏 Webview + 内容 Webview
+    // （错误页内容就是 `main` 标签，只是加载的是本地错误资产、且**没有任何注入**）。
+    let mut builder = WindowBuilder::new(app, MAIN_WINDOW)
+        .title("fnOS — 页面加载失败")
+        .inner_size(cfg.shell.window.w, cfg.shell.window.h)
+        .decorations(false);
     // 与 [`build_main_window_with`] 同理（T14c 修复轮 20）：位置建窗时就带上，
     // 不让错误页窗口也「先在左上角落脚、再跳走」。
     match (cfg.shell.window.x, cfg.shell.window.y) {
@@ -807,6 +1047,43 @@ fn build_error_window<R: Runtime>(
         builder = builder.visible(false);
     }
     let window = builder.build()?;
+    *app.state::<AppState>().tabs.lock().unwrap() = TabState::with_main();
+    let style = if cfg.mods.titlebar_style == "mac" {
+        TITLEBAR_STYLE_MAC
+    } else {
+        TITLEBAR_STYLE_WINDOWS
+    };
+    let (lw, lh) = logical_inner_size(&window)?;
+    let titlebar = WebviewBuilder::new(TITLEBAR_WEBVIEW, WebviewUrl::App("titlebar.html".into()))
+        .initialization_script(format!("window.__FNOS_TABS_BOOT__ = {{ style: '{style}' }};"));
+    window.add_child(
+        titlebar,
+        LogicalPosition::new(0.0, 0.0),
+        LogicalSize::new(lw, TAB_STRIP_H),
+    )?;
+    let app_for_title = app.clone();
+    let error_webview =
+        WebviewBuilder::new(MAIN_WINDOW, WebviewUrl::App(ERROR_PAGE_ASSET.into()))
+            .on_document_title_changed(move |webview, title| {
+                handle_title(&webview, &title, &app_for_title);
+            })
+            .on_page_load(move |webview, payload_event| {
+                if payload_event.event() != PageLoadEvent::Finished {
+                    return;
+                }
+                eprintln!(
+                    "[fnos] 错误页已加载（地址 {}；本页不注册 mods 初始化脚本）",
+                    payload_event.url()
+                );
+                let _ = webview.eval(format!(
+                    "window.__FNOS_SET_ERROR__ && window.__FNOS_SET_ERROR__({payload});"
+                ));
+            });
+    window.add_child(
+        error_webview,
+        LogicalPosition::new(0.0, TAB_STRIP_H),
+        LogicalSize::new(lw, lh - TAB_STRIP_H),
+    )?;
     tray::apply_window_geom(&window, cfg);
     Ok(window)
 }
@@ -866,18 +1143,18 @@ fn set_error_state<R: Runtime>(app: &AppHandle<R>, info: &ErrorInfo) -> u64 {
 /// 两个前缀的**副作用必须一致**：控制标题是「页面 → 宿主」的回传通道，不是给用户看的标题
 /// ——既不镜像到窗口标题（`set_title`），也不进 UI，只在控制台留一行**固定短语 + 类型**
 /// （绝不回显页面可控正文）。Task 11 的探针分支就是这样做的，Task 13a 的上报分支照抄。
-pub fn handle_title<R: Runtime>(window: &WebviewWindow<R>, title: &str) {
+pub fn handle_title<R: Runtime>(webview: &Webview<R>, title: &str, app: &AppHandle<R>) {
     if let Some(payload) = title.strip_prefix(PROBE_TITLE_PREFIX) {
         // 探针标题是「页面 → 宿主」的回传通道，不是给用户看的标题：不镜像、只处理。
-        on_load_probe(window.app_handle(), payload);
+        on_load_probe(app, payload);
         return;
     }
     if let Some(payload) = title.strip_prefix(report::CHUNK_TITLE_PREFIX) {
-        on_page_chunk(window, payload);
+        on_page_chunk(webview, payload);
         return;
     }
     if let Some(payload) = title.strip_prefix(report::REPORT_TITLE_PREFIX) {
-        on_page_report(window, payload);
+        on_page_report(webview, payload);
         return;
     }
     // 现场排障 + 运行期证据（错误页会把自检结论写进标题，见 ui/settings/error.html）。
@@ -888,7 +1165,22 @@ pub fn handle_title<R: Runtime>(window: &WebviewWindow<R>, title: &str) {
     // `set_title` 拿到的仍是**原文**：spec §7「窗口标题跟随页面」是产品行为，标题栏不承担
     // 「证据」职责（Windows 会把标题栏里的控制字符当空白渲染），两者要求不同、处理也不同。
     eprintln!("[fnos] 主窗口标题: {}", report::log_safe(title));
-    let _ = window.set_title(title);
+    // T14d：标题进标签页注册表；活动标签的标题同时是**窗口标题**（任务栏显示用）。
+    let label = webview.label();
+    if label != TITLEBAR_WEBVIEW {
+        {
+            let state = app.state::<AppState>();
+            let mut tabs = state.tabs.lock().unwrap();
+            if tabs.order.iter().any(|l| l == label) {
+                tabs.titles.insert(label.to_string(), title.to_string());
+            }
+        }
+        let active = app.state::<AppState>().tabs.lock().unwrap().active.clone();
+        if active == label {
+            let _ = webview.window().set_title(title);
+        }
+        push_tabs(app);
+    }
 }
 
 /// 收到一条页面上报（`document.title` 的 `FNOSREPORT:` 通道；Task 13a）。
@@ -900,7 +1192,7 @@ pub fn handle_title<R: Runtime>(window: &WebviewWindow<R>, title: &str) {
 ///
 /// 唯一一处会打印页面可控字段的日志是 [`report::accepted_log_line`]：`type` 与 `dir` 都在
 /// 允许表里过一遍，白名单外一律渲染成固定串 `report::UNKNOWN`（Important 1 的日志注入修复）。
-fn on_page_report<R: Runtime>(window: &WebviewWindow<R>, payload: &str) {
+fn on_page_report<R: Runtime>(window: &Webview<R>, payload: &str) {
     let value = match report::validate(payload) {
         Ok(v) => v,
         Err(reason) => {
@@ -929,7 +1221,7 @@ fn on_page_report<R: Runtime>(window: &WebviewWindow<R>, payload: &str) {
 ///
 /// 两者一起构成「这条上报属于哪个文档」的判据（`report::ReportEntry::matches_document`）。
 /// 取不到时 `None`——判据是「任一侧取不到一律不认」，所以宁可退回弱文案。
-fn document_identity<R: Runtime>(window: &WebviewWindow<R>) -> (Option<String>, Option<String>) {
+fn document_identity<R: Runtime>(window: &Webview<R>) -> (Option<String>, Option<String>) {
     let url = window.url().ok();
     let origin = url.as_ref().and_then(|u| config::origin_of(u.as_str()));
     (origin, url.map(|u| u.to_string()))
@@ -951,7 +1243,7 @@ fn document_identity<R: Runtime>(window: &WebviewWindow<R>) -> (Option<String>, 
 /// 日志只能打印白名单里的字段：`type` / `dir` 不在允许表里时渲染成固定串
 /// （[`report::accepted_log_line`]），`origin` 由宿主解析、再折成一行（`log_safe`）。
 fn store_report<R: Runtime>(
-    window: &WebviewWindow<R>,
+    window: &Webview<R>,
     value: Value,
     origin: Option<String>,
     url: Option<String>,
@@ -986,7 +1278,7 @@ fn clear_report_slots(state: &AppState) {
 ///
 /// 到齐后**仍然**走 [`report::validate`]：分片通道不是绕过单条通道校验的后门
 /// （字节上限、必须是 JSON 对象、`type` 必须在允许表内）。
-fn on_page_chunk<R: Runtime>(window: &WebviewWindow<R>, payload: &str) {
+fn on_page_chunk<R: Runtime>(window: &Webview<R>, payload: &str) {
     let (origin, url) = document_identity(window);
     let step = {
         let state = window.state::<AppState>();
@@ -1112,9 +1404,7 @@ fn read_slot_for_current_document(
 /// 返回体**永远是对象**（两个字段都可以是 `null`），调用方不需要再判「回包是不是 null」。
 #[tauri::command]
 pub fn get_page_report<R: Runtime>(app: AppHandle<R>) -> Value {
-    let current_url = app
-        .get_webview_window(MAIN_WINDOW)
-        .and_then(|w| w.url().ok());
+    let current_url = app.get_webview(MAIN_WINDOW).and_then(|w| w.url().ok());
     let current_origin = current_url
         .as_ref()
         .and_then(|u| config::origin_of(u.as_str()));
@@ -1180,8 +1470,8 @@ pub fn on_page_event<R: Runtime>(
     }
     // URL 上看不出失败（实测失败导航的 Source 仍是请求地址）→ 让页面自己回答
     eprintln!("[fnos] 页面 URL 未显示错误页，交由页面自检探针判定: {url}");
-    if let Some(window) = app.get_webview_window(MAIN_WINDOW) {
-        let _ = window.eval(LOAD_PROBE_JS);
+    if let Some(webview) = app.get_webview(MAIN_WINDOW) {
+        let _ = webview.eval(LOAD_PROBE_JS);
     }
 }
 
@@ -1379,7 +1669,7 @@ fn trigger_recreate<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
         return Ok(()); // 已在重建中：交给那一轮的 `Destroyed` 收尾
     }
 
-    let Some(win) = app.get_webview_window(MAIN_WINDOW) else {
+    let Some(win) = app.get_window(MAIN_WINDOW) else {
         // 没有主窗口（closeToTray=false 关掉之后、或上一轮重建失败）：直接建一个可见窗口
         *state.recreate_display.lock().unwrap() = DisplayState::default();
         return rebuild_main(app);
@@ -1501,7 +1791,7 @@ pub fn get_page_state<R: Runtime>(app: AppHandle<R>) -> PageStateView {
     // 活着的窗口 URL 优先（它能反映重定向 / 页内导航）；错误页例外——那时 URL 是应用资产
     // （`http://tauri.localhost/error.html`），对用户没有意义。
     let live = app
-        .get_webview_window(MAIN_WINDOW)
+        .get_webview(MAIN_WINDOW)
         .and_then(|w| w.url().ok())
         .map(|u| u.to_string());
     let url = if snapshot.error_page {
@@ -1865,7 +2155,7 @@ pub fn set_local_store(
 #[tauri::command]
 pub fn request_app_items<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
     let win = app
-        .get_webview_window(MAIN_WINDOW)
+        .get_webview(MAIN_WINDOW)
         .ok_or_else(|| "主窗口未打开".to_string())?;
     win.eval("window.__FNOS_REQUEST_APP_ITEMS__ && window.__FNOS_REQUEST_APP_ITEMS__();")
         .map_err(|e| format!("请求页面汇报应用项失败：{e}"))?;
@@ -1929,11 +2219,13 @@ pub fn save_and_install_state<R: Runtime>(
         page_report: Mutex::new(None),
         app_items_report: Mutex::new(None),
         chunk_report: Mutex::new(None),
+        tabs: Mutex::new(TabState::with_main()),
+        next_tab: AtomicU64::new(1),
     });
 }
 
 pub fn save_window_geom<R: Runtime>(app: &AppHandle<R>) {
-    let Some(win) = app.get_webview_window(MAIN_WINDOW) else {
+    let Some(win) = app.get_window(MAIN_WINDOW) else {
         return;
     };
     // 最小化时**不能**保存几何：Windows 对最小化窗口报 `inner_size = 0x0`、
@@ -2853,104 +3145,109 @@ mod tests {
         );
     }
 
-    /// T14c：`window.open` / `target=_blank` 必须开成**本壳窗口**（外部 Web 应用的启动路径）。
-    ///
-    /// 实测：Hermes Studio 的启动就是 `window.open(url, '_blank')`，浏览器里是新标签页，
-    /// 而 WebView2 默认丢弃 → 点图标什么都没发生。修法是 `on_new_window` 把它变成我们
-    /// 自己的窗口。这里锁四件事：协议闸门、两个分支、两处挂载点、以及「应用窗口不注入
-    /// 桌面脚本 / 不占主窗口上报通道」。
+    /// T14c 修复轮 11 → T14d 升级：`window.open` / `target=_blank` 必须开成**标签页**
+    /// （外部 Web 应用的启动路径）。实测：Hermes Studio 的启动就是 `window.open(url,
+    /// '_blank')`，浏览器里是新标签页，而 WebView2 默认丢弃 → 点图标什么都没发生。
+    /// 这里锁六件事：协议闸门、Deny + 异步转交（add_child 在同步回调里会死锁）、
+    /// 三个标签页命令、命令清单同步、标签条授权只给 titlebar、fnOS 主页标签不可关。
     #[test]
-    fn new_window_requests_become_app_windows() {
+    fn new_window_requests_become_tabs() {
         let src = include_str!("commands.rs");
-        let verdict_at = src.find("fn new_window_verdict").expect("裁定函数必须存在");
-        let open_at = src.find("fn open_app_window").expect("开窗函数必须存在");
-        let verdict = &src[verdict_at..open_at];
+        let verdict = &src[src.find("fn new_window_verdict").expect("裁定函数必须存在")
+            ..src.find("pub async fn open_app_tab").expect("标签页创建函数必须存在")];
         assert!(
             verdict.contains("\"http\" | \"https\" | \"about\""),
-            "只允许 http(s)/about 开窗（file/data/javascript 一律拒绝）"
+            "只允许 http(s)/about 开标签页（file/data/javascript 一律拒绝）"
         );
         assert!(
             verdict.contains("NewWindowResponse::Deny"),
-            "被拒的请求必须显式 Deny"
+            "原生新窗口必须显式 Deny（标签页由异步任务创建）"
         );
         assert!(
-            verdict.contains("NewWindowResponse::Create"),
-            "允许的请求必须开成窗口（不是让 WebView2 自己弹一个裸窗口）"
+            !verdict.contains("NewWindowResponse::Create"),
+            "不得再走 Create（add_child 在同步回调里会死锁，T14d）"
         );
         assert!(
-            src.matches(".on_new_window(").count() >= 2,
-            "主窗口与嵌套弹窗都要挂这条裁定"
+            verdict.contains("tauri::async_runtime::spawn") && verdict.contains("open_app_tab"),
+            "允许的请求必须转交给异步任务开标签页"
         );
-        // 开窗函数体：到「建内置错误页窗口」的文档注释为止
-        let end = src
-            .find("/// 建**内置错误页**窗口")
-            .expect("错误页建窗函数必须紧随其后");
+        assert!(
+            src.matches(".on_new_window(").count() >= 1,
+            "标签页 Webview 都要挂这条裁定（tab_webview_builder 统一组装）"
+        );
+        // open_app_tab：铺在标签栏以下、激活、复用 tab_webview_builder 与注入载荷
+        let open_at = src.find("pub async fn open_app_tab").expect("开标签页函数必须存在");
+        let end = src.find("/// 激活一个标签页").expect("激活函数必须紧随其后");
         let body = &src[open_at..end];
-        // 注入的只能是**标题栏**规格与脚本：桌面载荷（mods / dock / keepalive）不得进应用窗口
         assert!(
-            body.contains("__FNOS_APP_CHROME__") && body.contains("injector::APP_CHROME_JS"),
-            "应用窗口必须注入自绘标题栏（规格 + 脚本）"
+            body.contains("TAB_STRIP_H") && body.contains("LogicalPosition::new(0.0, TAB_STRIP_H)"),
+            "标签页 Webview 必须铺在标签栏以下的全部区域"
         );
         assert!(
-            !body.contains("build_init_script") && !body.contains("__FNOS_SHELL__"),
-            "应用窗口不得注入桌面脚本（mods/dock/keepalive 只属于主窗口）"
+            body.contains("tab_webview_builder(&label, url.clone(), app, None)"),
+            "标签页与主标签共用同一组回调（generation = None：不进加载观测管线）"
         );
         assert!(
-            body.contains(".decorations(false)"),
-            "应用窗口必须无边框（否则原生标题栏与桌面窗口样式不统一）"
-        );
-        // 默认位置：相对**主窗口（桌面）**居中，取不到主窗口才退回屏幕居中
-        assert!(
-            body.contains("desktop_centered_position(app, size)")
-                && body.contains("builder.center()"),
-            "应用窗口必须相对主窗口居中（退回屏幕居中）"
-        );
-        let center_fn = src
-            .find("fn desktop_centered_position")
-            .expect("居中函数必须存在");
-        // 按函数结尾（第一个 `\n}\n`）切，避免按字节切到多字节字符中间
-        let tail = &src[center_fn..];
-        let center_body = &tail[..tail.find("\n}\n").unwrap_or(tail.len())];
-        assert!(
-            center_body.contains("outer_position()") && center_body.contains("outer_size()"),
-            "居中必须取主窗口的外框位置与尺寸"
+            body.contains("build_init_script"),
+            "标签页 Webview 照常注入桌面载荷（origin 判定由 content-script 自行决定）"
         );
         assert!(
-            body.contains("mods.titlebar_style"),
-            "标题栏样式必须跟随配置（桌面窗口长什么样，应用窗口就长什么样）"
+            body.contains("activate_tab(app, &label)"),
+            "新标签页创建即激活"
         );
+        // 三个标签页命令 + 命令清单同步（build.rs 的 AppManifest::commands）
+        for cmd in ["tab_new", "tab_switch", "tab_close"] {
+            assert!(
+                src.contains(&format!("pub async fn {cmd}<R: Runtime>")),
+                "缺少标签页命令：{cmd}"
+            );
+            let build = include_str!("../build.rs");
+            assert!(build.contains(&format!("\"{cmd}\"")), "build.rs 命令清单缺少：{cmd}");
+        }
+        // fnOS 主页标签不可关闭（关了就没有「回桌面」的地方）
+        let close_at = src.find("pub async fn tab_close<R: Runtime>").expect("tab_close 必须存在");
+        let close_body = &src[close_at..close_at + 900];
         assert!(
-            !body.contains("handle_title"),
-            "应用窗口标题不得走主窗口的上报通道"
+            close_body.contains("if label == MAIN_WINDOW"),
+            "tab_close 必须拒绝关闭 fnOS 主页标签"
         );
-        assert!(body.contains("AtomicUsize"), "标签必须唯一（进程内计数）");
-        // 自绘标题栏的按钮/拖拽要 IPC，权限只授 app-* 窗口的窗口操作
-        let cap = include_str!("../capabilities/app-windows.json");
-        assert!(cap.contains("\"app-*\""), "能力必须只授 app-* 窗口");
+        // 标签条授权只给 titlebar；各标签页承载的第三方页面没有任何授权
+        let cap = include_str!("../capabilities/titlebar.json");
+        assert!(cap.contains("\"titlebar\""), "能力必须只授 titlebar Webview");
         for perm in [
             "core:window:allow-start-dragging",
             "core:window:allow-minimize",
             "core:window:allow-toggle-maximize",
             "core:window:allow-close",
+            "allow-tab-new",
+            "allow-tab-switch",
+            "allow-tab-close",
         ] {
-            assert!(cap.contains(perm), "自绘标题栏缺少权限：{perm}");
+            assert!(cap.contains(perm), "标签页栏缺少权限：{perm}");
         }
         assert!(
-            !cap.contains("\"allow-get-config\"") && !cap.contains("\"allow-open-url\""),
-            "应用窗口不得得到任何应用命令授权"
+            !cap.contains("allow-get-config") && !cap.contains("allow-open-url"),
+            "标签页栏不得得到任何应用命令授权"
         );
-        // 标题栏脚本本身：拖拽区 + 四个窗口命令 + 不碰页面内容
-        let chrome = include_str!("../inject/appchrome.js");
+        // 标签条前端：拖拽区 + 标签页/窗口命令 + 状态推送口（跨语言锚点）
+        let tb_js = include_str!("../../ui/settings/titlebar.js");
         for needle in [
             "data-tauri-drag-region",
-            "plugin:window|", // 命令名是拼的（'plugin:window|' + name），逐字只到这里
-            "'close'",
-            "'minimize'",
-            "'toggle_maximize'",
-            "__FNOS_APP_CHROME__",
+            "tab_new",
+            "tab_switch",
+            "tab_close",
+            "plugin:window|minimize",
+            "plugin:window|toggle_maximize",
+            "plugin:window|close",
+            "__FNOS_TABS_SET__",
         ] {
-            assert!(chrome.contains(needle), "标题栏脚本缺少：{needle}");
+            assert!(tb_js.contains(needle), "标签条脚本缺少：{needle}");
         }
-        assert!(!chrome.contains("innerHTML"), "标题栏脚本不得用 innerHTML");
+        assert!(!tb_js.contains("innerHTML"), "标签条脚本不得用 innerHTML");
+        let tb_html = include_str!("../../ui/settings/titlebar.html");
+        assert!(
+            tb_html.contains("data-tauri-drag-region"),
+            "标签条 HTML 必须带拖拽区"
+        );
     }
 }

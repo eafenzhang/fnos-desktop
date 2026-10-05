@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>fnOS 标签页栏</title>
+<link rel="stylesheet" href="titlebar.css">
+</head>
+<body>
+<!--
+  自绘标题栏（T14d）：标签条 + 窗口控制 + 拖拽区。
+  这个 Webview 是主窗口（无边框）里唯一「属于本壳」的一小块 UI，铺在窗口顶部
+  TAB_STRIP_H 高的一条里；下面的全部区域归标签页 Webview（fnOS 主页 / 外部应用）。
+  授权面见 capabilities/titlebar.json：三个标签页命令 + 四个窗口操作，仅此而已。
+-->
+<div id="titlebar" class="titlebar" data-tauri-drag-region>
+  <div id="tabs" class="tabs"></div>
+  <button id="newTab" class="new-tab" data-action="tab-new" title="新建标签页">+</button>
+  <div class="drag-fill" data-tauri-drag-region></div>
+  <div id="controls" class="controls"></div>
+</div>
+<script src="titlebar.js"></script>
+</body>
+</html>

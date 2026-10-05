@@ -1,0 +1,15 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "titlebar-chrome",
+  "description": "标签页栏（titlebar Webview，T14d）专用授权：自绘标题栏需要的最小窗口权限（拖拽移动 / 最小化 / 最大化切换 / 关闭——关闭走主窗口的 CloseRequested，照样服从 closeToTray）加上三个标签页命令（新建 / 切换 / 关闭标签页）。授权对象只有 titlebar 这一个 Webview；各标签页承载的第三方页面没有任何授权（连标签页命令都没有）——标签页的开关只能由这条栏发起。",
+  "webviews": ["titlebar"],
+  "permissions": [
+    "core:window:allow-start-dragging",
+    "core:window:allow-minimize",
+    "core:window:allow-toggle-maximize",
+    "core:window:allow-close",
+    "allow-tab-new",
+    "allow-tab-switch",
+    "allow-tab-close"
+  ]
+}

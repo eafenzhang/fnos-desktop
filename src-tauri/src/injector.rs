@@ -29,9 +29,8 @@ const KEEPALIVE_JS: &str = include_str!("../inject/keepalive.js");
 /// 桌面内窗口默认居中（T14c 修复轮 15）：fnOS 自己的应用窗口是桌面文档里的 DOM 元素，
 /// 它的窗口管理器默认级联摆位；本段让新窗口落在内容区正中（只写一次，不干预后续拖动）。
 const WINDOWPOS_JS: &str = include_str!("../inject/windowpos.js");
-/// 应用窗口的自绘标题栏脚本（T14c）。**不**属于主窗口的注入载荷，由
-/// `commands::open_app_window` 单独注入到 `app-*` 窗口（那里注的是应用页面本身）。
-pub(crate) const APP_CHROME_JS: &str = include_str!("../inject/appchrome.js");
+// T14d：`appchrome.js`（app-* 独立窗口的自绘标题栏）随独立窗口一起退役——
+// 外部应用现在开成主窗口标签条里的标签页，标题栏由 `ui/settings/titlebar.html` 统一承担。
 const CONTENT_SCRIPT_JS: &str = include_str!("../assets/fnos-mods/content-script.js");
 
 struct Assets {

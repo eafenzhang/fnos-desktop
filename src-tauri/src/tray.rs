@@ -21,7 +21,7 @@ use tauri::{
     image::Image,
     menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::TrayIconBuilder,
-    AppHandle, Manager, Runtime, WebviewWindow,
+    AppHandle, Manager, Runtime,
 };
 
 pub const TRAY_ID: &str = "main-tray";
@@ -83,7 +83,7 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
 /// 看不到。三步都对结果有贡献：`unminimize` 还原、`show` 兜住「窗口被 hide 到托盘」的
 /// 情形（`closeToTray=true` 时关窗走的就是 hide）、`set_focus` 才真正把它带到前台。
 pub fn show_main<R: Runtime>(app: &AppHandle<R>) {
-    if let Some(w) = app.get_webview_window(MAIN_WINDOW) {
+    if let Some(w) = app.get_window(MAIN_WINDOW) {
         let _ = w.unminimize();
         let _ = w.show();
         let _ = w.set_focus();
@@ -99,7 +99,8 @@ pub fn show_main<R: Runtime>(app: &AppHandle<R>) {
 /// 就已经带上——首启路径「建窗即可见」，build 之后才补套位置会让窗口先在 OS 默认的
 /// 左上角落脚、再跳到保存的位置（用户实测「启动时从左上跳到居中」）。本函数保留为
 /// **幂等兜底**：同一份配置再套一次，正常路径下不改变任何值。
-pub fn apply_window_geom<R: Runtime>(w: &WebviewWindow<R>, cfg: &Config) {
+/// T14d：主窗口是 `Window`（无边框 + 多 Webview），这里的读写全是 Window 方法。
+pub fn apply_window_geom<R: Runtime>(w: &tauri::Window<R>, cfg: &Config) {
     let g = &cfg.shell.window;
     // 防御（消费侧）：权威夹取在 `config::WindowGeom::clamp_to_usable`（`Config::normalize`
     // 必经，Item 2），所以正常路径下这里不会看到 `w/h = 0`；保留这道判断是为了让

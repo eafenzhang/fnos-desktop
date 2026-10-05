@@ -1,0 +1,63 @@
+/* 自绘标题栏（T14d）：与上游 mods 的深色桌面同一套视觉语言。
+ * 高度由 Rust 侧 TAB_STRIP_H 决定（40 逻辑像素），这里保持一致。 */
+:root {
+  color-scheme: dark;
+  --bar-bg: #1b1c1e;
+  --bar-line: #2e3034;
+  --tab-bg: #232427;
+  --tab-active: #2e3034;
+  --fg: #e8e8ea;
+  --dim: #8b9096;
+  --accent: rgb(0, 102, 255);
+  --close-hover: #e81123;
+}
+* { box-sizing: border-box; user-select: none; }
+html, body { height: 100%; }
+body {
+  margin: 0; overflow: hidden;
+  font: 12px/1 "Microsoft YaHei", system-ui, sans-serif;
+  color: var(--fg);
+}
+.titlebar {
+  height: 40px; display: flex; align-items: center; gap: 4px;
+  padding: 0 6px; background: var(--bar-bg);
+  border-bottom: 1px solid var(--bar-line);
+}
+.tabs { display: flex; align-items: center; gap: 2px; min-width: 0; overflow: hidden; }
+.tab {
+  display: flex; align-items: center; gap: 6px; min-width: 0;
+  max-width: 180px; height: 28px; padding: 0 8px;
+  border-radius: 6px; color: var(--dim); background: transparent;
+}
+.tab.active { background: var(--tab-active); color: var(--fg); }
+.tab:not(.active):hover { background: color-mix(in srgb, var(--tab-active) 55%, transparent); }
+.tab .tab-title { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tab .tab-close {
+  flex: 0 0 auto; width: 16px; height: 16px; border: 0; border-radius: 4px;
+  background: transparent; color: inherit; font: inherit; line-height: 1;
+  display: none; align-items: center; justify-content: center; cursor: pointer;
+}
+.tab.active .tab-close, .tab:hover .tab-close { display: flex; }
+.tab .tab-close:hover { background: var(--close-hover); color: #fff; }
+.new-tab {
+  flex: 0 0 auto; width: 24px; height: 24px; border: 0; border-radius: 6px;
+  background: transparent; color: var(--fg); font-size: 14px; cursor: pointer;
+}
+.new-tab:hover { background: var(--tab-active); }
+/* 空白区域全是拖拽区（data-tauri-drag-region 由授权的 start-dragging 承接） */
+.drag-fill { flex: 1 1 auto; align-self: stretch; cursor: default; }
+.controls { display: flex; align-items: center; gap: 2px; flex: 0 0 auto; }
+.controls .win-btn {
+  width: 34px; height: 30px; border: 0; border-radius: 0;
+  background: transparent; color: var(--fg); font-size: 12px; cursor: pointer;
+}
+.controls .win-btn:hover { background: var(--tab-active); }
+.controls .win-btn.close:hover { background: var(--close-hover); color: #fff; }
+/* mac 风格：红绿灯在左（body.mac 下 controls 内渲染三颗灯），标签随后 */
+body.mac .titlebar { flex-direction: row; padding-left: 8px; }
+.traffic { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; margin-right: 4px; }
+.traffic .light { width: 12px; height: 12px; border-radius: 50%; border: 0; cursor: pointer; padding: 0; }
+.traffic .light.red { background: #ff5f57; }
+.traffic .light.yellow { background: #febc2e; }
+.traffic .light.green { background: #28c840; }
+.traffic .light:hover { filter: brightness(1.15); }
