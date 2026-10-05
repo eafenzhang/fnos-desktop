@@ -33,7 +33,9 @@ body {
 .tab .tab-title { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .tab .tab-close {
   flex: 0 0 auto; width: 16px; height: 16px; border: 0; border-radius: 4px;
-  background: transparent; color: inherit; font: inherit; line-height: 1;
+  background: transparent; color: inherit; line-height: 1;
+  font-family: "Segoe Fluent Icons", "Segoe MDL2 Assets", sans-serif;
+  font-size: 13px;
   display: none; align-items: center; justify-content: center; cursor: pointer;
 }
 .tab.active .tab-close, .tab:hover .tab-close { display: flex; }
@@ -45,11 +47,18 @@ body {
 .new-tab:hover { background: var(--tab-active); }
 /* 空白区域全是拖拽区（data-tauri-drag-region 由授权的 start-dragging 承接） */
 .drag-fill { flex: 1 1 auto; align-self: stretch; cursor: default; }
-/* 窗口控制：系统默认观感——右对齐、整高按钮、悬停浅灰、关闭悬停红（Windows 11） */
+/* 窗口控制：**与系统标题栏一致**（T14d 修复轮 4）——46px 整高按钮 + 系统图标字体
+ * （Segoe Fluent Icons / Segoe MDL2 Assets 与 Windows 标题栏同款字形、同码点），
+ * 右对齐、悬停浅灰、关闭悬停红（Windows 11 观感）。字形比早先的文本字符 ─□× 明显
+ * 更大更粗（用户反馈「icon 太小」）。 */
 .controls { display: flex; align-items: stretch; flex: 0 0 auto; align-self: stretch; }
 .controls .win-btn {
   width: 46px; border: 0; border-radius: 0; padding: 0;
-  background: transparent; color: var(--fg); font-size: 12px; cursor: pointer;
+  background: transparent; color: var(--fg); cursor: pointer;
+  font-family: "Segoe Fluent Icons", "Segoe MDL2 Assets", "Arial Unicode MS", sans-serif;
+  font-size: 13px; /* 视觉字形 ≈10px，与 Windows 11 系统 caption 按钮一致（16px 实测偏大） */
+  line-height: 1;
+  display: flex; align-items: center; justify-content: center;
 }
 .controls .win-btn:hover { background: color-mix(in srgb, var(--fg) 12%, transparent); }
 .controls .win-btn.close:hover { background: var(--close-hover); color: #fff; }

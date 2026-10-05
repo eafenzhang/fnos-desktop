@@ -1,16 +1,17 @@
-/* fnOS Desktop — 一行式标题栏（标签 + 窗口控制）的渲染与指令分发（T14d 修复轮 3）。
+/* fnOS Desktop — 一行式标题栏（标签 + 窗口控制）的渲染与指令分发（T14d 修复轮 4）。
  *
  * 这个脚本跑在 `titlebar` Webview 里（主窗口顶部 TAB_STRIP_H 高的一条）。状态由宿主
- * （Rust `commands::push_tabs`）通过 `__FNOS_TABS_SET__` 推送——它是**单向**的：本脚本
- * 不维护任何状态，只渲染最近一次推送，并把用户点击翻译成 invoke 命令。
+ * （Rust `commands::push_tabs` / `relayout_main_window`）单向推送：
+ *   `__FNOS_TABS_SET__`   —— 标签列表（渲染最近一次推送，本脚本不维护状态）；
+ *   `__FNOS_WIN_MAX_SET__` —— 窗口是否最大化（切换 □ / 还原 的按钮字形）。
  *
- * 用户要求（修复轮 2 + 3）：最大化 / 最小化 / 关闭用**系统默认样式**——右对齐的
- * ─ □ ×（Windows 11 原生观感：悬停浅灰、关闭悬停红），固定不变、不跟随上游 mod 的
- * 标题栏样式；桌面内置应用窗口的样式仍由上游 mod 的「标题栏样式」设置接管。
+ * 用户要求（修复轮 2 → 4）：最大化 / 最小化 / 关闭用**系统默认样式**——右对齐按钮、
+ * **系统图标字体**（Segoe Fluent Icons / Segoe MDL2 Assets，与 Windows 标题栏同款字形
+ * 与尺寸），最大化 ↔ 还原字形随状态切换。桌面内置应用窗口的样式仍由上游 mod 的
+ * 「标题栏样式」设置接管，与本栏无关。
  *
  * 命令授权（capabilities/titlebar.json）：tab_new / tab_switch / tab_close + 窗口的
  * minimize / toggle_maximize / close + 拖拽（data-tauri-drag-region）。
- * 除这些之外没有任何能力——这里连配置都读不到。
  */
 (function () {
   'use strict';
@@ -18,6 +19,14 @@
   var W = typeof window !== 'undefined' ? window : globalThis;
   var D = W.document || (typeof document !== 'undefined' ? document : null);
   var STRIP_H = 40; // 与 Rust 侧 TAB_STRIP_H 一致（有跨语言断言）
+
+  // 系统标题栏同款字形：Segoe Fluent Icons（Win11）与 Segoe MDL2 Assets（Win10）共用
+  // 这些码点，字体栈在 CSS 里逐级回落。字符就是私用区码点本身（U+E921/E922/E923/E8BB，
+  // 字节已核对），文件以 UTF-8 保存。
+  var GLYPH_MINIMIZE = ''; // minimize ─
+  var GLYPH_MAXIMIZE = ''; // maximize □
+  var GLYPH_RESTORE = ''; // restore（最大化状态的按钮字形）
+  var GLYPH_CLOSE = ''; // close ×
 
   var invoke = function (cmd, args) {
     var internals = W.__TAURI_INTERNALS__;
@@ -50,7 +59,7 @@
         close.className = 'tab-close';
         close.dataset.action = 'close';
         close.dataset.tabId = String(tab.id);
-        close.textContent = '×';
+        close.textContent = GLYPH_CLOSE;
         close.title = '关闭标签页';
         item.appendChild(close);
       }
@@ -58,14 +67,18 @@
     });
   }
 
+  /** maximize 按钮引用（供 __FNOS_WIN_MAX_SET__ 切换字形）。 */
+  var maxBtn = null;
+
   /**
-   * 窗口控制区（**系统默认观感**，固定 windows 形态）：右对齐 ─ □ ×。
+   * 窗口控制区（**系统默认观感**，固定 windows 形态）：右对齐三个系统图标按钮。
    * 关闭走主窗口的 CloseRequested：照样服从 closeToTray（收起而不是退出）。
    */
   function renderControls() {
     var host = D.getElementById('controls');
     if (!host) return;
     host.textContent = '';
+    maxBtn = null;
     var button = function (cls, glyph, action, title) {
       var b = D.createElement('button');
       b.className = cls;
@@ -73,10 +86,18 @@
       b.textContent = glyph;
       b.title = title;
       host.appendChild(b);
+      return b;
     };
-    button('win-btn', '─', 'minimize', '最小化');
-    button('win-btn', '□', 'maximize', '最大化 / 还原');
-    button('win-btn close', '×', 'close', '关闭');
+    button('win-btn', GLYPH_MINIMIZE, 'minimize', '最小化');
+    maxBtn = button('win-btn maximize', GLYPH_MAXIMIZE, 'maximize', '最大化');
+    button('win-btn close', GLYPH_CLOSE, 'close', '关闭');
+  }
+
+  /** 宿主推送的窗口最大化状态 → 切换按钮字形（系统标题栏语义）。 */
+  function setMaxState(max) {
+    if (!maxBtn) return;
+    maxBtn.textContent = max ? GLYPH_RESTORE : GLYPH_MAXIMIZE;
+    maxBtn.title = max ? '还原' : '最大化';
   }
 
   /** 点击分发：`data-action` → invoke。close/switch 带上所在标签的 id。 */
@@ -115,9 +136,9 @@
     }
   }
 
-  // 宿主推送标签条状态（Rust `push_tabs`；eval 是单向的，所以用全局函数回话）。
-  // 必须在脚本顶层就位：宿主的第一条推送可能先于 boot 的事件绑定到达。
+  // 宿主推送口（Rust eval；单向、必须在脚本顶层就位——首条推送可能先于 boot 到达）。
   window.__FNOS_TABS_SET__ = render;
+  window.__FNOS_WIN_MAX_SET__ = setMaxState;
 
   function boot() {
     var bar = D.getElementById('titlebar');
@@ -133,10 +154,10 @@
     });
   }
 
-  // 真实页面自动启动；单测只导入 render/renderControls（无 DOM 断言隔离）
+  // 真实页面自动启动；单测只导入 render/renderControls/setMaxState（无 DOM 断言隔离）
   if (D && D.getElementById('titlebar')) {
     boot();
   }
 
-  window.__FNOS_TITLEBAR__ = { render: render, renderControls: renderControls };
+  window.__FNOS_TITLEBAR__ = { render: render, renderControls: renderControls, setMaxState: setMaxState };
 })();

@@ -78,14 +78,25 @@ test('渲染：状态由 __FNOS_TABS_SET__ 单向推送，标题/激活态/关�
   assert.equal(doc.getElementById('tabs').children.length, 1);
 });
 
-test('窗口控制：─ □ × 右对齐（系统默认观感），点击翻译成窗口命令', () => {
+test('窗口控制：系统图标字体的 ─ □ ×（46px 整高），点击翻译成窗口命令', () => {
   const { doc } = fakeTitlebar();
   const w = loadTitlebar(doc);
   w.__FNOS_TITLEBAR__.renderControls();
   const controls = doc.getElementById('controls').children;
   assert.deepEqual(controls.map((b) => b.dataset.action), ['minimize', 'maximize', 'close']);
   assert.equal(controls[0].className, 'win-btn');
+  assert.equal(controls[1].className, 'win-btn maximize');
   assert.equal(controls[2].className, 'win-btn close', '关闭钮必须带 close class（悬停红）');
+  // 系统标题栏同款字形：Segoe 图标字体的私用区码点（不是文本字符 ─□×）
+  assert.equal(controls[0].textContent.codePointAt(0), 0xe921, '最小化 = U+E921');
+  assert.equal(controls[1].textContent.codePointAt(0), 0xe922, '最大化 = U+E922');
+  assert.equal(controls[2].textContent.codePointAt(0), 0xe8bb, '关闭 = U+E8BB');
+  // 最大化 ↔ 还原字形切换（宿主 __FNOS_WIN_MAX_SET__ 推送状态）
+  w.__FNOS_TITLEBAR__.setMaxState(true);
+  assert.equal(controls[1].textContent.codePointAt(0), 0xe923, '最大化状态下按钮 = U+E923（还原）');
+  assert.equal(controls[1].title, '还原');
+  w.__FNOS_WIN_MAX_SET__(false);
+  assert.equal(controls[1].textContent.codePointAt(0), 0xe922, '还原后回到 U+E922');
   // 源码级：三条窗口命令
   for (const cmd of ['plugin:window|minimize', 'plugin:window|toggle_maximize', 'plugin:window|close']) {
     assert.ok(TB_JS.includes(`invoke('${cmd}')`), `缺少窗口命令：${cmd}`);
@@ -122,6 +133,10 @@ test('纪律：固定系统默认观感（无 mac 分支）、不碰页面内容
   assert.ok(!TB_CSS.includes('.traffic'), 'titlebar.css 不得有红绿灯样式');
   assert.ok(!TB_JS.includes('innerHTML'), '不得用 innerHTML');
   assert.ok(TB_JS.includes('STRIP_H = 40'), '栏高 40 与 Rust TAB_STRIP_H 一致');
+  // 系统标题栏一致性（修复轮 4）：图标必须走系统字体栈，按钮 46px 整高
+  assert.ok(TB_CSS.includes('"Segoe Fluent Icons"') && TB_CSS.includes('"Segoe MDL2 Assets"'),
+    '窗口按钮必须用系统图标字体（与 Windows 标题栏同款字形）');
+  assert.ok(TB_CSS.includes('width: 46px'), '按钮宽度必须与系统标题栏一致（46px）');
   const rust = readFileSync(new URL('../src-tauri/src/commands.rs', import.meta.url), 'utf8');
   assert.ok(rust.includes('pub const TAB_STRIP_H: f64 = 40.0;'),
     'Rust 侧标签栏高度必须是 40（跨语言锚点）');

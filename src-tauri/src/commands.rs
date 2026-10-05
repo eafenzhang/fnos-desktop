@@ -908,6 +908,23 @@ fn push_tabs<R: Runtime>(app: &AppHandle<R>) {
         }
         Err(e) => eprintln!("[fnos] 标签条状态序列化失败: {e}"),
     }
+    push_win_max(app);
+}
+
+/// 把窗口「是否最大化」推给标签条（`__FNOS_WIN_MAX_SET__`：切换 □ / 还原按钮字形）。
+/// 建窗后（[`push_tabs`]）与每次窗口 resize（[`relayout_main_window`]，最大化/还原都会
+/// 触发 Resized）各推一次——按钮字形始终与系统标题栏语义一致。
+fn push_win_max<R: Runtime>(app: &AppHandle<R>) {
+    let Some(titlebar) = app.get_webview(TITLEBAR_WEBVIEW) else {
+        return;
+    };
+    let Some(window) = app.get_window(MAIN_WINDOW) else {
+        return;
+    };
+    let maximized = window.is_maximized().unwrap_or(false);
+    let _ = titlebar.eval(format!(
+        "window.__FNOS_WIN_MAX_SET__ && window.__FNOS_WIN_MAX_SET__({maximized});"
+    ));
 }
 
 // ---------- 标签页命令（只授 titlebar Webview，见 capabilities/titlebar.json） ----------
@@ -1001,6 +1018,8 @@ pub fn relayout_main_window<R: Runtime>(window: &tauri::Window<R>, size: tauri::
         };
         let _ = wv.set_bounds(bounds);
     }
+    // 最大化 / 还原都会走 Resized：把新状态推给标签条（切换 □ / 还原按钮字形）
+    push_win_max(window.app_handle());
 }
 
 /// 建**内置错误页**窗口（Task 11 / spec §12.3「主窗口加载失败/离线」）。
@@ -3230,6 +3249,7 @@ mod tests {
             "tab_switch",
             "tab_close",
             "__FNOS_TABS_SET__",
+            "__FNOS_WIN_MAX_SET__",
             "plugin:window|minimize",
             "plugin:window|toggle_maximize",
             "plugin:window|close",
@@ -3241,6 +3261,24 @@ mod tests {
             assert!(!tb_js.contains(gone), "标签条脚本不得有样式分支：{gone}");
         }
         assert!(!tb_js.contains("innerHTML"), "标签条脚本不得用 innerHTML");
+        // 宿主侧：最大化状态推送口必须存在，且建窗后与 resize 后各推一次
+        // （按钮字形 □ ↔ 还原 与系统标题栏语义一致）
+        let src = include_str!("commands.rs");
+        let code_end = src.find("#[cfg(test)]").expect("测试模块存在");
+        let code = &src[..code_end];
+        assert!(
+            code.contains("fn push_win_max") && code.contains("__FNOS_WIN_MAX_SET__"),
+            "宿主必须有最大化状态推送口"
+        );
+        let push_count = code.matches("push_win_max(").count();
+        assert!(
+            push_count >= 2,
+            "建窗后（push_tabs）与 resize 后（relayout）都必须推最大化状态"
+        );
+        assert!(
+            code.contains("is_maximized()"),
+            "最大化状态必须来自 Window::is_maximized（不是猜的）"
+        );
         let tb_html = include_str!("../../ui/settings/titlebar.html");
         assert!(
             tb_html.contains("data-tauri-drag-region"),
