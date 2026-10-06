@@ -661,10 +661,14 @@ fn build_main_window_with<R: Runtime>(
         // `save_window_geom`），所以这里不会再拿到 `0x0` 或负数。
         .inner_size(cfg.shell.window.w, cfg.shell.window.h)
         // T14d 修复轮 3（用户要求「标签页合并到标题栏」）：**无边框 + 一行式自绘标题栏**——
-        // 标签与窗口控制（─ □ ×，系统默认观感）同处一条 40px 的栏里，不再有单独的原生
+        // 标签与窗口控制（─ □ ×，系统默认观感）同处一条 32px 的栏里，不再有单独的原生
         // 标题行。窗口控制由 titlebar Webview 的按钮经授权的窗口命令承担；拖拽区是栏内
         // 空白。桌面内置应用窗口的样式仍由上游 mod 的「标题栏样式」设置接管，与本栏无关。
-        .decorations(false);
+        .decorations(false)
+        // T14d 修复轮 7（用户报「标题栏下面的线条」）：窗口背景钉成标题栏同色。
+        // 无边框窗口未设背景时 Windows 用默认白底——标题栏 Webview 与内容 Webview 之间
+        // 任何 1px 的合成缝都会露出白线；背景与栏同色后，缝与栏同色 = 视觉无线。
+        .background_color(tauri::window::Color(0x1b, 0x1c, 0x1e, 0xff));
     // 位置建窗时就带上（T14c 修复轮 20）：不让窗口先在 OS 默认位置落脚再跳。
     match (cfg.shell.window.x, cfg.shell.window.y) {
         (Some(x), Some(y)) if x > -10000.0 && y > -10000.0 => {
@@ -1045,7 +1049,9 @@ fn build_error_window<R: Runtime>(
     let mut builder = WindowBuilder::new(app, MAIN_WINDOW)
         .title("fnOS — 页面加载失败")
         .inner_size(cfg.shell.window.w, cfg.shell.window.h)
-        .decorations(false);
+        .decorations(false)
+        // 与 build_main_window_with 同理（修复轮 7）：背景钉标题栏色，webview 缝不显白线
+        .background_color(tauri::window::Color(0x1b, 0x1c, 0x1e, 0xff));
     // 与 [`build_main_window_with`] 同理（T14c 修复轮 20）：位置建窗时就带上，
     // 不让错误页窗口也「先在左上角落脚、再跳走」。
     match (cfg.shell.window.x, cfg.shell.window.y) {
@@ -3288,6 +3294,13 @@ mod tests {
         assert!(
             tb_html.contains("id=\"controls\""),
             "一行式标题栏必须带窗口控制区（用户要求合并）"
+        );
+        // 修复轮 7（用户报「标题栏下面的线条」）：窗口背景 = 标题栏色——
+        // 两条建窗路径（主窗 + 错误页窗）都要设，webview 缝才不会露出白线
+        assert_eq!(
+            code.matches("background_color(tauri::window::Color").count(),
+            2,
+            "主窗口与错误页窗口都必须设标题栏同色背景"
         );
     }
 }

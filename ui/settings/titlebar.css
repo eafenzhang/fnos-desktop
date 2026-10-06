@@ -57,7 +57,11 @@ body {
   font-family: "Segoe Fluent Icons", "Segoe MDL2 Assets", sans-serif;
   font-size: 8px; /* 用户反馈：关闭 icon 调小 */
   display: flex; align-items: center; justify-content: center; cursor: pointer;
+  /* 默认不显示、鼠标悬浮才显示（用户要求）。用 visibility 而不是 display：
+   * 按钮始终占 14px 位，悬浮出现时标题不跳动（144px 固定宽下标题截断位置恒定） */
+  visibility: hidden;
 }
+.tab:hover .tab-close { visibility: visible; }
 .tab .tab-close:hover { background: var(--close-hover); color: #fff; }
 .new-tab {
   flex: 0 0 auto; width: 22px; height: 22px; border: 0; border-radius: 5px;
