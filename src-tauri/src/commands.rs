@@ -135,6 +135,14 @@ pub struct AppState {
     pub tabs: Mutex<TabState>,
     /// 下一个标签页的编号（`tab-N` 的 N；跨重建累加，保证 label 不与历史冲突）。
     pub next_tab: AtomicU64,
+    /// 「已为该页面开过标签」的登记表：[`page_key`]（剥 query/fragment 的
+    /// scheme+host+port+path）→ 标签 label（T14e）。
+    ///
+    /// 为什么需要：中继转发流程会**反复** `window.open` 同一地址——每次都开新标签就是
+    /// 标签爆炸、主标签停在选择页「进不了桌面」（用户实测）。命中登记表时先校验标签
+    /// 还活着（被关过就清掉条目继续开），活着就**复用切换**、绝不新开。
+    /// 只在内存里；标签关闭（[`tab_close`]）与窗口重建时清理。
+    pub open_tabs: Mutex<std::collections::HashMap<String, String>>,
 }
 
 /// 主窗口的标签页状态（见 [`AppState::tabs`]）。
@@ -771,6 +779,17 @@ fn tab_webview_builder<R: Runtime>(
         .on_new_window(move |url, _features| new_window_verdict(&app_for_new_window, url))
 }
 
+/// 「同一页面」的登记键：scheme+host+port+path（**剥掉 query/fragment**）。
+///
+/// T14e：中继转发流程的重复 `window.open` 常带变化的时间戳/随机参数——不剥的话
+/// 精确比对永远不相等，去重失效；而 path 不同就是不同页面（不做跨页合并）。
+fn page_key(url: &tauri::Url) -> String {
+    let mut u = url.clone();
+    u.set_query(None);
+    u.set_fragment(None);
+    u.to_string()
+}
+
 /// 新窗口请求的裁定（`window.open` / `target=_blank`）→ **开成标签页**（T14d）。
 ///
 /// 背景（T14c 修复轮 11，实测）：Hermes Studio 这类「外部 Web 应用」的启动路径就是
@@ -784,6 +803,10 @@ fn tab_webview_builder<R: Runtime>(
 /// 在异步上下文里创建。代价是页面侧 `window.open` 的返回值是 `null`（fnOS 启动台与
 /// 已知应用都不使用返回值）。
 ///
+/// 复用闸门（T14e，用户实测「中继转发会一直新开标签」）：中继连接流程会**反复**
+/// `window.open` 同一地址——命中登记表（[`page_key`]，见 [`AppState::open_tabs`]）或
+/// main 当前页时**切换复用、绝不新开**；登记过的标签被关过则清掉条目照常新开。
+///
 /// 安全边界：只给 `http` / `https` / `about`（`about:blank` 是弹窗流程常见的起始页）
 /// 开标签页，其余协议（`file:` / `data:` / `javascript:` …）一律 `Deny` 并留一行日志，
 /// 且**不**转交。
@@ -796,6 +819,42 @@ fn new_window_verdict<R: Runtime>(
         other => {
             eprintln!("[fnos] 拒绝非 http(s) 的新窗口请求（scheme={other}）：{url}");
             return tauri::webview::NewWindowResponse::Deny;
+        }
+    }
+    // 复用闸门（T14e：中继转发一直新开标签的止血）：目标页面已经有活着的标签
+    // （登记表命中并验活，或它就是 main 的当前页）→ 切过去，绝不新开。
+    {
+        let key = page_key(&url);
+        let registered = {
+            let state = app.state::<AppState>();
+            let map = state.open_tabs.lock().unwrap();
+            map.get(&key).cloned()
+        };
+        if let Some(existing) = registered {
+            if app.get_webview(&existing).is_some() {
+                let app_for_switch = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    activate_tab(&app_for_switch, &existing);
+                });
+                eprintln!("[fnos] window.open -> 已有相同页面的标签，复用切换（不新开）：{url}");
+                return tauri::webview::NewWindowResponse::Deny;
+            }
+            // 登记的标签已被关闭 → 清掉失效条目，继续走新建
+            let state = app.state::<AppState>();
+            state.open_tabs.lock().unwrap().remove(&key);
+        }
+        // main 当前页也算「已打开」（中继选择页 open 到桌面地址时不再多一个桌面标签）
+        if let Some(main_wv) = app.get_webview(MAIN_WINDOW) {
+            if let Ok(main_url) = main_wv.url() {
+                if page_key(&main_url) == key {
+                    let app_for_switch = app.clone();
+                    tauri::async_runtime::spawn(async move {
+                        activate_tab(&app_for_switch, MAIN_WINDOW);
+                    });
+                    eprintln!("[fnos] window.open -> 与桌面标签相同，切换复用（不新开）：{url}");
+                    return tauri::webview::NewWindowResponse::Deny;
+                }
+            }
         }
     }
     let app = app.clone();
@@ -843,6 +902,16 @@ pub async fn open_app_tab<R: Runtime>(app: &AppHandle<R>, url: tauri::Url) -> Re
             LogicalSize::new(lw, lh - TAB_STRIP_H),
         )
         .map_err(|e| format!("创建标签页失败：{e}"))?;
+    // 登记「该页面已有标签」（T14e 复用闸门）：同一页面再次 window.open 时
+    // 切过来而不是新开（中继流程的连续 open 就靠它止血）。
+    {
+        let state = app.state::<AppState>();
+        state
+            .open_tabs
+            .lock()
+            .unwrap()
+            .insert(page_key(&url), label.clone());
+    }
     activate_tab(app, &label);
     Ok(label)
 }
@@ -976,6 +1045,13 @@ pub async fn tab_close<R: Runtime>(app: AppHandle<R>, label: String) -> Result<(
         };
         tabs.order.remove(pos);
         tabs.titles.remove(&label);
+        // T14e：同时清掉复用登记表里 value == 该标签的条目
+        //（命中的失效条目在 verdict 里也会自愈清理，这里显式清避免残留）
+        state
+            .open_tabs
+            .lock()
+            .unwrap()
+            .retain(|_, l| l != &label);
         let activate = if tabs.active == label {
             // 优先左邻（浏览器语义），越界回第一个
             Some(tabs.order[pos.saturating_sub(1)].clone())
@@ -2238,6 +2314,7 @@ pub fn save_and_install_state<R: Runtime>(
         chunk_report: Mutex::new(None),
         tabs: Mutex::new(TabState::with_main()),
         next_tab: AtomicU64::new(1),
+        open_tabs: Mutex::new(std::collections::HashMap::new()),
     });
 }
 
@@ -3131,6 +3208,46 @@ mod tests {
         assert!(
             !apply_body.contains("\"homeUrl\"") && !apply_body.contains("\"nasUrl\""),
             "免刷新通道同样不得把宿主私有的 homeUrl/nasUrl 发给页面"
+        );
+    }
+
+    /// T14e（用户实测「中继转发会一直新开标签」）：复用闸门——同一页面绝不重复开标签。
+    /// `page_key` 剥掉 query/fragment（中继流程的重复 open 带变化的时间戳参数）。
+    #[test]
+    fn window_open_reuses_existing_tab_for_same_page() {
+        let a = tauri::Url::parse("https://ea121314.fnos.net/relay?ts=111").unwrap();
+        let b = tauri::Url::parse("https://ea121314.fnos.net/relay?ts=222&x=3").unwrap();
+        assert_eq!(page_key(&a), page_key(&b), "query 不同的同一页面必须同键（中继循环去重靠它）");
+        let other = tauri::Url::parse("https://ea121314.fnos.net/desktop").unwrap();
+        assert_ne!(page_key(&a), page_key(&other), "不同 path 是不同页面，不得合并");
+        let frag = tauri::Url::parse("https://ea121314.fnos.net/relay#s2").unwrap();
+        assert_eq!(page_key(&a), page_key(&frag), "fragment 不参与比对");
+
+        let src = include_str!("commands.rs");
+        let code_end = src.find("#[cfg(test)]").expect("测试模块存在");
+        let code = &src[..code_end];
+        // 复用闸门三处：登记表命中并验活、main 当前页复用、命中即切不新建
+        assert!(
+            code.contains("map.get(&key).cloned()"),
+            "必须先查复用登记表"
+        );
+        assert!(
+            code.contains("if app.get_webview(&existing).is_some()"),
+            "命中必须验活（标签被关过就清条目继续开）"
+        );
+        assert!(
+            code.contains("复用切换（不新开）") && code.contains("与桌面标签相同，切换复用"),
+            "命中路径必须是切换复用并留日志"
+        );
+        // 登记与清理
+        assert!(
+            code.contains("state\n            .open_tabs\n            .lock()\n            .unwrap()\n            .insert(page_key(&url), label.clone());")
+                || code.contains(".insert(page_key(&url), label.clone());"),
+            "开标签成功后必须登记复用键"
+        );
+        assert!(
+            code.contains(".retain(|_, l| l != &label);"),
+            "关标签必须清登记表"
         );
     }
 
