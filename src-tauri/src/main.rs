@@ -34,7 +34,7 @@ fn main() {
             commands::save_and_install_state(app.handle(), &cfg, recovered_from_backup);
 
             // Finding 1：这里不再有 `cfg.shell.home_url.parse().expect("home url")`——
-            // 地址经 `resolve_main_url` 逐级校验回落（覆盖 → homeUrl → 默认常量），
+            // 地址经 `resolve_main_url` 逐级校验回落（覆盖 → nasUrl → homeUrl → 默认常量），
             // 手改出来的非法 homeUrl 再也不会变成启动即 panic（release 下 R9 隐藏控制台，
             // panic 的表现就是「双击无反应」）。
             let url = commands::resolve_main_url(&cfg, None);

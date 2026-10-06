@@ -1624,14 +1624,20 @@ fn schedule_auto_retry<R: Runtime>(app: AppHandle<R>, delay_ms: u64) {
     }
 }
 
-/// 主窗口地址：`url` 覆盖 → 配置 `homeUrl` → `DEFAULT_HOME_URL`，逐级回落。
+/// 主窗口地址：`url` 覆盖 → 配置 `nasUrl`（配了就直达 NAS 桌面，T14e）→
+/// 配置 `homeUrl` → `DEFAULT_HOME_URL`，逐级回落。
 ///
-/// Finding 1：用户可控文本**永不**进入 `expect`。三级都过 `config::parse_web_url`
-/// （`home_url_or_default` 本身已兜底），因此只有「常量被改坏」才可能走到最后的
-/// `unreachable!`——那条假设由 `config::tests::default_home_url_is_a_valid_web_url` 锁定。
+/// Finding 1：用户可控文本**永不**进入 `expect`。每一级都过 `config::parse_web_url`
+/// （`nas_target` / `home_url_or_default` 本身已兜底），因此只有「常量被改坏」才可能
+/// 走到最后的 `unreachable!`——那条假设由 `config::tests::default_home_url_is_a_valid_web_url` 锁定。
 pub fn resolve_main_url(cfg: &Config, url_override: Option<&str>) -> tauri::Url {
+    // T14e（用户实测「无法进入桌面」）：窗口重建后地址回到 homeUrl（fnos.net 门户），
+    // 要再走一遍 FN Connect 连接流程才回 NAS 桌面。用户配置了 `shell.nasUrl` 时优先用它
+    // ——「NAS 地址」就是他要的桌面。nas_target() 已做 http(s) 校验（空/非法 → "" →
+    // 落到下一级），不会 panic。
     let candidates = [
         url_override.unwrap_or(""),
+        cfg.shell.nas_target().unwrap_or(""),
         cfg.shell.home_url_or_default(),
         config::DEFAULT_HOME_URL,
     ];
@@ -3125,6 +3131,36 @@ mod tests {
         assert!(
             !apply_body.contains("\"homeUrl\"") && !apply_body.contains("\"nasUrl\""),
             "免刷新通道同样不得把宿主私有的 homeUrl/nasUrl 发给页面"
+        );
+    }
+
+    /// T14e（用户实测「无法进入桌面」）：启动地址的优先级 = 覆盖 → nasUrl（直达桌面）
+    /// → homeUrl → 默认常量；nasUrl 为空/非法时回落，不 panic。
+    #[test]
+    fn resolve_main_url_prefers_nas_url_when_configured() {
+        let mk = |nas: &str, home: &str| {
+            let mut c = crate::config::Config::default();
+            c.shell.nas_url = nas.into();
+            c.shell.home_url = home.into();
+            c
+        };
+        // 配了 nasUrl → 启动直达 NAS 桌面（不经过 fnos.net 门户）
+        let cfg = mk("https://ea121314.fnos.net/", "https://fnos.net/");
+        assert_eq!(
+            resolve_main_url(&cfg, None).as_str(),
+            "https://ea121314.fnos.net/"
+        );
+        // 没配 → homeUrl 照旧（向后兼容：现有用户行为不变）
+        let cfg = mk("", "https://fnos.net/");
+        assert_eq!(resolve_main_url(&cfg, None).as_str(), "https://fnos.net/");
+        // 非法 nasUrl → 回落 homeUrl（用户 typo 不会 panic）
+        let cfg = mk("not a url", "https://fnos.net/");
+        assert_eq!(resolve_main_url(&cfg, None).as_str(), "https://fnos.net/");
+        // url 覆盖永远优先（托盘重新加载等一次性覆盖）
+        let cfg = mk("https://ea121314.fnos.net/", "https://fnos.net/");
+        assert_eq!(
+            resolve_main_url(&cfg, Some("http://other.local:5000/")).as_str(),
+            "http://other.local:5000/"
         );
     }
 

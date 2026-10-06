@@ -236,7 +236,8 @@ impl ShellConfig {
     ///
     /// 注（T13b fix round 1 订正注释）：托盘的「打开 NAS」菜单项、`tray::sync_menus` 与
     /// `commands::open_nas` 都已随托盘精简删除；这条取值器现在唯一的消费方是
-    /// `normalize`（把合法 `nasUrl` 的 origin 并入注入白名单，见 `enabled_origins`）。
+    /// `normalize`（把合法 `nasUrl` 的 origin 并入注入白名单，见 `enabled_origins`），
+    /// 以及 T14e 起的 `commands::resolve_main_url`（配了 nasUrl 启动直达 NAS 桌面）。
     pub fn nas_target(&self) -> Option<&str> {
         self.nas_url_parsed()?;
         Some(self.nas_url.trim())
