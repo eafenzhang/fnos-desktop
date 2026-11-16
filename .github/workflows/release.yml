@@ -1,9 +1,14 @@
-# 自动构建与发布（T14c 修复轮 21）。
+# 自动构建与发布（T14c 修复轮 21；P1 增补测试门禁）。
 #
-# 两条触发线：
-# - push 到 master：构建冒烟（及时暴露编译/打包错误，不发版）；
-# - push 标签 v*：构建 + 创建 GitHub Release 并上传 NSIS 安装包 —— 这是「发布新版本」。
-#   （tauri-action 的 tagName 为空时不建 Release，只构建——用同一份 job 承载两条线。）
+# 触发线：
+# - push 到 master / PR：**先跑测试**（Rust 单测 + 前端契约测试），全绿才继续构建冒烟；
+# - push 标签 v*：测试 → 构建 → 创建 GitHub Release 并上传 NSIS 安装包 —— 这就是「发布新版本」。
+#   （tauri-action 的 tagName 为空时不建 Release，只构建——同一份 job 承载两条线。）
+#
+# 为什么测试要进 CI：本仓有 126 项 Rust 单测 + 151 项前端契约测试（含大量「源码级锁」，
+# 锁的是跨语言常量、授权面、注入段序这类**编译期看不出来**的不变式）。此前它们只在本地跑，
+# 发版靠 `git tag && git push` 直接出包——测试红了也照样发。测试 job 失败会直接拦住
+# 后面的 build job（`needs: test`），发版流程因此有了一道真正的门。
 #
 # 发版流程：把 src-tauri/tauri.conf.json 与 src-tauri/Cargo.toml 的 version **一起**改成
 # 新版本 → commit → `git tag vX.Y.Z && git push origin master vX.Y.Z`。
@@ -14,6 +19,7 @@ on:
   push:
     branches: [master]
     tags: ['v*']
+  pull_request:
   workflow_dispatch:
 
 permissions:
@@ -24,7 +30,34 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # 测试门禁：不过就不构建、不发版。
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # 前端契约测试是零依赖的（package.json 里没有 dependencies，`node --test` 直接跑）。
+      - name: Frontend contract tests
+        run: npm test
+
+      # Rust 单测：其中相当一部分是「读源码断言」式的跨语言锁（注入段序、授权面、
+      # 常量一致性），它们不需要 WebView2 运行时，可以在 CI 里跑。
+      - name: Rust unit tests
+        working-directory: src-tauri
+        run: cargo test --all-targets
+
   build:
+    needs: test
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4

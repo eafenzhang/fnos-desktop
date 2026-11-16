@@ -14,6 +14,25 @@
 /// （设置窗本地状态，`local-store.json`，只存字符串且有大小上限）与 `request_app_items`
 /// （**无参数**，请主窗口页面重新汇报一次启动台应用项；只授设置窗、并进 remote-deny）。
 fn main() {
+    // ── `ui/` 改动的重编译保证（P2）─────────────────────────────────────────────
+    //
+    // `main.rs` 用的是 `tauri::generate_context!()`：它在**宏展开期**读 `frontendDist`
+    // （`../ui/settings`）并把资产嵌进二进制，而宏展开发生在编译本 crate 的时候。
+    // 问题在于 `tauri-codegen` 的资产嵌入路径**不为自己发 `rerun-if-changed`**
+    // （`tauri-codegen-2.7.0` 里搜不到针对 dist 目录的那条；`tauri-build` 只有在用
+    // `Attributes::codegen(...)` / `tauri_build_context!` 那条路时才发，见
+    // `tauri-build-2.7.0/src/codegen/context.rs:96`——本仓没用那条路）。
+    // 于是「只改 `ui/` 里的设置窗」时 cargo 认为 crate 没变、不重编，装出来的还是旧 UI。
+    //
+    // 对策（README 第 75 行原来让人手动改 `main.rs` 时间戳，靠自觉）：
+    // build script 只要重跑，cargo 就会**重编本 crate**，宏再展开一次 → 资产是新的。
+    // 所以这里替 `ui/settings` 整棵树发一条 `rerun-if-changed`，把「记得手动 touch」
+    // 变成机制保证。目录形式的 rerun-if-changed 由 cargo 递归跟踪。
+    let ui_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../ui/settings");
+    if ui_dir.exists() {
+        println!("cargo:rerun-if-changed={}", ui_dir.display());
+    }
+
     tauri_build::try_build(tauri_build::Attributes::new().app_manifest(
         tauri_build::AppManifest::new().commands(&[
             "get_config",

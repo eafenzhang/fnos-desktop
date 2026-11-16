@@ -16,9 +16,15 @@
 - **托盘常驻**：显示窗口 / 重新加载 / 系统设置 / 检查更新 / 退出；关闭窗口默认收到托盘
   （`closeToTray` 可关）。
 - **检查更新 + 自动升级**：托盘一键检查 GitHub Releases；有新版本时**自动下载安装包**
-  （下载到配置目录 `updates\`，同名复用、`.part` 原子落盘、体积健全性校验），确认后
+  （下载到配置目录 `updates\`，同名复用前先校验、`.part` 原子落盘 + 进程内唯一名、
+  体积健全性校验、**sha256 与 release 的 `assets[].digest` 比对**），确认后
   **静默安装并自动重启**。下载地址的 host 与路径被钉死在本仓库的发布资产下，
-  本地环回 / 内网地址一律拒绝。
+  本地环回 / 内网地址一律拒绝；重复点击有重入闸门，不会并发下载。
+- **多标签页 + 自带标题栏**：主窗口是无边框窗口，顶部一条自绘栏（品牌图标 + 标签 + ─ □ ×）；
+  fnOS 里 `window.open` 出来的外部应用开成标签页而不是独立窗口，同一页面被反复
+  `window.open` 时**复用切换、不重复开**（FN Connect 中继流程靠这条止血）。
+- **本地日志**：所有 `[fnos]` 日志同时写 `%APPDATA%\com.fnos.desktop\app.log`
+  （4 MiB 轮转；`FNOS_LOG=0` 关）——release 版没有控制台，这是唯一可回传的现场。
 - **Dock 自动隐藏**（`inject/dock.js`，默认关，设置里开）：平时滑出屏幕、指针顶到边缘
   热区才唤出；并把 Dock 让出的那条宽度还给桌面（样式层声明式回收，无闪烁）。全屏应用
   不再为 Dock 让位。
@@ -49,11 +55,17 @@
 | 项 | 位置 |
 |---|---|
 | 配置 | `%APPDATA%\com.fnos.desktop\config.json`（损坏时自动备份为 `config.json.bak`） |
+| **运行日志** | `%APPDATA%\com.fnos.desktop\app.log`（超过 4 MiB 轮转为 `app.log.1`，磁盘占用 ≤ 8 MiB；`FNOS_LOG=0` 可关） |
 | 设置窗本地状态 | `%APPDATA%\com.fnos.desktop\local-store.json` |
 | 登录壁纸导入文件 | `%APPDATA%\com.fnos.desktop\`（文件名带内容指纹） |
 | 更新下载缓存 | `%APPDATA%\com.fnos.desktop\updates\` |
 | WebView2 缓存 | `%LOCALAPPDATA%\com.fnos.desktop\EBWebView` |
 | 配置目录覆盖 | 环境变量 `FNOS_DESKTOP_CONFIG_DIR`（隔离测试 / 便携） |
+
+**排障先看 `app.log`**：release 版没有控制台（`windows_subsystem = "windows"`），所以白屏 /
+加载失败 / `window.open` 裁定 / 标签页创建失败 / 更新下载与校验这些现场，唯一能回传的
+文本就是它。日志行格式 `YYYY-MM-DD HH:MM:SS.mmmZ [fnos] …`（UTC），页面可控文本一律
+经 `report::log_safe` 收口，不会伪造出额外行。
 
 ## 从源码构建
 
@@ -72,20 +84,23 @@ cd ..
 npm test                    # 前端契约测试（shim / bootstrap / dock / windowpos / 设置窗 / 上报通道）
 ```
 
-**改了 `ui/` 之后必须强制重编译**：`frontendDist` 资产在编译期嵌进二进制，`tauri-codegen`
-不为它发 `rerun-if-changed`。任选其一：
+**改了 `ui/` 之后不需要手动 touch**：`build.rs` 已对 `../ui/settings` 整棵树发了
+`cargo:rerun-if-changed`，build script 重跑 → 本 crate 重编 → `generate_context!` 重新嵌入
+资产。（此前的做法是手动 `cargo clean -p` 或改 `main.rs` 时间戳，靠记性，容易漏。）
 
-```powershell
-cargo clean -p fnos-desktop ; cargo build
-(Get-Item src\main.rs).LastWriteTime = Get-Date ; cargo build
-```
+> 背景：`tauri::generate_context!()` 在**宏展开期**读 `frontendDist` 并把资产嵌进二进制，
+> 而 `tauri-codegen` 不为同 crate 的资产目录发 `rerun-if-changed`（`tauri-build` 只在
+> `Attributes::codegen(...)` + `tauri_build_context!` 那条路里发）。由 build script 代为
+> 声明是改动最小、且不需要动运行时宏的方案。
 
 ## 发版（GitHub Actions 自动构建）
 
-[`.github/workflows/release.yml`](.github/workflows/release.yml) 有两条触发线：
+[`.github/workflows/release.yml`](.github/workflows/release.yml) 有三条触发线：
 
-- **push 到 `master`**：只做构建冒烟（及时暴露编译 / 打包错误，不发版）；
-- **push 标签 `v*`**：构建 NSIS 安装包并**自动创建 GitHub Release** 上传——这就是「发布新版本」。
+- **push 到 `master` / PR**：先跑**测试门禁**（前端契约测试 + Rust 单测），全绿再做构建冒烟
+  （及时暴露编译 / 打包错误，不发版）；测试红了直接拦住后面的 build job；
+- **push 标签 `v*`**：测试通过后构建 NSIS 安装包并**自动创建 GitHub Release** 上传——
+  这就是「发布新版本」。
 
 发版流程：
 
@@ -98,13 +113,13 @@ cargo clean -p fnos-desktop ; cargo build
 
 | 路径 | 内容 |
 |---|---|
-| `src-tauri/src/` | Rust 侧：`paths`（配置/资源路径）、`config`（配置与归一化）、`injector`（注入载荷与资产嵌入）、`tray`（托盘）、`updater`（检查更新 / 自动下载 / 静默安装）、`commands`（IPC + 窗口 / 错误页 / 加载观测） |
-| `src-tauri/inject/` | `shim.js`（页面侧 chrome.\* 兼容层 + 上报通道）、`bootstrap.js`（配置装配与注入闸门）、`dock.js`（Dock 自动隐藏 + 空间回收）、`keepalive.js`（登录保活）、`windowpos.js`（桌面内窗口居中 / 最大化往返跟随）、`appchrome.js`（本壳应用窗口的自绘标题栏） |
+| `src-tauri/src/` | Rust 侧：`paths`（配置/资源路径）、`config`（配置与归一化）、`injector`（注入载荷与资产嵌入）、`logfile`（release 版日志落盘）、`tray`（托盘）、`updater`（检查更新 / 自动下载 / 校验 / 静默安装）、`commands`（IPC + 窗口 / 错误页 / 加载观测 / 标签页） |
+| `src-tauri/inject/` | `shim.js`（页面侧 chrome.\* 兼容层 + 上报通道）、`bootstrap.js`（配置装配与注入闸门）、`dock.js`（Dock 自动隐藏 + 空间回收）、`keepalive.js`（登录保活）、`windowpos.js`（桌面内窗口居中 / 最大化往返跟随） |
 | `src-tauri/assets/fnos-mods/` | 上游 vendored 资源 + `LICENSE` + `NOTICE`（provenance 与 SHA-256 表） |
-| `ui/settings/` | 设置窗前端（零依赖、零构建链）：上游 `popup.html`/`popup.js` 逐字节副本 + `chrome-shim.js`（iframe 里的 chrome.\* 兼容层）+ `app.js`（宿主桥）+ 内置错误页 |
-| `tests/` | Node 契约测试（145 项）与 Rust 单测（115 项） |
+| `ui/settings/` | 设置窗前端（零依赖、零构建链）：上游 `popup.html`/`popup.js` 逐字节副本 + `chrome-shim.js`（iframe 里的 chrome.\* 兼容层）+ `app.js`（宿主桥）+ `titlebar.*`（一行式标签栏）+ 内置错误页 |
+| `tests/` | Node 契约测试（151 项）与 Rust 单测（126 项） |
 | `docs/` | 设计文档与验收记录 |
-| `.github/workflows/` | 自动构建 / 发版 |
+| `.github/workflows/` | 测试门禁 / 自动构建 / 发版 |
 
 ## 失败模式与恢复
 
@@ -116,14 +131,19 @@ cargo clean -p fnos-desktop ; cargo build
 | 页面 20 秒不完成 | 看门狗兜底判失败 |
 | `config.json` 损坏 | 回退默认值，原文件保留为 `.bak` |
 | 检查更新网络失败 | 托盘弹窗如实告知，绝不静默 |
+| 下载的安装包校验失败 | 比对 GitHub Release 的 `assets[].digest`（sha256）；不匹配即丢弃重下，绝不执行 |
+| 重复点「检查更新」 | 有重入闸门：第二次点击直接提示「正在检查 / 下载更新」，不并发下载 |
+| 第三方应用页乱写 `document.title` | 上报/探针通道只认主标签，外部页无法伪造加载失败或覆盖状态证据 |
 
 ## 已知限制
 
 - **不含字体文件**：上游 popup 的字体导入控件在上游 HTML 里本就是注释掉的；
   `customFont*` 写入请求被如实拒绝（不假装成功）。字体覆盖只能用本机已装字体或网络字体。
 - **载荷约 423KB / 每次导航**（7 个 CSS + `mod.js` + `content-script.js`），每次导航重新注入。
+  脚本正文按配置指纹缓存在内存里，开新标签页不再重读壁纸 / 重做 base64。
 - **失败判定只覆盖首次导航**：页面内跳转失败不切错误页。
-- **release 版没有控制台**（`windows_subsystem = "windows"`），排障用 debug 版。
+- **release 版没有控制台**（`windows_subsystem = "windows"`）：日志落在
+  `%APPDATA%\com.fnos.desktop\app.log`，排障看它即可，不必再换 debug 版。
 - **安装包未签名**（见上）。
 - **不要拷贝 `fnos-desktop.exe` 到别处运行**：副本会静默退出；从安装目录或
   `target\<profile>\` 原地运行。
