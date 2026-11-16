@@ -24,6 +24,7 @@
 //! `spawn_blocking` 调进阻塞线程池——绝不能卡住托盘。
 
 use crate::commands::save_window_geom;
+use crate::logfile::flog;
 use crate::paths::config_dir;
 use serde_json::Value;
 use tauri::{AppHandle, Runtime};
@@ -54,8 +55,17 @@ fn host_is_allowed_for_mirror(host: &str) -> bool {
     if h.is_empty() || h == "localhost" || h.ends_with(".local") || h.ends_with(".arpa") {
         return false;
     }
-    if h == "::1" || h.starts_with("fe80:") || h.starts_with("fc") || h.starts_with("fd") {
-        return false; // 环回 / 链路本地 / ULA
+    // IPv6 字面量（含冒号）才做地址段判定。**必须先判冒号**：`url::Url::host_str()` 返回
+    // 的域名可以是 `fc…` / `fd…` 开头（`fcdn.example.com`、`fdroid-mirror.org`），
+    // 旧判定 `starts_with("fc")` 会把这类**正常公网镜像域名**一并拒掉。
+    if h.contains(':') {
+        if h == "::1" || h == "::" || h.starts_with("fe80:") {
+            return false; // 环回 / 未指定 / 链路本地
+        }
+        // ULA 是 `fc00::/7` = 首字节 0xfc 或 0xfd
+        if h.starts_with("fc") || h.starts_with("fd") {
+            return false;
+        }
     }
     // IPv4 私有 / 环回 / 保留段按首段数字判定
     let first = h.split('.').next().and_then(|s| s.parse::<u32>().ok());
@@ -180,16 +190,21 @@ pub fn validate_download_url(raw: &str) -> Result<String, String> {
     Ok(u.to_string())
 }
 
-/// 从 release JSON 里挑出 NSIS 安装包资产，返回（下载地址，文件名）。
+/// 从 release JSON 里挑出 NSIS 安装包资产，返回（下载地址，文件名，期望的 sha256）。
 ///
 /// 优先 `fnOS_…x64-setup.exe`（本壳的命名形态：productName = fnOS），其余
 /// `*x64-setup.exe` 兜底；都没有 → Err（如实告知，不猜别的资产）。
-pub fn pick_installer_asset(release: &Value) -> Result<(String, String), String> {
+///
+/// 第三个返回值是 GitHub Releases API 的 `assets[].digest`（`sha256:<hex>`）里的 hex 部分。
+/// **它可能不存在**（GitHub 对 2024 年前上传的资产不回填 digest，本仓库早期的 release 就是
+/// 这种），所以类型是 `Option<String>`，由下载路径决定「没有 digest 时怎么办」——
+/// 见 [`download_installer`] 的保守策略。
+pub fn pick_installer_asset(release: &Value) -> Result<(String, String, Option<String>), String> {
     let assets = release
         .get("assets")
         .and_then(|a| a.as_array())
         .ok_or_else(|| "release 响应里没有 assets".to_string())?;
-    let mut fallback: Option<(String, String)> = None;
+    let mut fallback: Option<(String, String, Option<String>)> = None;
     for asset in assets {
         let name = asset.get("name").and_then(|n| n.as_str()).unwrap_or("");
         let url = asset
@@ -199,14 +214,60 @@ pub fn pick_installer_asset(release: &Value) -> Result<(String, String), String>
         if !(name.ends_with("x64-setup.exe") && !url.is_empty()) {
             continue;
         }
+        let digest = asset
+            .get("digest")
+            .and_then(|d| d.as_str())
+            .and_then(parse_sha256_digest);
         if name.starts_with("fnOS_") {
-            return Ok((url.to_string(), name.to_string()));
+            return Ok((url.to_string(), name.to_string(), digest));
         }
         if fallback.is_none() {
-            fallback = Some((url.to_string(), name.to_string()));
+            fallback = Some((url.to_string(), name.to_string(), digest));
         }
     }
     fallback.ok_or_else(|| "发布页上没有找到 x64 安装包（*x64-setup.exe）".to_string())
+}
+
+/// 解析 GitHub 的 `digest` 字段：只接受 `sha256:` + 64 位十六进制，其余（别的算法、
+/// 长度不对、带空白）一律当「没有 digest」——绝不把认不出的形状当成校验值来用。
+fn parse_sha256_digest(raw: &str) -> Option<String> {
+    let hex = raw.trim().strip_prefix("sha256:")?;
+    if hex.len() != 64 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(hex.to_ascii_lowercase())
+}
+
+/// 一个文件的 sha256（小写 hex）。读失败返回 `None`（调用方按「校验不了」处理）。
+fn file_sha256(path: &std::path::Path) -> Option<String> {
+    use sha2::Digest;
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut hasher = sha2::Sha256::new();
+    std::io::copy(&mut file, &mut hasher).ok()?;
+    let digest = hasher.finalize();
+    let mut out = String::with_capacity(64);
+    for byte in digest {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    Some(out)
+}
+
+/// 「这个文件能不能当完整安装包用」的判定。
+///
+/// 有期望哈希时**只认哈希**（大小对、内容错的文件正是 `updateMirrorPrefix` 场景下最可能的
+/// 坏结果：镜像返回了一个 HTML 错误页或另一个版本）；没有期望哈希时退回体积下限
+/// （保留了 0.3.9 之前的行为：老 release 没有 digest 字段）。
+fn installer_looks_complete(path: &std::path::Path, expected_sha256: Option<&str>) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() || meta.len() < MIN_INSTALLER_BYTES {
+        return false;
+    }
+    match expected_sha256 {
+        Some(expected) => file_sha256(path).as_deref() == Some(expected),
+        None => true,
+    }
 }
 
 /// 请求 latest release 的完整 JSON。任何失败（DNS / 超时 / 非 2xx / JSON 不认识）都带
@@ -222,25 +283,37 @@ fn fetch_latest_release() -> Result<Value, String> {
     serde_json::from_str(&body).map_err(|e| format!("响应不是合法 JSON：{e}"))
 }
 
-/// 把安装包下载到配置目录 `updates/<文件名>`（已存在同名且体积达标 → 直接复用），
-/// 返回落盘路径。写 `.part` 临时名、完成后改名，避免留下半截文件被当成完整安装包。
+/// 把安装包下载到配置目录 `updates/<文件名>`，返回落盘路径与「是否复用了已有文件」。
+///
+/// 写 `.part` 临时名、完成后改名，避免留下半截文件被当成完整安装包。
+///
+/// ## 复用与完整性（P1-5）
+///
+/// 复用分支原先只比体积（≥ 1 MB 就当成「上次下载好了」）。配上 `updateMirrorPrefix` 之后
+/// 这条捷径是危险的：`updates/` 里一个被替换过或半截的同名 exe 会被直接拿去静默安装。
+/// 现在复用前必须过 [`installer_looks_complete`]——**有 digest 时严格比对 sha256**，
+/// 不匹配就删掉重下。
 fn download_installer(
     download_url: &str,
     file_name: &str,
     mirror_prefix: &str,
+    expected_sha256: Option<&str>,
 ) -> Result<std::path::PathBuf, String> {
     let dir = config_dir().join("updates");
     std::fs::create_dir_all(&dir).map_err(|e| format!("创建更新目录失败：{e}"))?;
     let dest = dir.join(file_name);
-    let part = dir.join(format!("{file_name}.part"));
+    // P1-6：`.part` 名带进程 id。两次「检查更新」并发时（快速连点托盘菜单）它们各写各的
+    // 临时文件，不会互相截断；最后两个线程都 rename 到同一个 dest，内容同源同哈希，
+    // 谁赢都对。
+    let part = dir.join(format!("{file_name}.{}.part", std::process::id()));
 
+    if installer_looks_complete(&dest, expected_sha256) {
+        return Ok(dest); // 上一次已经下载好了（比如点了「取消」后再次检查）
+    }
     if dest.exists() {
-        let size = std::fs::metadata(&dest)
-            .map(|m| m.len())
-            .unwrap_or(0);
-        if size >= MIN_INSTALLER_BYTES {
-            return Ok(dest); // 上一次已经下载好了（比如点了「取消」后再次检查）
-        }
+        // 存在但不可用（半截 / 哈希对不上）：删掉，绝不把它当安装包用
+        flog!("[fnos] 更新缓存不可用（体积或哈希不符），重新下载：{}", dest.display());
+        let _ = std::fs::remove_file(&dest);
     }
 
     // 直连不通（os error 10060 这类）时按配置的镜像前缀重试；瞬态超时做连接级重试。
@@ -291,6 +364,24 @@ fn download_installer(
     if size < MIN_INSTALLER_BYTES {
         let _ = std::fs::remove_file(&part);
         return Err(format!("下载的安装包不完整（{size} 字节）"));
+    }
+    // P1-5：下载完成后的**内容**校验。配了镜像前缀时，GitHub 的 HTTPS 不再是唯一来源，
+    // 所以「大小够」不代表「内容对」——必须拿 release API 给的 digest 比对；没有 digest
+    // 的老 release 退回体积判定（并在日志里如实标出来，免得把「没校验」当成「校验通过」）。
+    if let Some(expected) = expected_sha256 {
+        let actual = file_sha256(&part);
+        if actual.as_deref() != Some(expected) {
+            let _ = std::fs::remove_file(&part);
+            return Err(format!(
+                "安装包校验失败（sha256 不匹配，期望 {expected}，实际 {}）。已丢弃，请重试；若反复出现请检查 shell.updateMirrorPrefix 指向的镜像是否可信。",
+                actual.unwrap_or_else(|| "读取失败".into())
+            ));
+        }
+    } else {
+        flog!(
+            "[fnos] 该 release 的资产没有 digest 字段，安装包只做了体积校验（{} 字节）",
+            size
+        );
     }
     std::fs::rename(&part, &dest).map_err(|e| {
         let _ = std::fs::remove_file(&part);
@@ -366,8 +457,49 @@ fn start_install<R: Runtime>(app: &AppHandle<R>, installer: &std::path::Path) ->
     Ok(())
 }
 
+/// 「检查更新」的重入闸门（P1-6）。
+///
+/// 托盘菜单项没有置灰能力（T14a 之后菜单全是无状态动作项），所以用户完全可能在第一次
+/// 下载（最长 120 秒）期间再点一次。两次并发下载各写各的 `.part` 本身已经安全（见
+/// [`download_installer`] 的进程 id 后缀），但**两个原生 MessageBox 叠在一起**会让用户
+/// 分不清哪个是哪个，而且会白下一遍。用一次 CAS 直接告诉后来者「正在检查」。
+static UPDATE_CHECK_RUNNING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// 重入闸门的守卫：无论函数从哪条路径返回，`Drop` 都会把闸门放开。
+struct UpdateCheckGuard;
+
+impl UpdateCheckGuard {
+    /// 抢闸门；已在运行则返回 `None`。
+    fn acquire() -> Option<Self> {
+        use std::sync::atomic::Ordering;
+        if UPDATE_CHECK_RUNNING
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            Some(Self)
+        } else {
+            None
+        }
+    }
+}
+
+impl Drop for UpdateCheckGuard {
+    fn drop(&mut self) {
+        UPDATE_CHECK_RUNNING.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
 /// 托盘「检查更新」的入口（**阻塞**函数；托盘侧用 `spawn_blocking` 调用）。
 pub fn check_from_tray<R: Runtime>(app: AppHandle<R>) {
+    let Some(_guard) = UpdateCheckGuard::acquire() else {
+        message_box(
+            "fnOS 检查更新",
+            "正在检查 / 下载更新，请稍候；这次重复的点击已忽略。",
+            MB_ICON_INFO,
+        );
+        return;
+    };
     let current = current_version();
     let mirror_prefix = crate::commands::current(&app).shell.update_mirror_prefix;
     let release = match fetch_latest_release() {
@@ -386,23 +518,25 @@ pub fn check_from_tray<R: Runtime>(app: AppHandle<R>) {
         .and_then(|t| t.as_str())
         .unwrap_or("")
         .to_string();
-    let Some(latest) = parse_tag_version(&tag) else {
+    // 两条「无法识别」先各自如实报告（比一句笼统的「没有更新」有用得多），
+    // 真正的比较只走 `is_newer` 这一处——两处口径分叉正是这类版本判断最容易出的错。
+    if parse_tag_version(&tag).is_none() {
         message_box(
             "fnOS 检查更新",
             &format!("线上版本号无法识别（tag：{tag}）。"),
             MB_ICON_WARNING,
         );
         return;
-    };
-    let Some(cur) = parse_tag_version(current) else {
+    }
+    if parse_tag_version(current).is_none() {
         message_box(
             "fnOS 检查更新",
             &format!("当前版本号无法识别（{current}）。"),
             MB_ICON_WARNING,
         );
         return;
-    };
-    if latest <= cur {
+    }
+    if !is_newer(&tag, current) {
         message_box(
             "fnOS 检查更新",
             &format!("已是最新版本（v{current}）。"),
@@ -411,10 +545,10 @@ pub fn check_from_tray<R: Runtime>(app: AppHandle<R>) {
         return;
     }
 
-    // 有新版本：自动下载（文件已存在则复用），然后询问是否立即安装。
-    let (download_url, file_name) = match pick_installer_asset(&release) {
-        Ok((url, name)) if safe_asset_name(&name) => (url, name),
-        Ok((_, name)) => {
+    // 有新版本：自动下载（文件已存在且校验通过则复用），然后询问是否立即安装。
+    let (download_url, file_name, expected_sha256) = match pick_installer_asset(&release) {
+        Ok((url, name, digest)) if safe_asset_name(&name) => (url, name, digest),
+        Ok((_, name, _)) => {
             message_box(
                 "fnOS 检查更新",
                 &format!("资产文件名不可用（{name}），已放弃下载。"),
@@ -434,7 +568,12 @@ pub fn check_from_tray<R: Runtime>(app: AppHandle<R>) {
             return;
         }
     };
-    let installer = match download_installer(&validated, &file_name, &mirror_prefix) {
+    let installer = match download_installer(
+        &validated,
+        &file_name,
+        &mirror_prefix,
+        expected_sha256.as_deref(),
+    ) {
         Ok(p) => p,
         Err(e) => {
             message_box("fnOS 检查更新", &format!("{e}"), MB_ICON_WARNING);
@@ -491,7 +630,7 @@ fn message_box(title: &str, text: &str, flags: u32) -> i32 {
 /// 任何平台都不需要条件编译整个模块）。
 #[cfg(not(windows))]
 fn message_box(title: &str, text: &str, _flags: u32) -> i32 {
-    eprintln!("[fnos] {title}: {text}");
+    crate::logfile::emit(&format!("[fnos] {title}: {text}"));
     1
 }
 
@@ -535,19 +674,93 @@ mod tests {
             "tag_name": "v0.2.0",
             "assets": [
                 { "name": "fnOS_0.2.0_x64-setup.exe",
-                  "browser_download_url": "https://github.com/eafenzhang/fnos-desktop/releases/download/v0.2.0/fnOS_0.2.0_x64-setup.exe" },
+                  "browser_download_url": "https://github.com/eafenzhang/fnos-desktop/releases/download/v0.2.0/fnOS_0.2.0_x64-setup.exe",
+                  "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
                 { "name": "latest.json",
                   "browser_download_url": "https://github.com/eafenzhang/fnos-desktop/releases/download/v0.2.0/latest.json" }
             ]
         });
-        let (url, name) = pick_installer_asset(&release).expect("必须挑中 NSIS 安装包");
+        let (url, name, digest) = pick_installer_asset(&release).expect("必须挑中 NSIS 安装包");
         assert_eq!(name, "fnOS_0.2.0_x64-setup.exe");
         assert!(url.ends_with("/fnOS_0.2.0_x64-setup.exe"));
+        assert_eq!(
+            digest.as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            "资产带 digest 时必须把它带出来（P1-5 的校验依据）"
+        );
+
+        // 老 release 没有 digest 字段：不算错，返回 None（下载路径退回体积判定）
+        let no_digest = json!({
+            "tag_name": "v0.1.0",
+            "assets": [{ "name": "fnOS_0.1.0_x64-setup.exe",
+                         "browser_download_url": "https://github.com/eafenzhang/fnos-desktop/releases/download/v0.1.0/fnOS_0.1.0_x64-setup.exe" }]
+        });
+        assert_eq!(pick_installer_asset(&no_digest).unwrap().2, None);
 
         let empty = json!({ "tag_name": "v0.2.0", "assets": [] });
         assert!(pick_installer_asset(&empty).is_err(), "没有资产要如实失败");
         let none = json!({ "tag_name": "v0.2.0" });
         assert!(pick_installer_asset(&none).is_err(), "缺 assets 字段要如实失败");
+    }
+
+    /// `digest` 只认 `sha256:` + 64 位十六进制。别的算法 / 长度不对 / 带杂字符一律当
+    /// 「没有 digest」——把认不出的形状当校验值用，等于用垃圾数据做安全判定。
+    #[test]
+    fn sha256_digest_is_parsed_strictly() {
+        let hex64 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        assert_eq!(parse_sha256_digest(&format!("sha256:{hex64}")).as_deref(), Some(hex64));
+        // 大写十六进制允许（GitHub 用小写，但别的地方可能大写），统一折成小写
+        assert_eq!(
+            parse_sha256_digest(&format!("sha256:{}", hex64.to_uppercase())).as_deref(),
+            Some(hex64)
+        );
+        assert_eq!(parse_sha256_digest(&format!(" sha256:{hex64} ")).as_deref(), Some(hex64));
+
+        for bad in [
+            "".to_string(),
+            hex64.to_string(),                                   // 缺算法前缀
+            format!("sha512:{hex64}"),                           // 别的算法
+            format!("sha256:{}", &hex64[..63]),                  // 少一位
+            format!("sha256:{hex64}0"),                          // 多一位
+            format!("sha256:{}", "g".repeat(64)),                // 非十六进制
+            "sha256:".to_string(),
+        ] {
+            assert_eq!(parse_sha256_digest(&bad), None, "必须拒绝：{bad}");
+        }
+    }
+
+    /// 复用判定：有期望哈希时**只认哈希**；没有时退回体积下限。
+    #[test]
+    fn installer_reuse_requires_the_content_to_match() {
+        let dir = std::env::temp_dir().join(format!("fnos-upd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("fnOS_9.9.9_x64-setup.exe");
+        // 灌到体积下限之上（内容随意，这里只验证「哈希说了算」）
+        let payload = vec![0x41u8; MIN_INSTALLER_BYTES as usize + 16];
+        std::fs::write(&file, &payload).unwrap();
+
+        let good = file_sha256(&file).expect("必须能算出哈希");
+        assert!(
+            installer_looks_complete(&file, Some(&good)),
+            "哈希对得上 → 可复用"
+        );
+        assert!(
+            !installer_looks_complete(&file, Some(&"0".repeat(64))),
+            "哈希对不上 → 绝不能复用（这正是镜像返回错误内容的情形）"
+        );
+        assert!(
+            installer_looks_complete(&file, None),
+            "没有 digest 的老 release：退回体积判定"
+        );
+
+        // 体积不到下限：无论有没有哈希都不可用
+        let small = dir.join("small.exe");
+        std::fs::write(&small, b"x").unwrap();
+        assert!(!installer_looks_complete(&small, None));
+        assert!(!installer_looks_complete(&dir.join("missing.exe"), None));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -677,5 +890,28 @@ mod tests {
             resolve_download_url("https://evil.example.com/anything.exe", "https://gh-proxy.example.com/").is_err(),
             "镜像不得绕过原始 URL 的 host/路径校验"
         );
+
+        // IPv6 地址段判定不得误伤**以 fc/fd 开头的普通域名**——这是 `starts_with("fc")`
+        // 那版判定的实际风险（`fcdn.*` / `fdroid-mirror.*` 这类镜像域名会被无故拒绝）。
+        for domain in [
+            "https://fcdn.example.com/",
+            "https://fdroid-mirror.example.org/",
+            "https://fc.example.net/",
+        ] {
+            assert!(
+                validate_mirror_prefix(domain).is_ok(),
+                "以 fc/fd 开头的公网域名必须放行：{domain}"
+            );
+        }
+        // IPv6 字面量才按地址段拒绝（含 IPv4 映射形式与 ULA）
+        for bad in [
+            "https://[fe80::1]/",
+            "https://[::]/",
+            "https://[::1]/",
+            "https://[fd12:3456::1]/",
+            "https://[fc00::1]/",
+        ] {
+            assert!(validate_mirror_prefix(bad).is_err(), "IPv6 保留段必须拒绝：{bad}");
+        }
     }
 }

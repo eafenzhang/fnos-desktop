@@ -12,6 +12,7 @@ use crate::paths;
 use crate::report;
 use serde::Serialize;
 use serde_json::{json, Value};
+use crate::logfile::flog;
 
 pub const SHELL_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const MODS_COMMIT: &str = "483c3e2e217faebc1be45b4e824865854a61e3dd";
@@ -29,6 +30,10 @@ const KEEPALIVE_JS: &str = include_str!("../inject/keepalive.js");
 /// 桌面内窗口默认居中（T14c 修复轮 15）：fnOS 自己的应用窗口是桌面文档里的 DOM 元素，
 /// 它的窗口管理器默认级联摆位；本段让新窗口落在内容区正中（只写一次，不干预后续拖动）。
 const WINDOWPOS_JS: &str = include_str!("../inject/windowpos.js");
+/// 标签页键盘快捷键（P0-3）：Ctrl+T / Ctrl+W / Ctrl+Tab / Ctrl+Shift+Tab。
+/// 焦点在子 Webview 里，tauri 的 WindowEvent 收不到这些键，所以走既有的
+/// `document.title` 控制前缀通道回传给宿主（不占任何 IPC 授权）。
+const KEYS_JS: &str = include_str!("../inject/keys.js");
 // T14d：`appchrome.js`（app-* 独立窗口的自绘标题栏）随独立窗口一起退役——
 // 外部应用现在开成主窗口标签条里的标签页，标题栏由 `ui/settings/titlebar.html` 统一承担。
 const CONTENT_SCRIPT_JS: &str = include_str!("../assets/fnos-mods/content-script.js");
@@ -250,7 +255,7 @@ fn load_wallpaper_from(dir: &std::path::Path, cfg: &Config) -> Option<WallpaperA
         return None;
     }
     let Some(mime) = config::wallpaper_mime(name) else {
-        eprintln!(
+        flog!(
             "[fnos] 登录壁纸文件名不可用（已跳过，未读文件）：{}",
             report::log_safe(name)
         );
@@ -262,7 +267,7 @@ fn load_wallpaper_from(dir: &std::path::Path, cfg: &Config) -> Option<WallpaperA
     let meta = match std::fs::metadata(&path) {
         Ok(m) => m,
         Err(e) => {
-            eprintln!(
+            flog!(
                 "[fnos] 登录壁纸读取失败（已跳过）：{} — {e}",
                 report::log_safe(name)
             );
@@ -272,14 +277,14 @@ fn load_wallpaper_from(dir: &std::path::Path, cfg: &Config) -> Option<WallpaperA
     match precheck_wallpaper_len(meta.len(), meta.is_file()) {
         Precheck::Readable => {}
         Precheck::NotAFile => {
-            eprintln!(
+            flog!(
                 "[fnos] 登录壁纸不是一个普通文件（已跳过，未读文件）：{}",
                 report::log_safe(name)
             );
             return None;
         }
         Precheck::TooLarge => {
-            eprintln!(
+            flog!(
                 "[fnos] 登录壁纸超过 {} MiB 上限（已跳过，未读文件）：{} 实为 {} 字节",
                 MAX_WALLPAPER_BYTES / 1024 / 1024,
                 report::log_safe(name),
@@ -288,7 +293,7 @@ fn load_wallpaper_from(dir: &std::path::Path, cfg: &Config) -> Option<WallpaperA
             return None;
         }
         Precheck::Empty => {
-            eprintln!(
+            flog!(
                 "[fnos] 登录壁纸是空文件（已跳过，未读文件）：{}",
                 report::log_safe(name)
             );
@@ -300,7 +305,7 @@ fn load_wallpaper_from(dir: &std::path::Path, cfg: &Config) -> Option<WallpaperA
     let bytes = match std::fs::read(&path) {
         Ok(b) => b,
         Err(e) => {
-            eprintln!(
+            flog!(
                 "[fnos] 登录壁纸读取失败（已跳过）：{} — {e}",
                 report::log_safe(name)
             );
@@ -309,7 +314,7 @@ fn load_wallpaper_from(dir: &std::path::Path, cfg: &Config) -> Option<WallpaperA
     };
     // TOCTOU：预检之后文件可能被换掉/长大（预检只管「不因为一个本来就超限的文件去分配内存」）。
     if bytes.is_empty() || bytes.len() > MAX_WALLPAPER_BYTES {
-        eprintln!(
+        flog!(
             "[fnos] 登录壁纸在预检之后变了（已跳过）：{} 实读 {} 字节",
             report::log_safe(name),
             bytes.len()
@@ -432,11 +437,41 @@ fn wrap_upstream(content: &str) -> String {
 /// `inject_enabled == false`（脚本最终一定是空的），也会去配置目录读一次壁纸，
 /// 配置里写了个不存在/超大/非法的名字时还会打出一行「登录壁纸读取失败（已跳过）」这种
 /// 与用户实际状态无关的噪声。现在关态一次文件 IO 都不做。
+///
+/// **昂贵**：会读壁纸（最多 8 MiB）、对 15 个图标做 base64（约 1 MiB）、拼装约 500 KB
+/// 文本资产。调用方一律经 `commands::init_script_cached` 走缓存，不要直接调
+/// （P0-2：每开一个标签页都重新做一遍是纯浪费）。
 pub fn build_init_script(cfg: &Config) -> String {
     if !cfg.shell.inject_enabled {
         return String::new();
     }
     build_init_script_with(cfg, load_wallpaper(cfg))
+}
+
+/// 初始化脚本的**内容指纹**——只覆盖「会改变脚本正文」的那些配置项。
+///
+/// 用途：`commands::init_script_cached` 用它判断缓存能不能复用。**必须漏得少、不能漏多**：
+///
+/// - 漏一项 → 用户改了配置、新开的标签页却仍是旧脚本（最难查的一类问题）；
+/// - 多算无关项 → 缓存命中率下降，只是白重建一次（可接受）。
+///
+/// 因此这里把 `mods` / `local` **整段**序列化进指纹（它们全都原样进脚本），shell 段只取
+/// 真正下发的两个键。`homeUrl` / `nasUrl` / `window` 不进脚本（宿主私有），故不进指纹。
+///
+/// 不含壁纸的**文件内容**：壁纸由文件名决定，而导入路径落盘的名字带内容指纹
+///（`config::stored_wallpaper_name`），「换了图」必然表现为「名字变了」。
+pub fn script_fingerprint(cfg: &Config) -> String {
+    // 序列化 `Config` 的这几段不可能失败（纯数据），失败就退化成「永不命中」的空串。
+    serde_json::to_string(&serde_json::json!({
+        "inject": cfg.shell.inject_enabled,
+        "dock": cfg.shell.dock_auto_hide,
+        "keepalive": cfg.shell.keep_alive_minutes,
+        "perfect": perfect_icon_enabled(cfg),
+        "wallpaper": cfg.local.login_wallpaper_file_name,
+        "mods": &cfg.mods,
+        "local": &cfg.local,
+    }))
+    .unwrap_or_default()
 }
 
 /// [`build_init_script`] 的**纯**内核：壁纸由调用方先读好（生产走 [`load_wallpaper`]，
@@ -511,6 +546,7 @@ pub fn build_init_script_with(cfg: &Config, wallpaper: Option<WallpaperAsset>) -
          {dock}\n\
          {keepalive}\n\
          {windowpos}\n\
+         {keys}\n\
          {content}\n",
         ver = SHELL_VERSION,
         commit = MODS_COMMIT,
@@ -521,6 +557,7 @@ pub fn build_init_script_with(cfg: &Config, wallpaper: Option<WallpaperAsset>) -
         dock = DOCK_JS,
         keepalive = KEEPALIVE_JS,
         windowpos = WINDOWPOS_JS,
+        keys = KEYS_JS,
         content = wrap_upstream(CONTENT_SCRIPT_JS),
     )
 }
@@ -576,6 +613,8 @@ mod tests {
         let i_pos = s
             .find("__FNOS_WINDOWPOS_STATE__")
             .expect("windowpos section");
+        // keys 段用它的控制前缀字面量（别处都不出现）
+        let i_keys = s.find("FNOSKEY:").expect("keys section");
         let i_cs = s.find("hasFnOSSignature").expect("upstream content-script");
         assert!(
             i_cfg < i_shim
@@ -583,9 +622,31 @@ mod tests {
                 && i_boot < i_dock
                 && i_dock < i_keep
                 && i_keep < i_pos
-                && i_pos < i_cs,
-            "段落顺序必须是 配置→shim→bootstrap→dock→keepalive→windowpos→上游"
+                && i_pos < i_keys
+                && i_keys < i_cs,
+            "段落顺序必须是 配置→shim→bootstrap→dock→keepalive→windowpos→keys→上游"
         );
+    }
+
+    /// P0-3：标签页快捷键段只认白名单动作，且不得抢页面编辑区的按键。
+    #[test]
+    fn keys_section_is_narrow_and_whitelisted() {
+        let js = include_str!("../inject/keys.js");
+        assert!(js.contains("var KEY_TITLE_PREFIX = 'FNOSKEY:';"), "控制前缀必须是 FNOSKEY:");
+        for act in ["'next'", "'prev'", "'close'", "'new'"] {
+            assert!(js.contains(act), "白名单动作缺失：{act}");
+        }
+        // 只有真要消费时才 preventDefault；不得整键拦截
+        assert!(js.contains("e.preventDefault()"), "消费时才阻止默认行为");
+        assert!(js.contains("if (!action) return;"), "非白名单按键一律不碰");
+        // 编辑区守卫 + 只认物理 Ctrl + 不连发 + 不碰 Alt/Meta
+        assert!(js.contains("isContentEditable"), "编辑区不得抢键");
+        assert!(js.contains("if (!e.ctrlKey || e.altKey || e.metaKey) return null;"));
+        assert!(js.contains("e.repeat"), "长按不连发");
+        // 不碰 DOM 内容、不开 IPC
+        assert!(!js.contains("innerHTML") && !js.contains("invoke("), "不写页面内容、不开 IPC");
+        // 标题用完要还回去（否则标签标题会一直显示控制串）
+        assert!(js.contains("FNOSKEY:') !== 0") || js.contains("indexOf(KEY_TITLE_PREFIX)"), "控制标题要还原");
     }
 
     /// T14c：桌面内窗口默认居中，且**只对新窗口动手一次**（不干预用户拖动）。
@@ -1357,5 +1418,59 @@ mod tests {
         assert_eq!(precheck_wallpaper_len(1, false), Precheck::NotAFile);
         // 非普通文件优先于长度判定：一个巨大的目录项也只想说「这不是普通文件」
         assert_eq!(precheck_wallpaper_len(cap + 1, false), Precheck::NotAFile);
+    }
+
+    /// P0-2：初始化脚本缓存的内容指纹必须**覆盖所有进脚本的配置项**。
+    ///
+    /// 指纹漏一项 = 用户改了配置、新开的标签页却仍是旧脚本（最难查的一类问题）；
+    /// 多算无关项只是白重建一次。所以这里按「进脚本的键逐个变一次」锁定。
+    #[test]
+    fn script_fingerprint_covers_every_key_that_reaches_the_script() {
+        let base = Config::default();
+        let fp = script_fingerprint(&base);
+        assert!(!fp.is_empty(), "指纹必须可序列化（失败就退化成永不命中）");
+        assert_eq!(fp, script_fingerprint(&base.clone()), "同样的配置 → 同样的指纹");
+
+        // 每一个都真实改变脚本正文的键：改动必须让指纹变化
+        let mutators: Vec<(&str, Box<dyn Fn(&mut Config)>)> = vec![
+            ("injectEnabled", Box::new(|c: &mut Config| {
+                c.shell.inject_enabled = !c.shell.inject_enabled;
+            })),
+            ("dockAutoHide", Box::new(|c: &mut Config| {
+                c.shell.dock_auto_hide = !c.shell.dock_auto_hide;
+            })),
+            ("keepAliveMinutes", Box::new(|c: &mut Config| {
+                c.shell.keep_alive_minutes = 7;
+            })),
+            ("perfectIcon", Box::new(|c: &mut Config| {
+                c.mods.launchpad_icon_scale_enabled = true;
+            })),
+            ("wallpaper", Box::new(|c: &mut Config| {
+                c.local.login_wallpaper_file_name = Some("w-abc123.png".into());
+            })),
+            ("mods.brandColor", Box::new(|c: &mut Config| {
+                c.mods.brand_color = "#123456".into();
+            })),
+            ("mods.enabledOrigins", Box::new(|c: &mut Config| {
+                c.mods.enabled_origins.push("https://nas.example.com".into());
+            })),
+        ];
+        for (name, mutate) in mutators {
+            let mut c = base.clone();
+            mutate(&mut c);
+            assert_ne!(
+                fp,
+                script_fingerprint(&c),
+                "改动 {name} 后指纹必须变化，否则新开的标签页会拿到旧脚本"
+            );
+        }
+
+        // 不进脚本的宿主私有键（homeUrl / nasUrl / 窗口几何）**不进**指纹：
+        // 把它们算进去只会让缓存白白失效（它们改变时本来就不需要重建载荷）。
+        let mut c = base.clone();
+        c.shell.home_url = "https://other.example.com/".into();
+        c.shell.nas_url = "https://nas2.example.com/".into();
+        c.shell.window.w += 100.0;
+        assert_eq!(fp, script_fingerprint(&c), "宿主私有键不得影响脚本指纹");
     }
 }

@@ -10,6 +10,7 @@ use std::time::Duration;
 use tauri::webview::{PageLoadEvent, WebviewBuilder};
 use tauri::window::WindowBuilder;
 use tauri::{AppHandle, LogicalPosition, LogicalSize, Manager, Runtime, State, Webview, WebviewUrl, WebviewWindowBuilder};
+use crate::logfile::flog;
 
 /// 设置窗 label（spec §7）：与 `capabilities/default.json` 的 `"windows": ["settings"]` 一致。
 pub const SETTINGS_WINDOW: &str = "settings";
@@ -48,6 +49,25 @@ const AUTO_RETRY_DELAYS_MS: [u64; 4] = [15_000, 30_000, 60_000, 120_000];
 /// （实测：`\u0001FNOSPROBE\u0001…` 到达宿主时控制字符已经不见，`strip_prefix` 静默失配，
 /// 失败被当成了一个普通标题）。改用「真实网页标题不会以它开头」的可打印哨兵。
 pub const PROBE_TITLE_PREFIX: &str = "FNOSPROBE:";
+
+/// 标签页键盘快捷键的控制前缀（P0-3；页面侧 `inject/keys.js`）。
+///
+/// 焦点在子 Webview 里，tauri 的 `WindowEvent::KeyboardInput` 收不到这些键；本壳已有的
+/// 「页面 → 宿主」通道就是 `document.title`（不占任何 IPC 授权），沿用它能省掉
+/// `with_webview` + WebView2 COM 的一整层 unsafe。
+pub const KEY_TITLE_PREFIX: &str = "FNOSKEY:";
+
+/// 快捷键的最小生效间隔（毫秒）。
+///
+/// 任何页面都写得动自己的标题，所以这条通道必须按「可能被刷屏」设计：120ms 内的多个命令
+/// 只执行第一个（人类连按 Tag 键的极限在 100ms 以上，180 次/秒的合成风暴会被完全折掉）。
+const KEY_COOLDOWN_MS: u64 = 120;
+
+/// 快捷键冷却的**上次执行时刻**（`AppState::last_key_at`）：Unix 毫秒。
+///
+/// 用 `AtomicU64` + 毫秒时间戳而不是 `Mutex<Instant>`：这条路径被设计成「不获取任何
+/// Mutex」，免得页面刷标题时与标签页/配置锁争抢。
+pub type KeyClock = AtomicU64;
 
 /// 注入到主窗口页面里的自检探针：回答「你是不是 Chromium 的网络错误页」。
 ///
@@ -143,6 +163,21 @@ pub struct AppState {
     /// 还活着（被关过就清掉条目继续开），活着就**复用切换**、绝不新开。
     /// 只在内存里；标签关闭（[`tab_close`]）与窗口重建时清理。
     pub open_tabs: Mutex<std::collections::HashMap<String, String>>,
+    /// 初始化脚本缓存（P0-2）：`(内容指纹, 脚本正文)`。
+    ///
+    /// 为什么需要：`injector::build_init_script` 会读壁纸（最多 8 MiB）、base64 15 个图标
+    /// （约 1 MiB）、再拼装约 500 KB 文本。此前**每开一个标签页**（`open_app_tab`）与每次
+    /// 建窗都完整重做一遍——开一个第三方应用标签要白付这整份成本，而配置在两次开标签之间
+    /// 几乎从不变化。
+    ///
+    /// 失效判据是 [`injector::script_fingerprint`]：只覆盖真正进脚本的配置项。
+    /// 缓存**不跨进程**、也不落盘（脚本正文随 `Config` 内存态同寿命）。
+    pub init_script: Mutex<Option<(String, String)>>,
+    /// 快捷键命令的上次执行时刻（Unix 毫秒；`0` = 还没执行过）。
+    ///
+    /// 见 [`KEY_COOLDOWN_MS`]：页面（任何页面）都写得动 `document.title`，这条通道必须假设
+    /// 会被刷屏，所以每条命令在执行前先做一次 CAS 冷却——不取任何 Mutex。
+    pub last_key_at: KeyClock,
 }
 
 /// 主窗口的标签页状态（见 [`AppState::tabs`]）。
@@ -539,22 +574,11 @@ pub fn set_config<R: Runtime>(
         // 判定放在 `normalize()` 之后：非法 `homeUrl` 被夹成默认值时若与旧值相同，
         // 就不该白重建一次窗口。
         //
-        // Task 13b 补上第三、四类**载荷内容**键（同样是建窗时注册的 initialization_script 的
-        // 一部分，活窗口上换不掉）：
-        // - 完美图标的**开关状态**（`injector::perfect_icon_enabled`）：它决定 14 个 PNG
-        //   要不要进载荷（约 +1.0 MiB）；逐项键（scaleSelected/redrawKeys/redrawMap 的**具体
-        //   取值**）不进这个判据——它们经 `apply_to_page` 即时生效，不必重建；
-        // - 登录壁纸的**文件名**：它决定从配置目录读哪个文件、以什么键嵌进 `binaryAssets`。
-        //   导入路径落盘的名字带内容指纹（`config::stored_wallpaper_name`），所以「换了图」
-        //   必然表现为「名字变了」，这里比较文件名就够了。
-        //
-        // T14c 的 `dockAutoHide` **不进**判据：dock.js 在活页面上由 `apply_to_page` 的
-        // `shell.dockAutoHide`（shim 转调 `__FNOS_APPLY_SHELL__`）即时切换。建窗载荷里的
-        // `shell.dockAutoHide` 只是新窗口的初始态，活窗口换态不需要重建。
-        let needs_reload = next.shell.inject_enabled != prev.shell.inject_enabled
-            || next.shell.home_url != prev.shell.home_url
-            || injector::perfect_icon_enabled(&next) != injector::perfect_icon_enabled(&prev)
-            || next.local.login_wallpaper_file_name != prev.local.login_wallpaper_file_name;
+        // P1-8：判据抽成 [`payload_changed`]，`set_config` 与 `reset_config` 共用。
+        // 此前 reset 那份只比 `inject_enabled` / `home_url` 两项，于是「恢复默认」把完美图标
+        // 关掉、把登录壁纸清空之后，活窗口的初始化脚本里仍然带着 1 MiB 图标与旧壁纸——
+        // 设置窗显示已关闭、页面上却还在生效，直到用户下次重启。
+        let needs_reload = payload_changed(&prev, &next);
         *guard = next.clone();
         (next, needs_reload)
     };
@@ -587,6 +611,35 @@ fn merge(base: &mut Value, patch: Value) {
         }
         (b, p) => *b = p,
     }
+}
+
+/// 这两份配置的**初始化载荷**是否不同——即「要不要重建主窗口才算生效」。
+///
+/// 初始化脚本是 WebView2 的 `AddScriptToExecuteOnDocumentCreated`，注册到活 webview 上之后
+/// **换不掉**（gap (a)），所以凡是进了这份脚本、又不在免刷新通道里的键，变了就必须重建。
+///
+/// 四个键（判据全部在 `normalize()` 之后比较，非法值被夹成默认值时不白重建）：
+///
+/// 1. `shell.injectEnabled`：决定脚本注册不注册（关掉 = 一个字节都不注册）；
+/// 2. `shell.homeUrl`：决定建窗地址；
+/// 3. `injector::perfect_icon_enabled`：决定 14 个 PNG 要不要进载荷（约 +1.0 MiB）。
+///    注意它比的是**开关状态**——逐项键（scaleSelected / redrawKeys / redrawMap 的具体取值）
+///    不是载荷结构，经 `apply_to_page` 即时生效，不需要重建；
+/// 4. `local.loginWallpaperFileName`：决定从配置目录读哪个文件、以什么键嵌进 `binaryAssets`。
+///    导入路径落盘的名字带内容指纹（`config::stored_wallpaper_name`），所以「换了图」
+///    必然表现为「名字变了」，比较文件名就够。
+///
+/// **故意不在判据里**的：`shell.dockAutoHide` 与 `shell.keepAliveMinutes`（`dock.js` /
+/// `keepalive.js` 在活页面上由 `apply_to_page` 的 `__FNOS_APPLY_SHELL__` 即时切换），以及
+/// `mods.*` 的全部字段（同样走免刷新通道）。
+///
+/// 抽成函数是为了让 `set_config` 与 `reset_config` **不可能分叉**：这两条路径的判据分叉过一次
+/// （reset 少了后两项），表现是「恢复了默认设置，但图标/壁纸要重启才消失」。
+fn payload_changed(prev: &Config, next: &Config) -> bool {
+    next.shell.inject_enabled != prev.shell.inject_enabled
+        || next.shell.home_url != prev.shell.home_url
+        || injector::perfect_icon_enabled(next) != injector::perfect_icon_enabled(prev)
+        || next.local.login_wallpaper_file_name != prev.local.login_wallpaper_file_name
 }
 
 /// 把 `mods` / `local` 推给页面（免刷新）。
@@ -623,8 +676,40 @@ fn apply_to_page<R: Runtime>(app: &AppHandle<R>, cfg: &Config) {
             }
         }
         // `Config` 全是普通字段，序列化不可能失败；真失败也只是这一次免刷新没生效
-        Err(e) => eprintln!("[fnos] 配置推送序列化失败: {e}"),
+        Err(e) => flog!("[fnos] 配置推送序列化失败: {e}"),
     }
+}
+
+/// 取初始化脚本（带缓存；P0-2）。
+///
+/// **为什么需要缓存**：`injector::build_init_script` 每次都要读壁纸（最多 8 MiB）、把 15 个
+/// 图标 base64 成 1 MiB 的 data URL、再拼装约 500 KB 文本。它原先在**每开一个标签页**与每次
+/// 建窗时都被完整调用一遍——也就是说「从启动台点开一个第三方应用」会先白白做一遍这些工作，
+/// 而结果通常与上次字节相同。
+///
+/// **正确性判据**：缓存键是 [`injector::script_fingerprint`]，覆盖所有真正进脚本的配置项
+/// （放进指纹的项「只多不少」，宁可多失效一次也不让用户拿到旧脚本）。
+///
+/// **锁纪律**：只在锁内做「查键 / 写回」，**不在锁内**跑昂贵的 `build_init_script`——
+/// 否则并发开两个标签时第二个会被第一个的长耗时卡住。
+pub fn init_script_cached<R: Runtime>(app: &AppHandle<R>, cfg: &Config) -> String {
+    let key = injector::script_fingerprint(cfg);
+    {
+        let state = app.state::<AppState>();
+        let cached = state.init_script.lock().unwrap();
+        if let Some((cached_key, script)) = cached.as_ref() {
+            if *cached_key == key {
+                return script.clone();
+            }
+        }
+    }
+    // 锁外构建（可能读盘，几十毫秒级）
+    let script = injector::build_init_script(cfg);
+    {
+        let state = app.state::<AppState>();
+        *state.init_script.lock().unwrap() = Some((key, script.clone()));
+    }
+    script
 }
 
 /// 建主窗口：**首次启动与重建共用同一份定义**（地址、几何、注入载荷、标题跟随页面、加载日志）。
@@ -690,7 +775,15 @@ fn build_main_window_with<R: Runtime>(
     let window = builder.build()?;
 
     // 标签页状态复位：重建出来的窗口永远只有一个 `main` 标签（T14d）。
-    *app.state::<AppState>().tabs.lock().unwrap() = TabState::with_main();
+    //
+    // P1-7：`open_tabs` 复用登记表也必须一起清空——它的键是「页面 → 标签 label」，而重建
+    // 之后 `tab-N` 这些 label 全部不存在了（残留条目会在命中时被「验页面」判否并自愈，
+    // 但那要多绕一圈；这里直接清干净，与注释里承诺的语义一致）。
+    {
+        let state = app.state::<AppState>();
+        *state.tabs.lock().unwrap() = TabState::with_main();
+        state.open_tabs.lock().unwrap().clear();
+    }
 
     // —— 标签页栏：本地资产页，无注入、无上报通道，授权面见
     //    `capabilities/titlebar.json`（拖拽 + 三个标签页命令，仅此而已）。
@@ -709,7 +802,7 @@ fn build_main_window_with<R: Runtime>(
     // [`tab_webview_callbacks`]）。`main` 这个 label 同时是注入页的 IPC 身份：
     // `capabilities/default.json` 之外它没有任何授权，远程页面的显式拒绝在
     // `capabilities/remote-deny.json`。
-    let script = injector::build_init_script(cfg);
+    let script = init_script_cached(app, cfg);
     let mut main_webview = tab_webview_builder(MAIN_WINDOW, url.clone(), app, Some(generation));
     if !script.is_empty() {
         // gap (a)：`inject_enabled=false` 时 `build_init_script` 返回空串，此时**不注册**
@@ -770,7 +863,7 @@ fn tab_webview_builder<R: Runtime>(
                     payload_event.event(),
                     payload_event.url().as_str(),
                 ),
-                None => eprintln!(
+                None => flog!(
                     "[fnos] 标签页已加载: {}",
                     report::log_safe(payload_event.url().as_str())
                 ),
@@ -817,7 +910,7 @@ fn new_window_verdict<R: Runtime>(
     match url.scheme() {
         "http" | "https" | "about" => {}
         other => {
-            eprintln!("[fnos] 拒绝非 http(s) 的新窗口请求（scheme={other}）：{url}");
+            flog!("[fnos] 拒绝非 http(s) 的新窗口请求（scheme={other}）：{url}");
             return tauri::webview::NewWindowResponse::Deny;
         }
     }
@@ -831,15 +924,24 @@ fn new_window_verdict<R: Runtime>(
             map.get(&key).cloned()
         };
         if let Some(existing) = registered {
-            if app.get_webview(&existing).is_some() {
+            // P1-7：命中之后还要**验页面**，不能只验「这个 webview 还活着」。标签页是完整
+            // 浏览器语义，用户完全可以在里面点链接跳到别的地址；旧实现只看存活，于是
+            // 「应用页跳走之后，再从启动台点同一入口」会切到一个显示着别的内容的旧标签，
+            // 用户看到的是「点了没反应 / 打开的不是这个应用」。
+            let still_same_page = app
+                .get_webview(&existing)
+                .and_then(|wv| wv.url().ok())
+                .map(|current| page_key(&current) == key)
+                .unwrap_or(false);
+            if still_same_page {
                 let app_for_switch = app.clone();
                 tauri::async_runtime::spawn(async move {
                     activate_tab(&app_for_switch, &existing);
                 });
-                eprintln!("[fnos] window.open -> 已有相同页面的标签，复用切换（不新开）：{url}");
+                flog!("[fnos] window.open -> 已有相同页面的标签，复用切换（不新开）：{url}");
                 return tauri::webview::NewWindowResponse::Deny;
             }
-            // 登记的标签已被关闭 → 清掉失效条目，继续走新建
+            // 标签已关 / 已导航到别的页面 → 清掉失效条目，继续走新建
             let state = app.state::<AppState>();
             state.open_tabs.lock().unwrap().remove(&key);
         }
@@ -851,7 +953,7 @@ fn new_window_verdict<R: Runtime>(
                     tauri::async_runtime::spawn(async move {
                         activate_tab(&app_for_switch, MAIN_WINDOW);
                     });
-                    eprintln!("[fnos] window.open -> 与桌面标签相同，切换复用（不新开）：{url}");
+                    flog!("[fnos] window.open -> 与桌面标签相同，切换复用（不新开）：{url}");
                     return tauri::webview::NewWindowResponse::Deny;
                 }
             }
@@ -861,10 +963,10 @@ fn new_window_verdict<R: Runtime>(
     let url_for_log = url.clone();
     tauri::async_runtime::spawn(async move {
         if let Err(e) = open_app_tab(&app, url).await {
-            eprintln!("[fnos] 标签页创建失败（已拒绝该请求）：{e}");
+            flog!("[fnos] 标签页创建失败（已拒绝该请求）：{e}");
         }
     });
-    eprintln!("[fnos] window.open -> 开成标签页：{url_for_log}");
+    flog!("[fnos] window.open -> 开成标签页：{url_for_log}");
     tauri::webview::NewWindowResponse::Deny
 }
 
@@ -886,7 +988,8 @@ pub async fn open_app_tab<R: Runtime>(app: &AppHandle<R>, url: tauri::Url) -> Re
         .fetch_add(1, Ordering::Relaxed);
     let label = format!("tab-{n}");
     let cfg = current(app);
-    let script = injector::build_init_script(&cfg);
+    // P0-2：走缓存，不再每次开标签都重读壁纸 + 重做 1 MiB base64
+    let script = init_script_cached(app, &cfg);
     let mut builder = tab_webview_builder(&label, url.clone(), app, None);
     if !script.is_empty() {
         builder = builder.initialization_script(script);
@@ -902,6 +1005,18 @@ pub async fn open_app_tab<R: Runtime>(app: &AppHandle<R>, url: tauri::Url) -> Re
             LogicalSize::new(lw, lh - TAB_STRIP_H),
         )
         .map_err(|e| format!("创建标签页失败：{e}"))?;
+    // P1-7：标签的**初始标题**先取主机名（此后由 `document.title` 接管，见 `handle_title`）。
+    // 旧实现什么都不写，于是新标签从创建到页面加载完成的那一两秒里显示的是内部 label
+    // （「tab-3」），既不像浏览器也不好认。
+    {
+        let state = app.state::<AppState>();
+        state
+            .tabs
+            .lock()
+            .unwrap()
+            .titles
+            .insert(label.clone(), tab_initial_title(&url));
+    }
     // 登记「该页面已有标签」（T14e 复用闸门）：同一页面再次 window.open 时
     // 切过来而不是新开（中继流程的连续 open 就靠它止血）。
     {
@@ -914,6 +1029,32 @@ pub async fn open_app_tab<R: Runtime>(app: &AppHandle<R>, url: tauri::Url) -> Re
     }
     activate_tab(app, &label);
     Ok(label)
+}
+
+/// 新标签页在页面还没报出 `document.title` 之前显示的标题。
+///
+/// 取主机名第一段（`hermes-studio.nas.fnos.net` → `hermes-studio`）；`about:blank` 这类
+/// 没有主机名的（弹窗流程的起始页）给一句固定文案，绝不回落到内部 label。
+///
+/// **IP 字面量整段保留**（`192.168.1.10` 不该被截成 `192`）：那不是「名字.域名」结构，
+/// 按点切毫无意义，只会让人认不出是哪台机器。
+fn tab_initial_title(url: &tauri::Url) -> String {
+    if let Some(host) = url.host_str() {
+        // 剥掉 IPv6 的方括号形式（`Url::host_str()` 会保留 `[...]`），再判字面量：
+        // IPv4 / IPv6 整段保留（`192.168.1.10` 不该被截成无意义的 `192`）。
+        let bare = host.trim_start_matches('[').trim_end_matches(']');
+        if bare.parse::<std::net::IpAddr>().is_ok() {
+            return bare.to_string();
+        }
+        let first = bare.split('.').next().unwrap_or(bare);
+        if !first.is_empty() {
+            return first.to_string();
+        }
+    }
+    if url.scheme() == "about" {
+        return "新标签页".to_string();
+    }
+    url.scheme().to_string()
 }
 
 /// 激活一个标签页：显示它、隐藏其余标签页、更新窗口标题并把标签条状态推给 titlebar。
@@ -980,7 +1121,7 @@ fn push_tabs<R: Runtime>(app: &AppHandle<R>) {
                 "window.__FNOS_TABS_SET__ && window.__FNOS_TABS_SET__({json});"
             ));
         }
-        Err(e) => eprintln!("[fnos] 标签条状态序列化失败: {e}"),
+        Err(e) => flog!("[fnos] 标签条状态序列化失败: {e}"),
     }
     push_win_max(app);
 }
@@ -1140,7 +1281,12 @@ fn build_error_window<R: Runtime>(
         builder = builder.visible(false);
     }
     let window = builder.build()?;
-    *app.state::<AppState>().tabs.lock().unwrap() = TabState::with_main();
+    // 与 build_main_window_with 同理：标签状态与复用登记表一起复位（错误页只有一个 main 标签）
+    {
+        let state = app.state::<AppState>();
+        *state.tabs.lock().unwrap() = TabState::with_main();
+        state.open_tabs.lock().unwrap().clear();
+    }
     let (lw, lh) = logical_inner_size(&window)?;
     let titlebar = WebviewBuilder::new(TITLEBAR_WEBVIEW, WebviewUrl::App("titlebar.html".into()));
     window.add_child(
@@ -1158,7 +1304,7 @@ fn build_error_window<R: Runtime>(
                 if payload_event.event() != PageLoadEvent::Finished {
                     return;
                 }
-                eprintln!(
+                flog!(
                     "[fnos] 错误页已加载（地址 {}；本页不注册 mods 初始化脚本）",
                     payload_event.url()
                 );
@@ -1231,17 +1377,41 @@ fn set_error_state<R: Runtime>(app: &AppHandle<R>, info: &ErrorInfo) -> u64 {
 /// ——既不镜像到窗口标题（`set_title`），也不进 UI，只在控制台留一行**固定短语 + 类型**
 /// （绝不回显页面可控正文）。Task 11 的探针分支就是这样做的，Task 13a 的上报分支照抄。
 pub fn handle_title<R: Runtime>(webview: &Webview<R>, title: &str, app: &AppHandle<R>) {
+    // —— P0-4：三条「页面 → 宿主」的控制前缀**只认主标签**。
+    //
+    // 这三条通道原先只按前缀分流、不看 webview 归属，于是任意一个**第三方应用标签页**
+    // 只要写一句 `document.title = 'FNOSPROBE:{"err":true,…}'`，宿主就会 `mark_failed`，
+    // 把整个主窗口重建成错误页——所有标签一起消失。上报通道同理：外部页的一条伪造上报
+    // 会覆盖 `page_report` 槽位，让设置窗的状态条从「已注入」错乱成别的结论。
+    //
+    // 归属判据必须是 `MAIN_WINDOW`（fnOS 桌面本体）：错误页/看门狗/退避/状态条证据
+    // 全部是围绕「fnOS 主页这一次加载」设计的。`titlebar` 是本地资产页、`tab-*` 是外部
+    // 应用页，两者都没有资格替主标签回话。
+    let is_main = webview.label() == MAIN_WINDOW;
     if let Some(payload) = title.strip_prefix(PROBE_TITLE_PREFIX) {
         // 探针标题是「页面 → 宿主」的回传通道，不是给用户看的标题：不镜像、只处理。
-        on_load_probe(app, payload);
+        if is_main {
+            on_load_probe(app, payload);
+        }
         return;
     }
     if let Some(payload) = title.strip_prefix(report::CHUNK_TITLE_PREFIX) {
-        on_page_chunk(webview, payload);
+        if is_main {
+            on_page_chunk(webview, payload);
+        }
         return;
     }
     if let Some(payload) = title.strip_prefix(report::REPORT_TITLE_PREFIX) {
-        on_page_report(webview, payload);
+        if is_main {
+            on_page_report(webview, payload);
+        }
+        return;
+    }
+    // P0-3：标签页快捷键。**任何**标签页都能发（用户焦点在哪个标签就由哪个标签发），
+    // 所以这里不加 `is_main` 门；安全性由「动作白名单 + 冷却 + 命令本身就是用户点标签条
+    // 也能做的事」三条共同保证（见 [`KEY_COOLDOWN_MS`] / [`handle_tab_key`]）。
+    if let Some(action) = title.strip_prefix(KEY_TITLE_PREFIX) {
+        handle_tab_key(app, action);
         return;
     }
     // 现场排障 + 运行期证据（错误页会把自检结论写进标题，见 ui/settings/error.html）。
@@ -1251,7 +1421,7 @@ pub fn handle_title<R: Runtime>(webview: &Webview<R>, title: &str, app: &AppHand
     // `document.title = "x\n[fnos] 页面上报已接受：…"` 就能在研究 stderr 里插出一行伪造日志。
     // `set_title` 拿到的仍是**原文**：spec §7「窗口标题跟随页面」是产品行为，标题栏不承担
     // 「证据」职责（Windows 会把标题栏里的控制字符当空白渲染），两者要求不同、处理也不同。
-    eprintln!("[fnos] 主窗口标题: {}", report::log_safe(title));
+    flog!("[fnos] 主窗口标题: {}", report::log_safe(title));
     // T14d：标题进标签页注册表；活动标签的标题同时是**窗口标题**（任务栏显示用）。
     let label = webview.label();
     if label != TITLEBAR_WEBVIEW {
@@ -1270,8 +1440,101 @@ pub fn handle_title<R: Runtime>(webview: &Webview<R>, title: &str, app: &AppHand
     }
 }
 
-/// 收到一条页面上报（`document.title` 的 `FNOSREPORT:` 通道；Task 13a）。
+/// 处理一条标签页快捷键（P0-3）：`next` / `prev` / `close` / `new`，其余一律丢弃。
 ///
+/// ## 为什么这条通道可以接受「页面写得动」
+///
+/// `document.title` 是页面可控的，任何站点都能写 `FNOSKEY:close`。三个理由让它不构成
+/// 安全问题：① 动作只有四个，且**每一个都等价于用户亲手点标签条**（关/切/开标签），
+/// 不触碰配置、文件系统、网络或任何 IPC 命令；② 只有真的把 fnOS 桌面开成标签页时才有
+/// 多个标签可操作，普通外部页刷这个前缀最多把当前标签切走一次；③ 下面的冷却把它压成
+/// 「120ms 最多一次」，刷屏不产生可感知影响。
+///
+/// 动作不合法就静默丢弃（不写日志——这条通路人人都能触发，写日志等于给页面一个日志放大器）。
+fn handle_tab_key<R: Runtime>(app: &AppHandle<R>, action: &str) {
+    use std::sync::atomic::Ordering;
+    let action = action.trim();
+    if !matches!(action, "next" | "prev" | "close" | "new") {
+        return;
+    }
+    // 冷却：CAS 抢占本次「时间片」。取不到（别的线程刚抢过）或还没到点就丢弃。
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let last = app
+        .state::<AppState>()
+        .last_key_at
+        .load(Ordering::Relaxed);
+    if now.saturating_sub(last) < KEY_COOLDOWN_MS {
+        return;
+    }
+    if app
+        .state::<AppState>()
+        .last_key_at
+        .compare_exchange(last, now, Ordering::AcqRel, Ordering::Relaxed)
+        .is_err()
+    {
+        return; // 并发的那一个已经执行
+    }
+
+    match action {
+        "new" => {
+            let url = {
+                let cfg = current(app);
+                resolve_main_url(&cfg, None)
+            };
+            let app = app.clone();
+            tauri::async_runtime::spawn(async move {
+                if let Err(e) = open_app_tab(&app, url).await {
+                    flog!("[fnos] 快捷键新开标签失败：{e}");
+                }
+            });
+        }
+        "close" => {
+            let active = app.state::<AppState>().tabs.lock().unwrap().active.clone();
+            if active == MAIN_WINDOW {
+                return; // 主页标签不可关（与 tab_close 同一条规则，这里直接不动）
+            }
+            let app = app.clone();
+            tauri::async_runtime::spawn(async move {
+                if let Err(e) = tab_close(app, active).await {
+                    flog!("[fnos] 快捷键关闭标签失败：{e}");
+                }
+            });
+        }
+        "next" | "prev" => {
+            let target = {
+                let state = app.state::<AppState>();
+                let tabs = state.tabs.lock().unwrap();
+                neighbor_tab(&tabs.order, &tabs.active, action == "next")
+            };
+            if let Some(label) = target {
+                activate_tab(app, &label);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 循环取邻居标签（浏览器语义：末尾下一个回到第一个）。
+///
+/// 抽成纯函数是为了能单测「首尾环绕 / 单标签 / 当前标签不在表里」这几种真实会出现的形状。
+fn neighbor_tab(order: &[String], active: &str, forward: bool) -> Option<String> {
+    if order.len() < 2 {
+        return None; // 只有一个标签：Ctrl+Tab 无事可做
+    }
+    let pos = order.iter().position(|l| l == active)?;
+    let n = order.len();
+    let next = if forward {
+        (pos + 1) % n
+    } else {
+        (pos + n - 1) % n
+    };
+    Some(order[next].clone())
+}
+
+/// 收到一条页面上报（`document.title` 的 `FNOSREPORT:` 通道；Task 13a）。
 /// 四道闸门全在 [`report::validate`] 里（字节上限 → 合法 JSON → 必须是对象 → `type` 白名单），
 /// 未通过就丢掉并留一行固定短语，**绝不 panic、绝不把页面可控正文写进日志或 UI**。
 /// 通过后连同**上报文档的 origin 与 URL** 一起存进 `AppState`（内存）：两者用于「换了页面/
@@ -1283,7 +1546,7 @@ fn on_page_report<R: Runtime>(window: &Webview<R>, payload: &str) {
     let value = match report::validate(payload) {
         Ok(v) => v,
         Err(reason) => {
-            eprintln!(
+            flog!(
                 "[fnos] 页面上报被拒（{}；{} 字节）",
                 reason.as_str(),
                 payload.len()
@@ -1292,7 +1555,7 @@ fn on_page_report<R: Runtime>(window: &Webview<R>, payload: &str) {
             // 超过它的上报到达宿主时已经被截断，只能表现为「不是合法 JSON」。把这一情形标出来，
             // 否则后来的人会去追一个并不存在的语法 bug（T13b 的大载荷上报正是高风险场景）。
             if reason == report::Reject::NotJson && report::truncation_suspected(payload.len()) {
-                eprintln!(
+                flog!(
                     "[fnos]   ↑ 长度已够到 document.title 的 {} 字节上限，疑似被通道截断（而不是 JSON 语法错）+ 见 FNOSCHUNK: 分片通道",
                     report::TITLE_CHANNEL_MAX_BYTES
                 );
@@ -1338,7 +1601,7 @@ fn store_report<R: Runtime>(
 ) {
     let ty = value.get("type").and_then(Value::as_str).unwrap_or("");
     let dir = value.get("dir").and_then(Value::as_str);
-    eprintln!(
+    flog!(
         "{}",
         report::accepted_log_line(ty, dir, origin.as_deref(), bytes)
     );
@@ -1381,10 +1644,10 @@ fn on_page_chunk<R: Runtime>(window: &Webview<R>, payload: &str) {
     match step {
         report::ChunkStep::Accepted { seq, total } => {
             // `seq` / `total` 都是宿主自己解析出来的数字（不是页面可控文本），可以作为日志字段
-            eprintln!("[fnos] 分片上报已接受：seq={seq} total={total}");
+            flog!("[fnos] 分片上报已接受：seq={seq} total={total}");
         }
         report::ChunkStep::Rejected(reason) => {
-            eprintln!(
+            flog!(
                 "[fnos] 分片上报被拒（{}；这一片 {} 字节）",
                 reason.as_str(),
                 payload.len()
@@ -1393,12 +1656,12 @@ fn on_page_chunk<R: Runtime>(window: &Webview<R>, payload: &str) {
         report::ChunkStep::Complete(assembled) => {
             match report::validate(&assembled) {
                 Ok(value) => {
-                    eprintln!("[fnos] 分片上报已到齐（{} 字节）", assembled.len());
+                    flog!("[fnos] 分片上报已到齐（{} 字节）", assembled.len());
                     store_report(window, value, origin, url, assembled.len());
                 }
                 Err(reason) => {
                     // 组装完成但内容不合法：同样只留固定短语（不打印正文）
-                    eprintln!(
+                    flog!(
                         "[fnos] 分片上报组装后被拒（{}；{} 字节）",
                         reason.as_str(),
                         assembled.len()
@@ -1532,7 +1795,7 @@ pub fn on_page_event<R: Runtime>(
     if event != PageLoadEvent::Finished {
         return;
     }
-    eprintln!("[fnos] 主窗口页面已加载: {url}");
+    flog!("[fnos] 主窗口页面已加载: {url}");
     // Task 13a：页内导航（`reload_main` 的 `navigate`、页面里的链接、重定向）**不走**
     // `begin_load`，所以上面那段带世代闸门的代码会直接 return——清理必须放在闸门**之前**，
     // 否则新文档与旧上报不同文档（换 origin，或同一个 origin 下的另一篇文档）时那条证据会
@@ -1551,22 +1814,26 @@ pub fn on_page_event<R: Runtime>(
         load.probe_generation = Some(generation);
     }
     if let Some(reason) = load_failure_reason(url) {
-        eprintln!("[fnos] URL 判定为 WebView2 错误页：{url}");
+        flog!("[fnos] URL 判定为 WebView2 错误页：{url}");
         mark_failed(app, generation, url, &reason);
         return;
     }
     // URL 上看不出失败（实测失败导航的 Source 仍是请求地址）→ 让页面自己回答
-    eprintln!("[fnos] 页面 URL 未显示错误页，交由页面自检探针判定: {url}");
+    flog!("[fnos] 页面 URL 未显示错误页，交由页面自检探针判定: {url}");
     if let Some(webview) = app.get_webview(MAIN_WINDOW) {
         let _ = webview.eval(LOAD_PROBE_JS);
     }
 }
 
 /// 页面自检探针的回话；只有明确的「这是错误页」才降级。
+///
+/// **结论是哪种都要先消费掉槽位**（P0-4 的另一半）：旧实现只在「判定失败」那条路上把
+/// `probe_generation` 清成 `None`（`mark_failed` 里），判定**成功**的分支在
+/// `probe_verdict` 返回 `None` 时直接 `return`，于是槽位永久停在 `Some(generation)`。
+/// 后果是同一世代里任何迟到（或伪造）的探针回话都还能再走一遍 `mark_failed`——而
+/// 探针本来就只该回一次话。
 fn on_load_probe<R: Runtime>(app: &AppHandle<R>, payload: &str) {
-    let Some(reason) = probe_verdict(payload) else {
-        return;
-    };
+    let verdict = probe_verdict(payload);
     let (generation, url) = {
         let state = app.state::<AppState>();
         let mut load = state.load.lock().unwrap();
@@ -1577,7 +1844,11 @@ fn on_load_probe<R: Runtime>(app: &AppHandle<R>, payload: &str) {
         load.probe_generation = None;
         (load.generation, load.url.clone())
     };
-    eprintln!("[fnos] 页面自检判定为加载失败：{reason}");
+    // 回话 = 页面自己说「我不是错误页」：这是成功路径，只消费槽位，不做别的。
+    let Some(reason) = verdict else {
+        return;
+    };
+    flog!("[fnos] 页面自检判定为加载失败：{reason}");
     mark_failed(app, generation, &url, &reason);
 }
 
@@ -1596,7 +1867,7 @@ fn mark_failed<R: Runtime>(app: &AppHandle<R>, generation: u64, url: &str, reaso
         load.failures = load.failures.saturating_add(1);
         load.probe_generation = None;
     }
-    eprintln!("[fnos] 主窗口加载失败：{url} — {reason}");
+    flog!("[fnos] 主窗口加载失败：{url} — {reason}");
     show_error_page(app, url, reason);
 }
 
@@ -1623,7 +1894,7 @@ fn show_error_page<R: Runtime>(app: &AppHandle<R>, failed_url: &str, reason: &st
     };
     *app.state::<AppState>().recreate_error.lock().unwrap() = Some(info);
     if let Err(e) = trigger_recreate(app) {
-        eprintln!("[fnos] 切换错误页失败: {e}");
+        flog!("[fnos] 切换错误页失败: {e}");
         // 建不出来就别把错误页目标挂在那里，否则下一次重建会莫名其妙变成错误页
         let _ = app
             .state::<AppState>()
@@ -1657,11 +1928,11 @@ fn arm_load_watchdog<R: Runtime>(app: &AppHandle<R>, generation: u64) {
                 return;
             }
             let reason = format!("页面在 {LOAD_TIMEOUT_SECS} 秒内没有完成加载（超时）");
-            eprintln!("[fnos] {reason}");
+            flog!("[fnos] {reason}");
             mark_failed(&handle, generation, &url, &reason);
         });
     if let Err(e) = spawned {
-        eprintln!("[fnos] 加载看门狗线程启动失败（超时兜底失效）: {e}");
+        flog!("[fnos] 加载看门狗线程启动失败（超时兜底失效）: {e}");
     }
 }
 
@@ -1690,13 +1961,13 @@ fn schedule_auto_retry<R: Runtime>(app: AppHandle<R>, delay_ms: u64) {
             if !go {
                 return;
             }
-            eprintln!("[fnos] 错误页自动重试（退避 {delay_ms} ms）");
+            flog!("[fnos] 错误页自动重试（退避 {delay_ms} ms）");
             if let Err(e) = recreate_main_window(&app, None) {
-                eprintln!("[fnos] 自动重试重建主窗口失败: {e}");
+                flog!("[fnos] 自动重试重建主窗口失败: {e}");
             }
         });
     if let Err(e) = spawned {
-        eprintln!("[fnos] 自动重试线程启动失败: {e}");
+        flog!("[fnos] 自动重试线程启动失败: {e}");
     }
 }
 
@@ -1813,7 +2084,7 @@ pub fn recreate_main_window<R: Runtime>(
 /// 托盘「重新加载」：按配置的 `homeUrl` 重建主窗口（从错误页恢复的正路之一）。
 pub fn reload_main_window<R: Runtime>(app: &AppHandle<R>) {
     if let Err(e) = recreate_main_window(app, None) {
-        eprintln!("[fnos] 重新加载主窗口失败: {e}");
+        flog!("[fnos] 重新加载主窗口失败: {e}");
     }
 }
 
@@ -1826,7 +2097,7 @@ pub fn on_main_destroyed<R: Runtime>(app: &AppHandle<R>) {
         return;
     }
     if let Err(e) = rebuild_main(app) {
-        eprintln!("[fnos] 主窗口重建失败: {e}");
+        flog!("[fnos] 主窗口重建失败: {e}");
     }
 }
 
@@ -1961,14 +2232,14 @@ fn open_in_browser(url: &str) -> Result<(), String> {
         .map_err(|e| format!("打开系统默认浏览器失败：{e}"))?;
     // 排障 + 验证用：一次成功的「交给系统浏览器」在应用 stderr 留一行。运行时验证靠它
     // 确认点击真的走到了这条命令（而不是被 webview 吞掉），与建窗时的页面加载日志同风格。
-    eprintln!("[fnos] open_url -> 系统默认浏览器: {url}");
+    flog!("[fnos] open_url -> 系统默认浏览器: {url}");
     Ok(())
 }
 
 #[tauri::command]
 pub fn reset_config<R: Runtime>(app: AppHandle<R>, scope: String) -> Result<ConfigView, String> {
-    let mut cfg = current(&app);
-    let prev_shell = cfg.shell.clone();
+    let prev = current(&app);
+    let mut cfg = prev.clone();
     match scope.as_str() {
         "mods" => cfg.mods = Default::default(),
         "shell" => {
@@ -1987,13 +2258,12 @@ pub fn reset_config<R: Runtime>(app: AppHandle<R>, scope: String) -> Result<Conf
         .map_err(|e| e.to_string())?;
     *app.state::<AppState>().config.lock().unwrap() = cfg.clone();
     apply_to_page(&app, &cfg);
-    // 与 `set_config` 同一判据：reset 也可能把 `injectEnabled` / `homeUrl` 拉回默认值，
-    // 同样必须重建主窗口才算生效。
-    if cfg.shell.inject_enabled != prev_shell.inject_enabled
-        || cfg.shell.home_url != prev_shell.home_url
-    {
+    // 与 `set_config` **同一个**判据（`payload_changed`）：reset 同样可能把
+    // `injectEnabled` / `homeUrl` / 完美图标 / 登录壁纸拉回默认值，全部必须重建主窗口才算生效。
+    // 此前这里只比前两项，于是「恢复默认」后活窗口仍带着已关闭的 1 MiB 图标与旧壁纸。
+    if payload_changed(&prev, &cfg) {
         if let Err(e) = recreate_main_window(&app, None) {
-            eprintln!("[fnos] 重置后重建主窗口失败: {e}");
+            flog!("[fnos] 重置后重建主窗口失败: {e}");
         }
     }
     Ok(config_view(
@@ -2074,7 +2344,7 @@ fn store_wallpaper(
 pub fn import_wallpaper(name: String, data_base64: String) -> Result<String, String> {
     let (stored, bytes) = store_wallpaper(&paths::config_dir(), &name, &data_base64)?;
     // `stored` 是宿主自己算出来的 ASCII 名字（`[a-z0-9-_]` + 扩展名），不含换行、可以直接进日志
-    eprintln!("[fnos] 登录壁纸已导入：{stored}（{bytes} 字节）");
+    flog!("[fnos] 登录壁纸已导入：{stored}（{bytes} 字节）");
     Ok(stored)
 }
 
@@ -2130,7 +2400,7 @@ fn load_local_store(path: &std::path::Path) -> std::collections::BTreeMap<String
         None => {
             let bak = path.with_extension("json.bak");
             let _ = std::fs::rename(path, &bak);
-            eprintln!(
+            flog!(
                 "[fnos] 设置窗本地存储损坏，已改名为 {} 并回到空存储",
                 bak.display()
             );
@@ -2254,7 +2524,7 @@ pub fn request_app_items<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
         .map_err(|e| format!("请求页面汇报应用项失败：{e}"))?;
     // 运行期证据（与建窗加载日志同风格）：证明设置窗的请求真的**下发到了页面**。
     // 「页面有没有真的送出去」不在这里断言（宿主观测不到），见上面的注释。
-    eprintln!(
+    flog!(
         "[fnos] 已向主窗口页面下发重新汇报应用项的钩子调用（页面侧无钩子/无请求可发时不会送出）"
     );
     Ok(())
@@ -2283,7 +2553,7 @@ pub fn open_settings<R: Runtime>(app: &AppHandle<R>) {
     .build()
     {
         Ok(_) => {}
-        Err(e) => eprintln!("[fnos] 设置窗创建失败: {e}"),
+        Err(e) => flog!("[fnos] 设置窗创建失败: {e}"),
     }
 }
 
@@ -2315,6 +2585,8 @@ pub fn save_and_install_state<R: Runtime>(
         tabs: Mutex::new(TabState::with_main()),
         next_tab: AtomicU64::new(1),
         open_tabs: Mutex::new(std::collections::HashMap::new()),
+        init_script: Mutex::new(None),
+        last_key_at: AtomicU64::new(0),
     });
 }
 
@@ -2361,6 +2633,113 @@ pub fn save_window_geom<R: Runtime>(app: &AppHandle<R>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// P0-3：标签页快捷键的邻居计算必须环绕，且单标签/异常态不做事。
+    #[test]
+    fn neighbor_tab_wraps_and_is_inert_with_a_single_tab() {
+        let order: Vec<String> = ["main", "tab-1", "tab-2"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        assert_eq!(neighbor_tab(&order, "main", true).as_deref(), Some("tab-1"));
+        assert_eq!(neighbor_tab(&order, "tab-2", true).as_deref(), Some("main"), "末尾下一个环绕回第一个");
+        assert_eq!(neighbor_tab(&order, "main", false).as_deref(), Some("tab-2"), "第一个上一个环绕到末尾");
+        assert_eq!(neighbor_tab(&order, "tab-1", false).as_deref(), Some("main"));
+        // 只有一个标签：Ctrl+Tab 无事可做（返回 None 而不是切到自己）
+        let single: Vec<String> = vec!["main".to_string()];
+        assert_eq!(neighbor_tab(&single, "main", true), None);
+        // 当前标签不在表里（竞态：刚被关掉）：不做任何事
+        assert_eq!(neighbor_tab(&order, "tab-9", true), None);
+        assert_eq!(neighbor_tab(&[], "main", true), None);
+    }
+
+    /// P0-3：快捷键通道的安全面——前缀常量与 `inject/keys.js` 逐字一致，白名单之外一律不执行。
+    #[test]
+    fn tab_key_channel_is_whitelisted() {
+        assert_eq!(KEY_TITLE_PREFIX, "FNOSKEY:");
+        let js = include_str!("../inject/keys.js");
+        assert!(
+            js.contains(&format!("var KEY_TITLE_PREFIX = '{KEY_TITLE_PREFIX}';")),
+            "页面侧前缀必须与宿主常量逐字一致"
+        );
+        let src = include_str!("commands.rs");
+        let start = src.find("fn handle_tab_key").expect("处理器必须存在");
+        let end = src[start..].find("/// 循环取邻居标签").map(|i| start + i).unwrap_or(src.len());
+        let body = &src[start..end];
+        assert!(
+            body.contains(r#"matches!(action, "next" | "prev" | "close" | "new")"#),
+            "动作必须在白名单里"
+        );
+        assert!(
+            body.contains("KEY_COOLDOWN_MS") && body.contains("compare_exchange"),
+            "必须有刷屏冷却（页面可控通道）"
+        );
+        // 不得出现「提升权限」式的动作：这条通道只能切/关/开标签
+        for forbidden in ["set_config", "reset_config", "import_wallpaper", "open_url"] {
+            assert!(!body.contains(forbidden), "快捷键通道不得触达 {forbidden}");
+        }
+    }
+
+    /// P1-8：`payload_changed` 是 `set_config` 与 `reset_config` 共用的**唯一**重建判据。
+    /// 四个载荷键任一变化都必须判「需要重建」；其余（mods 字段、dockAutoHide、
+    /// keepAliveMinutes、window 几何）都不能触发重建。
+    #[test]
+    fn payload_changed_covers_exactly_the_four_reload_keys() {
+        let base = Config::default();
+        assert!(!payload_changed(&base, &base.clone()), "没变就不该重建");
+
+        // ① injectEnabled
+        let mut c = base.clone();
+        c.shell.inject_enabled = !base.shell.inject_enabled;
+        assert!(payload_changed(&base, &c), "注入开关变了必须重建");
+
+        // ② homeUrl
+        let mut c = base.clone();
+        c.shell.home_url = "https://nas.example.com/".into();
+        assert!(payload_changed(&base, &c), "启动地址变了必须重建");
+
+        // ③ 完美图标开关（决定 1 MiB 图标进不进载荷）
+        let mut c = base.clone();
+        c.mods.launchpad_icon_scale_enabled = true;
+        assert!(payload_changed(&base, &c), "完美图标开关变了必须重建");
+
+        // ④ 登录壁纸文件名（决定 binaryAssets 里嵌哪张图）
+        let mut c = base.clone();
+        c.local.login_wallpaper_file_name = Some("wall-abc123.png".into());
+        assert!(payload_changed(&base, &c), "登录壁纸变了必须重建");
+
+        // 反例：走免刷新通道的键都**不得**进判据（进了就是白重建一次窗口）
+        let mut c = base.clone();
+        c.shell.dock_auto_hide = !base.shell.dock_auto_hide;
+        c.shell.keep_alive_minutes = 33;
+        c.mods.base_preset_enabled = !base.mods.base_preset_enabled;
+        c.shell.window.w = base.shell.window.w + 10.0;
+        assert!(
+            !payload_changed(&base, &c),
+            "dockAutoHide / keepAliveMinutes / mods.* / 窗口几何走免刷新或与载荷无关，不得触发重建"
+        );
+    }
+
+    /// P1-7：新标签页的初始标题取主机名第一段，绝不回落到内部 label（`tab-3`）。
+    #[test]
+    fn tab_initial_title_prefers_the_host_label() {
+        let u = tauri::Url::parse("https://hermes-studio.nas-abc.fnos.net/apps/x?a=1").unwrap();
+        assert_eq!(tab_initial_title(&u), "hermes-studio");
+        // IP 字面量整段保留（按点切会把 192.168.1.10 变成无意义的「192」）
+        let u = tauri::Url::parse("http://192.168.1.10:5666/").unwrap();
+        assert_eq!(tab_initial_title(&u), "192.168.1.10");
+        let u = tauri::Url::parse("http://[fd00::1]:5666/").unwrap();
+        assert_eq!(tab_initial_title(&u), "fd00::1");
+        // 单段主机名
+        let u = tauri::Url::parse("http://nas:5666/").unwrap();
+        assert_eq!(tab_initial_title(&u), "nas");
+        // 弹窗起始页没有主机名：给一句固定文案，而不是空串或 tab-N
+        let u = tauri::Url::parse("about:blank").unwrap();
+        assert_eq!(tab_initial_title(&u), "新标签页");
+        // 其它无主机名的 scheme 退化成 scheme 本身，仍然可读
+        let u = tauri::Url::parse("data:text/html,x").unwrap();
+        assert_eq!(tab_initial_title(&u), "data");
+    }
 
     /// `open_url` 的闸门：只有绝对 http(s) URL 能过。
     #[test]
@@ -3176,24 +3555,45 @@ mod tests {
     /// T14c：`dockAutoHide` **不进** `needs_reload` 判据（免刷新生效）。
     ///
     /// 判据本身要 `State`/`AppHandle` 才能跑（`set_config` 是命令，本 crate 的单测不带
-    /// tauri harness），所以按上面几条的同族手法做**源码级**锁：判据表达式的源码区间里
-    /// 不得出现 `dock_auto_hide`。它的生效通道是 `apply_to_page` 的 `shell.dockAutoHide`
-    /// → shim 转调 `__FNOS_APPLY_SHELL__`（`inject/dock.js`）——把它加进判据只会让每次
-    /// 切换白重建一次主窗口。
+    /// tauri harness），所以按上面几条的同族手法做**源码级**锁：判据函数
+    /// [`payload_changed`] 的函数体里不得出现 `dock_auto_hide`。它的生效通道是
+    /// `apply_to_page` 的 `shell.dockAutoHide` → shim 转调 `__FNOS_APPLY_SHELL__`
+    /// （`inject/dock.js`）——把它加进判据只会让每次切换白重建一次主窗口。
     #[test]
     fn dock_auto_hide_toggles_without_window_rebuild() {
         let src = include_str!("commands.rs");
+        // 锚点必须是**定义**而不是任意引用：`find("…")` 会命中这条测试自己的断言字符串
+        // （它就在同一份源码里），于是区间变成「测试内部的一小段」，断言永远为真。
+        // 用函数定义的头 + 到下一个顶层 `}` 的区间来锁真正的判据。
         let start = src
-            .find("let needs_reload = next.shell.inject_enabled")
-            .expect("needs_reload 判据必须还在 set_config 里");
+            .find("fn payload_changed(prev: &Config, next: &Config) -> bool {")
+            .expect("判据函数 payload_changed 必须存在");
+        // 函数体的结束：从 `fn payload_changed` 往后找第一个「独占一行的 `}`」。
+        // 必须同时兼容 LF / CRLF（源码在 Windows 上是 CRLF，而 `include_str!` 保留原样）。
         let end = src[start..]
-            .find(';')
+            .find("\n}\n")
+            .or_else(|| src[start..].find("\r\n}\r\n"))
             .map(|i| start + i)
-            .expect("判据是一条以分号结尾的表达式");
+            .expect("判据函数的函数体必须以独占一行的 } 结束");
         let predicate = &src[start..end];
         assert!(
+            predicate.contains("next.shell.inject_enabled"),
+            "取到的区间必须真的是判据函数体（锚点失效会让这条断言变成空转）：{predicate}"
+        );
+        assert!(
             !predicate.contains("dock_auto_hide"),
-            "dockAutoHide 必须走免刷新通道，不得进 needs_reload 判据：{predicate}"
+            "dockAutoHide 必须走免刷新通道，不得进 payload_changed 判据：{predicate}"
+        );
+        // 判据必须被两条入口**共用**（这正是 P1-8 的修复点：reset 曾经少比两项）
+        let set_cfg = src.find("pub fn set_config<R: Runtime>").expect("set_config 必须存在");
+        assert!(
+            src[set_cfg..].contains("payload_changed(&prev, &next)"),
+            "set_config 必须调用共用的 payload_changed"
+        );
+        let reset = src.find("pub fn reset_config<R: Runtime>").expect("reset_config 必须存在");
+        assert!(
+            src[reset..].contains("payload_changed(&prev, &cfg)"),
+            "reset_config 必须调用**同一个** payload_changed（否则「恢复默认」不重建窗口）"
         );
         // 免刷新通道必须带着这个键：apply_to_page 的 shell 段缺了它，开关就只能对下一个
         // 新窗口生效（对活窗口永远不动手——那不是「即时生效」而是「悄悄不生效」）。
@@ -3232,8 +3632,8 @@ mod tests {
             "必须先查复用登记表"
         );
         assert!(
-            code.contains("if app.get_webview(&existing).is_some()"),
-            "命中必须验活（标签被关过就清条目继续开）"
+            code.contains("still_same_page"),
+            "命中必须复验标签**当前页面**（P1-7：只看 webview 存活会切到已导航走的旧标签）"
         );
         assert!(
             code.contains("复用切换（不新开）") && code.contains("与桌面标签相同，切换复用"),
@@ -3248,6 +3648,12 @@ mod tests {
         assert!(
             code.contains(".retain(|_, l| l != &label);"),
             "关标签必须清登记表"
+        );
+        // P1-7：窗口重建（正常窗 + 错误页）都必须把登记表清空——旧 tab-N label 已不存在
+        assert_eq!(
+            code.matches("open_tabs.lock().unwrap().clear();").count(),
+            2,
+            "build_main_window_with 与 build_error_window 都要清空复用登记表"
         );
     }
 
@@ -3358,12 +3764,20 @@ mod tests {
             "标签页与主标签共用同一组回调（generation = None：不进加载观测管线）"
         );
         assert!(
-            body.contains("build_init_script"),
-            "标签页 Webview 照常注入桌面载荷（origin 判定由 content-script 自行决定）"
+            body.contains("init_script_cached(app, &cfg)"),
+            "标签页必须走**缓存过的**初始化脚本（P0-2：每次开标签都重读壁纸 + 重做 1 MiB base64 是纯浪费）"
         );
         assert!(
             body.contains("activate_tab(app, &label)"),
             "新标签页创建即激活"
+        );
+        assert!(
+            body.contains("tab_initial_title(&url)"),
+            "新标签页必须立刻有可读标题（取主机名），不能等 document.title 才从 tab-N 变过来"
+        );
+        assert!(
+            verdict.contains("still_same_page"),
+            "复用闸门必须复验标签**当前页面**（P1-7），不能只验 webview 还活着"
         );
         // 三个标签页命令 + 命令清单同步（build.rs 的 AppManifest::commands）
         for cmd in ["tab_new", "tab_switch", "tab_close"] {

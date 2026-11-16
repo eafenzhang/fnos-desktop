@@ -1,6 +1,6 @@
 [package]
 name = "fnos-desktop"
-version = "0.3.12"
+version = "0.3.13"
 edition = "2021"
 build = "build.rs"
 
@@ -21,6 +21,9 @@ url = "2"
 # T14c 修复轮 21：托盘「检查更新」——拉 GitHub Releases 的 latest 比对版本号。阻塞式
 # HTTP 放在 `spawn_blocking` 里跑；升级动作本身由用户在浏览器里完成，本壳不下载不安装。
 ureq = { version = "2", default-features = true }
+# P1-5：安装包完整性校验。配上 `shell.updateMirrorPrefix` 之后，GitHub 的 HTTPS 不再是
+# 唯一来源，下载完必须拿 release API 的 `assets[].digest`（sha256）比对一次再执行。
+sha2 = "0.10"
 
 [target.'cfg(windows)'.dependencies]
 # 原生 MessageBoxW：检查结果要能从托盘动作直接反馈给用户（release 无控制台，

@@ -5,6 +5,10 @@ mod base64;
 mod commands;
 mod config;
 mod injector;
+// P0-1：release 下没有控制台（R9），所有 `[fnos]` 日志经 `logfile::flog!` 同时落盘到
+// `config_dir()/app.log`。此前安装版的所有日志都掉进无底洞，白屏/加载失败/更新失败
+// 这些现场没有任何可回传的文本。
+mod logfile;
 mod paths;
 mod report;
 mod tray;
@@ -72,6 +76,13 @@ fn main() {
                 tauri::WindowEvent::Destroyed => commands::on_main_destroyed(app),
                 // T14d：子 Webview 不会随窗口自动重排——最大化 / 还原 / 拖边缘都要重摆。
                 tauri::WindowEvent::Resized(size) => commands::relayout_main_window(window, *size),
+                // 跨不同缩放比的显示器拖动（100% ⇄ 150%）：tao 发的是 ScaleFactorChanged，
+                // **不保证**再补一条 Resized。子 Webview 的 bounds 是按**物理**像素算的，
+                // 只处理 Resized 会让 32px 标题栏在换屏后残留旧缩放的条高（表现为标题栏
+                // 与内容之间一道缝或盖住内容 1~2px）。这里复用同一个 relayout。
+                tauri::WindowEvent::ScaleFactorChanged { new_inner_size, .. } => {
+                    commands::relayout_main_window(window, *new_inner_size)
+                }
                 _ => {}
             }
         })
