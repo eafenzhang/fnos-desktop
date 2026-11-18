@@ -93,6 +93,10 @@
   var axis = 'x';        // Dock 贴边方向：'x'（左右缘）或 'y'（上下缘）
   var edgeMin = true;    // true = 贴在坐标最小的一侧（左/上）；false = 右/下
   var shown = false;     // 显隐意图（与 HIDDEN_CLASS 互斥）；接管默认 false = 平时是藏着的
+  var lastMove = null;   // 最近一次 pointermove 的坐标（按帧合并用）
+  var moveScheduled = false; // 本帧是否已经排了指针处理
+  var dockW = 0;         // Dock 尺寸缓存（避免每个 pointermove 都读 offsetWidth/Height）
+  var dockH = 0;
   var idleTimer = null;  // 无操作兜底定时器（armIdle）
   var displayTimer = null; // 滑出动画结束后真正 display:none 的定时器
   var lastMiss = '';     // 最近一次「全部策略落空」的计数快照（控制台诊断用）
@@ -274,6 +278,8 @@
     if (!dock) return;
     var rect;
     try { rect = dock.getBoundingClientRect(); } catch (e) { return; }
+    if (rect.width > 0) dockW = rect.width;
+    if (rect.height > 0) dockH = rect.height;
     dock.style.setProperty('--fnos-dock-hide-tf', measure(rect));
   }
 
@@ -632,11 +638,31 @@
    */
   function onPointerMove(e) {
     if (!enabled || !dock || fullscreen) return;
+    lastMove = { x: e.clientX, y: e.clientY };
+    // 高频鼠标（1000Hz 回报率）不必每个事件都算一遍：按帧合并。
+    if (typeof W.requestAnimationFrame !== 'function') {
+      handlePointerMove(lastMove);
+      return;
+    }
+    if (moveScheduled) return;
+    moveScheduled = true;
+    W.requestAnimationFrame(function () {
+      moveScheduled = false;
+      if (lastMove) handlePointerMove(lastMove);
+      lastMove = null;
+    });
+  }
+
+  function handlePointerMove(point) {
+    if (!enabled || !dock || fullscreen) return;
     armIdle();
     var vw = W.innerWidth || 0;
     var vh = W.innerHeight || 0;
-    var size = axis === 'y' ? dock.offsetHeight : dock.offsetWidth;
-    var coord = axis === 'y' ? e.clientY : e.clientX;
+    // 尺寸缓存：每帧最多读一次 offsetWidth/Height（隐藏时读 0，就沿用上次的）。
+    var size = axis === 'y' ? (dockH || dock.offsetHeight) : (dockW || dock.offsetWidth);
+    dockW = dock.offsetWidth || dockW;
+    dockH = dock.offsetHeight || dockH;
+    var coord = axis === 'y' ? point.y : point.x;
     var span = axis === 'y' ? vh : vw;
     var near = edgeMin ? coord <= EDGE_PX : (span ? coord >= span - EDGE_PX : false);
     var over = edgeMin ? coord <= size + SLACK_PX : (span ? coord >= span - size - SLACK_PX : false);

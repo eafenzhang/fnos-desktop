@@ -205,6 +205,8 @@ test('点击分发：标签切换 / 关闭 / 新建都带上正确的命令与�
 test('纪律：不碰页面内容、高度 32 跨语言一致、授权面精确', () => {
   assert.ok(!TB_JS.includes('innerHTML'), '不得用 innerHTML');
   assert.ok(TB_JS.includes('STRIP_H = 32'), '栏高 32 与 Rust TAB_STRIP_H 一致');
+  assert.ok(TB_JS.includes('requestAnimationFrame') && TB_JS.includes('scheduleTabs'),
+    '高频标签状态推送必须按帧合并（隐藏时同步渲染）');
   // 系统标题栏一致性（修复轮 4）：图标必须走系统字体栈，按钮 46px 整高
   assert.ok(TB_CSS.includes('"Segoe Fluent Icons"') && TB_CSS.includes('"Segoe MDL2 Assets"'),
     '窗口按钮必须用系统图标字体（与 Windows 标题栏同款字形）');

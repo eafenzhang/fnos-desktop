@@ -174,6 +174,10 @@ test('纪律：不开 IPC、不写 innerHTML、只在自己的 class 命名空�
   }
   // 诊断只剩控制台口（不向页面画东西）
   assert.ok(DOCK.includes('__FNOS_DOCK_STATE__'), '必须保留控制台诊断口');
+  // 性能：高频指针按帧合并 + Dock 尺寸缓存，不在每个 pointermove 里读布局。
+  assert.ok(DOCK.includes('requestAnimationFrame') && DOCK.includes('handlePointerMove'),
+    'pointermove 必须按帧合并');
+  assert.ok(DOCK.includes('dockW') && DOCK.includes('dockH'), 'Dock 尺寸必须缓存');
 });
 
 // ---------- 顶层文档守卫 ----------

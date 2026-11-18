@@ -4,7 +4,7 @@ use crate::{base64, config, config::Config, injector, paths, report, tray, MAIN_
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 use tauri::webview::{PageLoadEvent, WebviewBuilder};
@@ -72,6 +72,10 @@ pub const KEY_TITLE_PREFIX: &str = "FNOSKEY:";
 /// 任何页面都写得动自己的标题，所以这条通道必须按「可能被刷屏」设计：120ms 内的多个命令
 /// 只执行第一个（人类连按 Tag 键的极限在 100ms 以上，180 次/秒的合成风暴会被完全折掉）。
 const KEY_COOLDOWN_MS: u64 = 120;
+
+/// 标题日志的最小落盘间隔（毫秒）。页面标题会随未读计数/播放进度频繁变化，逐条写日志
+/// 只会白占磁盘和主线程；500ms 足够还原「标题怎么变」，又不至于把日志变成噪声放大器。
+const TITLE_LOG_INTERVAL_MS: u64 = 500;
 
 /// 快捷键冷却的**上次执行时刻**（`AppState::last_key_at`）：Unix 毫秒。
 ///
@@ -199,6 +203,13 @@ pub struct AppState {
     /// 见 [`KEY_COOLDOWN_MS`]：页面（任何页面）都写得动 `document.title`，这条通道必须假设
     /// 会被刷屏，所以每条命令在执行前先做一次 CAS 冷却——不取任何 Mutex。
     pub last_key_at: KeyClock,
+    /// 上次推给标题栏的最大化状态：`0` = 未知（建窗/重建后必须重推）、`1` = 否、`2` = 是。
+    ///
+    /// 拖拽缩放期间 `Resized` 会高频到来，`window.is_maximized()` 很便宜，但每次 eval 标题栏
+    /// 是跨 Webview 的 IPC；用这个状态把「没变」的推送折掉。
+    pub last_maximized: AtomicU8,
+    /// 标题日志的上次落盘时刻（Unix 毫秒；见 [`TITLE_LOG_INTERVAL_MS`]）。
+    pub last_title_log: AtomicU64,
 }
 
 /// 主窗口的标签页状态（见 [`AppState::tabs`]）。
@@ -805,6 +816,8 @@ fn build_main_window_with<R: Runtime>(
         let state = app.state::<AppState>();
         *state.tabs.lock().unwrap() = TabState::with_main();
         state.open_tabs.lock().unwrap().clear();
+        // 新建的标题栏是全新的 Webview：最大化字形状态必须重推一次。
+        state.last_maximized.store(0, Ordering::SeqCst);
     }
 
     // —— 标签页栏：本地资产页，无注入、无上报通道，授权面见
@@ -843,6 +856,8 @@ fn build_main_window_with<R: Runtime>(
     arm_load_watchdog(app, generation);
     // T14d：标签条先推一次初态（main 一个标签），不等第一条标题事件。
     push_tabs(app);
+    // 新建标题栏：最大化字形必须初始化（push_tabs 不再顺带推它）。
+    push_win_max(app);
     Ok(window)
 }
 
@@ -1195,15 +1210,27 @@ fn create_popup_window<R: Runtime>(
     builder.build()
 }
 
+/// 同一个 fnOS origin 下，只有桌面根页面和登录/授权页需要完整 mods 载荷；应用标签
+/// （`/seek`、`/p`、`/music`、`/app/...`）只需要标签快捷键。
+///
+/// 为什么：完整载荷包含 dock / windowpos / keepalive 与上游 content-script，它们只对
+/// fnOS 桌面有意义；聊天/相册这类高频变更的应用页里，windowpos 的全局 MutationObserver
+/// 等观察器纯属额外开销。登录/授权页仍拿完整载荷（授权按钮可见性等 CSS 修正依赖它）。
+/// 调用方已保证 `same_origin(desktop, url)`。
+fn is_desktop_or_auth_page(desktop: &tauri::Url, url: &tauri::Url) -> bool {
+    desktop.path().trim_end_matches('/') == url.path().trim_end_matches('/')
+        || is_auth_like_url(url)
+}
+
 /// 按目标页面选择注入档位：
-/// - 与 fnOS 桌面同源的标签 → 完整载荷（缓存过的初始化脚本）；
-/// - 第三方标签 → 只注入标签快捷键（[`injector::build_core_script`]）。
+/// - 桌面根页面 / 登录授权页（且与 fnOS 同源）→ 完整载荷（缓存过的初始化脚本）；
+/// - 其他应用标签与第三方标签 → 只注入标签快捷键（[`injector::build_core_script`]）。
 ///
 /// 「同源」的比较对象是 [`resolve_main_url`]（与建窗/重建用的是同一份地址解析），
 /// 所以 `nasUrl`/`homeUrl` 的切换不会让这两个入口对同一个标签做出不同判断。
 fn init_script_for_tab<R: Runtime>(app: &AppHandle<R>, cfg: &Config, url: &tauri::Url) -> String {
     let desktop = resolve_main_url(cfg, None);
-    if same_origin(&desktop, url) {
+    if same_origin(&desktop, url) && is_desktop_or_auth_page(&desktop, url) {
         init_script_cached(app, cfg)
     } else {
         injector::build_core_script()
@@ -1341,6 +1368,8 @@ fn activate_tab<R: Runtime>(app: &AppHandle<R>, label: &str) {
         let _ = window.set_title(&t);
     }
     push_tabs(app);
+    // 隐藏期间窗口可能改过尺寸；切过来时补一次 bounds（resize 只重排激活标签）。
+    set_active_content_bounds(&window, label);
 }
 
 /// 把标签条状态推给 titlebar Webview（`__FNOS_TABS_SET__`；标签的增删 / 切换 / 改名都会调）。
@@ -1370,12 +1399,12 @@ fn push_tabs<R: Runtime>(app: &AppHandle<R>) {
         }
         Err(e) => flog!("[fnos] 标签条状态序列化失败: {e}"),
     }
-    push_win_max(app);
 }
 
 /// 把窗口「是否最大化」推给标签条（`__FNOS_WIN_MAX_SET__`：切换 □ / 还原按钮字形）。
-/// 建窗后（[`push_tabs`]）与每次窗口 resize（[`relayout_main_window`]，最大化/还原都会
-/// 触发 Resized）各推一次——按钮字形始终与系统标题栏语义一致。
+///
+/// 建窗后与每次窗口 resize（[`relayout_main_window`]）调用；状态没变时**不 eval**——
+/// 拖拽缩放期间 `Resized` 高频到来，每次跨 Webview IPC 是白费。
 fn push_win_max<R: Runtime>(app: &AppHandle<R>) {
     let Some(titlebar) = app.get_webview(TITLEBAR_WEBVIEW) else {
         return;
@@ -1384,6 +1413,15 @@ fn push_win_max<R: Runtime>(app: &AppHandle<R>) {
         return;
     };
     let maximized = window.is_maximized().unwrap_or(false);
+    let next: u8 = if maximized { 2 } else { 1 };
+    if app
+        .state::<AppState>()
+        .last_maximized
+        .swap(next, Ordering::SeqCst)
+        == next
+    {
+        return;
+    }
     let _ = titlebar.eval(format!(
         "window.__FNOS_WIN_MAX_SET__ && window.__FNOS_WIN_MAX_SET__({maximized});"
     ));
@@ -1734,7 +1772,40 @@ fn exit_fullscreen_if_needed<R: Runtime>(app: &AppHandle<R>) {
     leave_fullscreen(app);
 }
 
-/// 窗口 resize 后把所有子 Webview 摆回正确位置（`main.rs` 的 `Resized` 事件转发到这里）。
+/// 内容 Webview 的 bounds（全屏时从 y=0 铺满；普通态在 32px 标题栏之下）。
+fn content_rect(
+    size: tauri::PhysicalSize<u32>,
+    scale: f64,
+    fullscreen: bool,
+) -> tauri::Rect {
+    let strip = (TAB_STRIP_H * scale) as i32;
+    let (y, h) = if fullscreen {
+        (0, size.height)
+    } else {
+        (strip, size.height.saturating_sub(strip as u32))
+    };
+    tauri::Rect {
+        position: tauri::Position::Physical(tauri::PhysicalPosition::new(0, y)),
+        size: tauri::Size::Physical(tauri::PhysicalSize::new(size.width, h)),
+    }
+}
+
+/// 只把**当前激活**标签摆到内容区。resize 时隐藏标签不重排——它们的页面不该因为
+/// 用户拖窗口而白做一次 layout/reflow；等真正切过去时由 [`activate_tab`] 补上。
+fn set_active_content_bounds<R: Runtime>(window: &tauri::Window<R>, label: &str) {
+    let Ok(size) = window.inner_size() else {
+        return;
+    };
+    let Ok(scale) = window.scale_factor() else {
+        return;
+    };
+    let fullscreen = window.is_fullscreen().unwrap_or(false);
+    if let Some(wv) = window.webviews().into_iter().find(|wv| wv.label() == label) {
+        let _ = wv.set_bounds(content_rect(size, scale, fullscreen));
+    }
+}
+
+/// 窗口 resize 后把标题栏与**当前激活标签**摆回正确位置（`main.rs` 的 `Resized` 转发）。
 /// 子 Webview **不会**随窗口自动重排——最大化 / 还原 / 拖边缘都靠这一趟。
 pub fn relayout_main_window<R: Runtime>(window: &tauri::Window<R>, size: tauri::PhysicalSize<u32>) {
     let Ok(scale) = window.scale_factor() else {
@@ -1744,29 +1815,32 @@ pub fn relayout_main_window<R: Runtime>(window: &tauri::Window<R>, size: tauri::
     // 全屏时标题栏是**悬浮层**：内容 Webview 铺满整个窗口（从 y=0 开始），标题栏
     // 仍保持 0..32px 的位置，但只在顶部热区悬停时显示、盖在内容上方。
     let fullscreen = window.is_fullscreen().unwrap_or(false);
-    let (content_y, content_h) = if fullscreen {
-        (0, size.height)
-    } else {
-        (strip, size.height.saturating_sub(strip as u32))
-    };
+    let active = window
+        .app_handle()
+        .state::<AppState>()
+        .tabs
+        .lock()
+        .unwrap()
+        .active
+        .clone();
     for wv in window.webviews() {
-        let bounds = if wv.label() == TITLEBAR_WEBVIEW {
-            tauri::Rect {
+        let label = wv.label();
+        if label == TITLEBAR_WEBVIEW {
+            let bounds = tauri::Rect {
                 position: tauri::Position::Physical(tauri::PhysicalPosition::new(0, 0)),
                 size: tauri::Size::Physical(tauri::PhysicalSize::new(
                     size.width,
                     strip as u32,
                 )),
-            }
-        } else {
-            tauri::Rect {
-                position: tauri::Position::Physical(tauri::PhysicalPosition::new(0, content_y)),
-                size: tauri::Size::Physical(tauri::PhysicalSize::new(size.width, content_h)),
-            }
-        };
-        let _ = wv.set_bounds(bounds);
+            };
+            let _ = wv.set_bounds(bounds);
+        } else if label == active.as_str() {
+            let _ = wv.set_bounds(content_rect(size, scale, fullscreen));
+        }
+        // 隐藏标签保持原 bounds；切换时由 set_active_content_bounds 补。
     }
-    // 最大化 / 还原都会走 Resized：把新状态推给标签条（切换 □ / 还原按钮字形）
+    // 最大化 / 还原都会走 Resized：把新状态推给标签条（切换 □ / 还原按钮字形）。
+    // push_win_max 内部按 last_maximized 去重，状态没变不会 eval。
     push_win_max(window.app_handle());
 }
 
@@ -1812,6 +1886,7 @@ fn build_error_window<R: Runtime>(
         let state = app.state::<AppState>();
         *state.tabs.lock().unwrap() = TabState::with_main();
         state.open_tabs.lock().unwrap().clear();
+        state.last_maximized.store(0, Ordering::SeqCst);
     }
     let (lw, lh) = logical_inner_size(&window)?;
     let titlebar = WebviewBuilder::new(TITLEBAR_WEBVIEW, WebviewUrl::App("titlebar.html".into()));
@@ -1982,12 +2057,23 @@ pub fn handle_title<R: Runtime>(webview: &Webview<R>, title: &str, app: &AppHand
     if !changed {
         return;
     }
-    flog!("[fnos] 主窗口标题: {}", report::log_safe(title));
     if !registered {
         return;
     }
-    // T14d：活动标签的标题同时是**窗口标题**（任务栏显示用）。
+    // 只记录**当前激活标签**的标题（它就是窗口标题）：后台标签的标题照样进标签条，
+    // 但不必为每一次未读计数/播放进度变化写一行日志 + 刷一次盘。500ms 节流兜住高频变化。
     if active {
+        let now = now_unix_ms();
+        let state = app.state::<AppState>();
+        let last = state.last_title_log.load(Ordering::Relaxed);
+        if now.saturating_sub(last) >= TITLE_LOG_INTERVAL_MS
+            && state
+                .last_title_log
+                .compare_exchange(last, now, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+        {
+            flog!("[fnos] 主窗口标题: {}", report::log_safe(title));
+        }
         let _ = webview.window().set_title(title);
     }
     push_tabs(app);
@@ -3166,6 +3252,8 @@ pub fn save_and_install_state<R: Runtime>(
         open_tabs: Mutex::new(std::collections::HashMap::new()),
         init_script: Mutex::new(None),
         last_key_at: AtomicU64::new(0),
+        last_maximized: AtomicU8::new(0),
+        last_title_log: AtomicU64::new(0),
     });
 }
 
@@ -4313,6 +4401,50 @@ mod tests {
         );
     }
 
+    /// 应用标签不再拿桌面完整载荷；根页面与登录/授权页仍拿。
+    #[test]
+    fn app_tabs_get_the_core_script_not_the_desktop_payload() {
+        let desktop = tauri::Url::parse("https://nas.example.com/").unwrap();
+        let page = |u: &str| tauri::Url::parse(u).unwrap();
+        assert!(is_desktop_or_auth_page(
+            &desktop,
+            &page("https://nas.example.com/")
+        ));
+        assert!(!is_desktop_or_auth_page(
+            &desktop,
+            &page("https://nas.example.com/seek/?ver=0.0.1")
+        ));
+        assert!(!is_desktop_or_auth_page(
+            &desktop,
+            &page("https://nas.example.com/p")
+        ));
+        assert!(!is_desktop_or_auth_page(
+            &desktop,
+            &page("https://nas.example.com/music/")
+        ));
+        assert!(!is_desktop_or_auth_page(
+            &desktop,
+            &page("https://nas.example.com/app/Harness/dsh/")
+        ));
+        assert!(is_desktop_or_auth_page(
+            &desktop,
+            &page("https://nas.example.com/signin?client_id=x")
+        ));
+        assert!(is_desktop_or_auth_page(
+            &desktop,
+            &page("https://nas.example.com/seek/login")
+        ));
+        let nested = page("https://nas.example.com/fnos/");
+        assert!(is_desktop_or_auth_page(
+            &nested,
+            &page("https://nas.example.com/fnos/")
+        ));
+        assert!(!is_desktop_or_auth_page(
+            &nested,
+            &page("https://nas.example.com/fnos/app/x")
+        ));
+    }
+
     /// 控制标题是页面 → 宿主的传输，不是页面标题；弹窗镜像标题前必须能识别它们。
     #[test]
     fn control_titles_cover_every_page_to_host_prefix() {
@@ -4412,6 +4544,7 @@ mod tests {
         // 分档函数本身：同源 → 缓存过的完整脚本；第三方 → 只含 keys 的核心脚本
         let tier_at = src.find("fn init_script_for_tab").expect("分档函数必须存在");
         let tier = &src[tier_at..tier_at + 600];
+        assert!(tier.contains("is_desktop_or_auth_page"));
         assert!(tier.contains("same_origin(&desktop, url)"));
         assert!(tier.contains("init_script_cached(app, cfg)"));
         assert!(tier.contains("injector::build_core_script()"));
@@ -4533,7 +4666,11 @@ mod tests {
         let push_count = code.matches("push_win_max(").count();
         assert!(
             push_count >= 2,
-            "建窗后（push_tabs）与 resize 后（relayout）都必须推最大化状态"
+            "建窗后与 resize 后（relayout）都必须推最大化状态"
+        );
+        assert!(
+            code.contains("last_maximized") && code.contains("swap(next"),
+            "最大化状态必须去重，不能每次 resize 都 eval"
         );
         assert!(
             code.contains("is_maximized()"),

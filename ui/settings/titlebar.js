@@ -245,7 +245,25 @@
   }
 
   // 宿主推送口（Rust eval；单向、必须在脚本顶层就位——首条推送可能先于 boot 到达）。
-  window.__FNOS_TABS_SET__ = render;
+  /** 合并高频标签状态推送：可见时每帧最多渲染一次；隐藏（全屏悬浮栏）时同步渲染，
+   *  因为隐藏页面的 rAF 可能被节流/暂停，不能让标签条带着旧状态被唤出。 */
+  var pendingTabs = null;
+  var tabsScheduled = false;
+  function scheduleTabs(state) {
+    pendingTabs = state;
+    if (typeof W.requestAnimationFrame !== 'function' || (D && D.hidden)) {
+      render(state);
+      return;
+    }
+    if (tabsScheduled) return;
+    tabsScheduled = true;
+    W.requestAnimationFrame(function () {
+      tabsScheduled = false;
+      render(pendingTabs);
+    });
+  }
+
+  window.__FNOS_TABS_SET__ = scheduleTabs;
   window.__FNOS_WIN_MAX_SET__ = setMaxState;
   window.__FNOS_WIN_FULLSCREEN_SET__ = setFullscreenState;
 
