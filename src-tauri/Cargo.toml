@@ -1,6 +1,6 @@
 [package]
 name = "fnos-desktop"
-version = "0.3.15"
+version = "0.3.16"
 edition = "2021"
 build = "build.rs"
 
@@ -29,6 +29,10 @@ sha2 = "0.10"
 # 原生 MessageBoxW：检查结果要能从托盘动作直接反馈给用户（release 无控制台，
 # 主窗口页面也不是放这条消息的地方——那是 fnOS 的 WebUI）。
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
+# 全屏悬浮标题栏：拿 WebView2 子窗口的 HWND（controller.ParentWindow），再用
+# SetWindowPos 把它提到内容 Webview 之上——Tauri 的 child Webview 没有暴露 z-order。
+# 版本与 tauri 2.12 锁定的 webview2-com 一致，不会引入第二份 COM 绑定。
+webview2-com = "0.39"
 
 [profile.release]
 lto = true

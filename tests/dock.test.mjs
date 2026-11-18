@@ -222,6 +222,42 @@ test('样式层预留清除随开关装卸：接管时装、还原时卸（关�
   assert.equal(typeof w2.__FNOS_DOCK_STATE__, 'function', '没有 shell-CSS 钩子也要能正常接管');
 });
 
+// ---------- 全屏：与自动隐藏开关正交 ----------
+
+test('全屏：即使没开自动隐藏也强制隐藏 Dock、回收宽度；退出时完整还原', () => {
+  const doc = fakeDom();
+  const calls = [];
+  doc._win.__FNOS_SHELL_CSS__ = { setDockReclaim: (on) => calls.push(on) };
+  const w = load(doc, { dockAutoHide: false });
+  const dock = fakeEl({ w: 68, h: 800, left: 0, hasList: true });
+  doc._candidates = [dock];
+  w.__FNOS_DOCK_FULLSCREEN__(true);
+  assert.ok(dock._classes.has('fnos-shell-dock-fullscreen-hidden'), '全屏必须加隐藏类');
+  assert.ok(dock._classes.has('fnos-shell-dock-autohide'), '全屏临时接管必须有接管标记');
+  assert.ok(calls.includes(true), '全屏必须回收 Dock 让出的宽度');
+  assert.equal(w.__FNOS_DOCK_STATE__().fullscreen, true);
+  w.__FNOS_DOCK_FULLSCREEN__(false);
+  assert.ok(!dock._classes.has('fnos-shell-dock-fullscreen-hidden'), '退出全屏必须移除隐藏类');
+  assert.ok(!dock._classes.has('fnos-shell-dock-autohide'), '没开自动隐藏：退出后必须完全释放接管');
+  assert.equal(calls[calls.length - 1], false, '退出时卸下预留清除表');
+  assert.equal(w.__FNOS_DOCK_STATE__().fullscreen, false);
+});
+
+test('全屏与自动隐藏叠加：退出后交还 auto-hide，不拆它的接管', () => {
+  const doc = fakeDom();
+  doc._win.__FNOS_SHELL_CSS__ = { setDockReclaim: () => {} };
+  const w = load(doc, { dockAutoHide: true });
+  const dock = fakeEl({ w: 68, h: 800, left: 0, hasList: true });
+  doc._candidates = [dock];
+  settle(doc); // auto-hide 接管并落成「藏」
+  w.__FNOS_DOCK_FULLSCREEN__(true);
+  assert.ok(dock._classes.has('fnos-shell-dock-fullscreen-hidden'), '全屏必须加隐藏类');
+  w.__FNOS_DOCK_FULLSCREEN__(false);
+  assert.ok(!dock._classes.has('fnos-shell-dock-fullscreen-hidden'), '退出后移除隐藏类');
+  assert.ok(dock._classes.has('fnos-shell-dock-autohide'), '自动隐藏的接管必须保留');
+  assert.equal(w.__FNOS_DOCK_STATE__().fullscreen, false);
+});
+
 // ---------- 定位策略 ----------
 
 test('关闭自动隐藏会取消待触发的 locate（不得在关掉后又把 Dock 藏起来）', () => {
@@ -372,8 +408,8 @@ test('免刷新关闭：接管与内边距中和全部还原（含还原原本�
   assert.equal(dock.style.display, '', 'display 必须还原');
   assert.ok(doc._moDisconnected, '观察器必须断开');
   assert.deepEqual(w.__FNOS_DOCK_STATE__(), {
-    enabled: false, found: false, targets: 0, axis: 'x', edgeMin: true, shown: false,
-    reclaimed: [], lastMiss: '',
+    enabled: false, fullscreen: false, found: false, targets: 0, axis: 'x', edgeMin: true,
+    shown: false, reclaimed: [], lastMiss: '',
   }, '诊断口必须如实');
 });
 

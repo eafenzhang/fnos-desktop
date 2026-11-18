@@ -34,6 +34,7 @@ function fakeTitlebar() {
     body: el('body'),
     getElementById(id) { return this._els[id] || null; },
     createElement(tag) { return el(tag); },
+    createElementNS(_ns, tag) { return el(tag); },
     addEventListener() {},
   };
   doc.body.classList = {
@@ -142,24 +143,42 @@ test('窗口控制：系统图标字体的 ─ □ ×（46px 整高），点击�
   const w = loadTitlebar(doc);
   w.__FNOS_TITLEBAR__.renderControls();
   const controls = doc.getElementById('controls').children;
-  assert.deepEqual(controls.map((b) => b.dataset.action), ['minimize', 'maximize', 'close']);
-  assert.equal(controls[0].className, 'win-btn');
-  assert.equal(controls[1].className, 'win-btn maximize');
-  assert.equal(controls[2].className, 'win-btn close', '关闭钮必须带 close class（悬停红）');
-  // 系统标题栏同款字形：Segoe 图标字体的私用区码点（不是文本字符 ─□×）
-  assert.equal(controls[0].textContent.codePointAt(0), 0xe921, '最小化 = U+E921');
-  assert.equal(controls[1].textContent.codePointAt(0), 0xe922, '最大化 = U+E922');
-  assert.equal(controls[2].textContent.codePointAt(0), 0xe8bb, '关闭 = U+E8BB');
+  assert.deepEqual(controls.map((b) => b.dataset.action), ['fullscreen', 'minimize', 'maximize', 'close']);
+  assert.equal(controls[0].className, 'win-btn fullscreen');
+  assert.equal(controls[1].className, 'win-btn');
+  assert.equal(controls[2].className, 'win-btn maximize');
+  assert.equal(controls[3].className, 'win-btn close', '关闭钮必须带 close class（悬停红）');
+  // 最小化/最大化/关闭仍是 Segoe 字形；全屏按钮改用用户参考图的四角括号 SVG。
+  assert.equal(controls[1].textContent.codePointAt(0), 0xe921, '最小化 = U+E921');
+  assert.equal(controls[2].textContent.codePointAt(0), 0xe922, '最大化 = U+E922');
+  assert.equal(controls[3].textContent.codePointAt(0), 0xe8bb, '关闭 = U+E8BB');
+  assert.equal(controls[0].dataset.fsState, 'enter', '全屏按钮初始为进入态');
+  const enterSvg = controls[0].children.find((c) => c.tagName === 'SVG');
+  assert.ok(enterSvg, '全屏按钮必须是 inline SVG（四角括号参考图）');
+  assert.equal(enterSvg.children.length, 4, '四角括号 = 4 段 L 形路径');
   // 最大化 ↔ 还原字形切换（宿主 __FNOS_WIN_MAX_SET__ 推送状态）
   w.__FNOS_TITLEBAR__.setMaxState(true);
-  assert.equal(controls[1].textContent.codePointAt(0), 0xe923, '最大化状态下按钮 = U+E923（还原）');
-  assert.equal(controls[1].title, '还原');
+  assert.equal(controls[2].textContent.codePointAt(0), 0xe923, '最大化状态下按钮 = U+E923（还原）');
+  assert.equal(controls[2].title, '还原');
   w.__FNOS_WIN_MAX_SET__(false);
-  assert.equal(controls[1].textContent.codePointAt(0), 0xe922, '还原后回到 U+E922');
-  // 源码级：三条窗口命令
+  assert.equal(controls[2].textContent.codePointAt(0), 0xe922, '还原后回到 U+E922');
+  // 全屏 ↔ 退出全屏图标切换（宿主 __FNOS_WIN_FULLSCREEN_SET__ 推送状态）
+  w.__FNOS_WIN_FULLSCREEN_SET__(true);
+  assert.equal(controls[0].dataset.fsState, 'exit', '全屏状态切到退出图标');
+  assert.ok(controls[0].title.includes('退出全屏'));
+  assert.ok(controls[0].children.some((c) => c.tagName === 'SVG'), '退出态仍是四角括号 SVG');
+  assert.equal(controls[1].disabled, true, '全屏下最小化必须禁用（任务栏被藏起来）');
+  assert.equal(controls[2].disabled, true, '全屏下最大化必须禁用（会 toggle 退出全屏）');
+  w.__FNOS_TITLEBAR__.setFullscreenState(false);
+  assert.equal(controls[0].dataset.fsState, 'enter', '退出后回到进入图标');
+  assert.equal(controls[1].disabled, false, '退出全屏后恢复最小化');
+  assert.equal(controls[2].disabled, false, '退出全屏后恢复最大化');
+  // 源码级：三条窗口命令 + 全屏命令
   for (const cmd of ['plugin:window|minimize', 'plugin:window|toggle_maximize', 'plugin:window|close']) {
     assert.ok(TB_JS.includes(`invoke('${cmd}')`), `缺少窗口命令：${cmd}`);
   }
+  assert.ok(TB_JS.includes("invoke('set_fullscreen', { value: !fullscreenOn })"),
+    '全屏按钮必须调用宿主 set_fullscreen 命令');
 });
 
 test('点击分发：标签切换 / 关闭 / 新建都带上正确的命令与参数', () => {
@@ -190,6 +209,7 @@ test('纪律：不碰页面内容、高度 32 跨语言一致、授权面精确'
   assert.ok(TB_CSS.includes('"Segoe Fluent Icons"') && TB_CSS.includes('"Segoe MDL2 Assets"'),
     '窗口按钮必须用系统图标字体（与 Windows 标题栏同款字形）');
   assert.ok(TB_CSS.includes('width: 46px'), '按钮宽度必须与系统标题栏一致（46px）');
+  assert.ok(TB_CSS.includes('.controls .win-btn.fullscreen svg'), '全屏按钮必须有 SVG 图标样式');
   // 标签固定 144px（用户定值）：关闭钮预留位、标题 flex 截断省略号
   assert.ok(TB_CSS.includes('width: 144px; min-width: 144px; max-width: 144px;'),
     '标签必须固定 144px 宽');
@@ -203,7 +223,7 @@ test('纪律：不碰页面内容、高度 32 跨语言一致、授权面精确'
     '鼠标悬浮标签时关闭钮必须显示');
   assert.ok(!/\.tab \.tab-close \{[^}]*display: none/s.test(TB_CSS),
     '不得用 display:none（会丢占位，悬浮时标题跳动）');
-  // 授权面：三个标签页命令 + 窗口控制 + 拖拽，别无其它
+  // 授权面：三个标签页命令 + 窗口控制（含全屏）+ 拖拽，别无其它
   const cap = JSON.parse(readFileSync(new URL('../src-tauri/capabilities/titlebar.json', import.meta.url), 'utf8'));
   assert.deepEqual(cap.webviews, ['titlebar']);
   assert.deepEqual(cap.permissions, [
@@ -214,6 +234,7 @@ test('纪律：不碰页面内容、高度 32 跨语言一致、授权面精确'
     'allow-tab-new',
     'allow-tab-switch',
     'allow-tab-close',
+    'allow-set-fullscreen',
   ]);
   assert.ok(!cap.permissions.some((p) => p.includes('get-config') || p.includes('open-url')),
     '标签页栏不得得到任何应用命令授权');

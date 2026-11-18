@@ -70,6 +70,8 @@
 
   var HOST_CLASS = 'fnos-shell-dock-autohide';   // 常驻：宣告「本壳在管这个元素」
   var HIDDEN_CLASS = 'fnos-shell-dock-hidden';   // 状态：滑出屏幕（随后 display:none 离场）
+  var FULLSCREEN_CLASS = 'fnos-shell-dock-fullscreen-hidden'; // 全屏：强制离场（与开关无关）
+  var fullscreen = false; // 宿主 set_fullscreen 推送的运行时状态
   var STYLE_ID = 'fnos-shell-dock-style';
   var EDGE_PX = 6;           // 屏幕边缘热区宽度（唤出条件；比 Dock 厚度窄得多）
   var SLACK_PX = 12;         // 「还在 Dock 脚印内」判定的余量（指针抖动 + 边框）
@@ -413,7 +415,7 @@
   /** 释放一个曾接管的元素：class、内联变量、display 全部还原（不留下孤儿状态）。 */
   function releaseOne(el) {
     if (!el) return;
-    el.classList.remove(HOST_CLASS, HIDDEN_CLASS);
+    el.classList.remove(HOST_CLASS, HIDDEN_CLASS, FULLSCREEN_CLASS);
     try {
       el.style.removeProperty('--fnos-dock-hide-tf');
       el.style.display = '';
@@ -440,6 +442,78 @@
     restoreReclaimed();
   }
 
+  // ---------- 全屏：强制隐藏 fnOS 桌面任务栏 ----------
+
+  var fullscreenRetries = 0;
+  var FULLSCREEN_RETRIES = 6;
+
+  /** 全屏时无条件接管 Dock 并隐藏（不看 dockAutoHide 开关）。 */
+  function applyFullscreenDock() {
+    if (!dock) {
+      dock = findDock();
+      if (!dock) {
+        // SPA 可能还没渲染出 Dock：有限次重试，不阻塞全屏本身。
+        if (fullscreen && fullscreenRetries > 0) {
+          fullscreenRetries -= 1;
+          W.setTimeout(function () {
+            if (fullscreen && !dock) applyFullscreenDock();
+          }, 200);
+        }
+        return;
+      }
+      targets = [dock];
+      dock.classList.add(HOST_CLASS);
+      syncTransform();
+      // 自动隐藏关着时没有 observer：全屏期间自己补一个，Dock 被 SPA 重建后还能重新隐藏。
+      if (!observer && typeof W.MutationObserver === 'function') {
+        observer = new W.MutationObserver(scheduleLocate);
+        observer.observe(D, { childList: true, subtree: true });
+      }
+    }
+    dock.classList.add(FULLSCREEN_CLASS);
+    applyDockReclaim(true);
+    // 全屏下自动隐藏的显隐意图不再有意义：取消所有待触发的藏/显定时器。
+    if (displayTimer) { W.clearTimeout(displayTimer); displayTimer = null; }
+    if (idleTimer) { W.clearTimeout(idleTimer); idleTimer = null; }
+  }
+
+  /** 退出全屏：交还给自动隐藏；没开自动隐藏则完整还原。 */
+  function restoreFullscreenDock() {
+    fullscreenRetries = 0;
+    if (dock) {
+      try { dock.classList.remove(FULLSCREEN_CLASS); } catch (e) { /* 元素没了就算了 */ }
+    }
+    if (enabled) {
+      // 自动隐藏仍在：保留接管与空间回收，按它自己的意图落态（默认藏）。
+      applyDockReclaim(true);
+      if (dock) {
+        shown = false;
+        renderState();
+      }
+      return;
+    }
+    // 全屏期间是临时接管：observer（若为全屏补的）与 class/预留一起还原。
+    if (observer) { observer.disconnect(); observer = null; }
+    releaseAll();
+    applyDockReclaim(false);
+  }
+
+  /**
+   * 宿主全屏开关（`commands::apply_fullscreen_side_effects` 调）。
+   * 与自动隐藏开关正交：开不开 dockAutoHide，全屏都必须把任务栏藏掉。
+   */
+  W.__FNOS_DOCK_FULLSCREEN__ = function (on) {
+    on = !!on;
+    if (on === fullscreen) return;
+    fullscreen = on;
+    if (on) {
+      fullscreenRetries = FULLSCREEN_RETRIES;
+      applyFullscreenDock();
+    } else {
+      restoreFullscreenDock();
+    }
+  };
+
   /**
    * 派发一次 resize（**只在 teardown 时**：用户关掉自动隐藏、左侧预留还原、工作区真的
    * 变了，让窗口管理器重排一次）。
@@ -456,6 +530,12 @@
   /** 把 `shown` 的意图落到接管元素上（幂等；接管后无条件调一次以防换元素后状态漂移）。 */
   function renderState() {
     if (!dock) return;
+    // 全屏优先：自动隐藏的显隐状态不能把任务栏放回来。
+    if (fullscreen) {
+      dock.classList.add(FULLSCREEN_CLASS);
+      applyDockReclaim(true);
+      return;
+    }
     if (displayTimer) { W.clearTimeout(displayTimer); displayTimer = null; }
     if (shown) {
       for (var i = 0; i < targets.length; i++) {
@@ -490,7 +570,8 @@
     locateScheduled = false;
     // 关掉自动隐藏后，之前排队的 locate 不得再跑：否则它会重新接管 Dock 并按
     // shown=false 落态，把 Dock 重新藏起来（指针处理器已停用，只能刷新恢复）。
-    if (!enabled) return;
+    // 例外：全屏期间必须继续接管——否则 SPA 重建 Dock 时它会重新冒出来。
+    if (!enabled && !fullscreen) return;
     var found = findDock();
     if (found && found !== dock) {
       // fnOS 会重建 Dock 元素（悬浮等时机）：这里只释放旧元素的接管标记，
@@ -504,13 +585,19 @@
       // 先定贴边方向：空间回收（只处理贴左缘）与滑出方向都依赖它，而它只能从**当前可见**
       // 的 Dock 几何量出来——晚于这一步量就会拿到默认值（修复轮 7 的实现次序）。
       syncTransform();
-      // 接管即按当前意图落态（默认 = 藏）：不等第一次 pointermove，否则用户在设置里
-      // 打开开关、切回主窗口，鼠标不动就永远看不到效果（修复轮 2）。
-      // 指针恰好在 Dock 上时先不藏（:hover 读的是当前真实悬停链）。
-      var hovered = false;
-      try { hovered = dock.matches(':hover'); } catch (e) { /* 老内核不支持就照藏 */ }
-      if (hovered) shown = true;
-      renderState();
+      if (fullscreen) {
+        // 全屏接管：不看 hover / 自动隐藏意图，落到「永远隐藏」。
+        dock.classList.add(FULLSCREEN_CLASS);
+        applyDockReclaim(true);
+      } else {
+        // 接管即按当前意图落态（默认 = 藏）：不等第一次 pointermove，否则用户在设置里
+        // 打开开关、切回主窗口，鼠标不动就永远看不到效果（修复轮 2）。
+        // 指针恰好在 Dock 上时先不藏（:hover 读的是当前真实悬停链）。
+        var hovered = false;
+        try { hovered = dock.matches(':hover'); } catch (e) { /* 老内核不支持就照藏 */ }
+        if (hovered) shown = true;
+        renderState();
+      }
     }
     if (!dock) return;
     // 空间回收：机制①（内边距）需要 JS 跑（容器稳定、幂等、带节流）；
@@ -530,10 +617,11 @@
 
   /** 无操作兜底：IDLE_MS 内没有任何指针事件就藏（iframe 吞事件的场景只有它能救）。 */
   function armIdle() {
-    if (idleTimer) W.clearTimeout(idleTimer);
+    if (fullscreen) return;
+    if (idleTimer) { W.clearTimeout(idleTimer); idleTimer = null; }
     idleTimer = W.setTimeout(function () {
       idleTimer = null;
-      if (enabled && dock) setShown(false);
+      if (enabled && dock && !fullscreen) setShown(false);
     }, IDLE_MS);
   }
 
@@ -543,7 +631,7 @@
    * 对贴右/下缘的形态会恒真或恒假。热区（near）只认屏幕边缘那几像素。
    */
   function onPointerMove(e) {
-    if (!enabled || !dock) return;
+    if (!enabled || !dock || fullscreen) return;
     armIdle();
     var vw = W.innerWidth || 0;
     var vh = W.innerHeight || 0;
@@ -558,7 +646,7 @@
 
   /** 指针离开窗口 / 窗口失焦：auto-hide 的通用语义，直接藏。 */
   function onHideSignal() {
-    if (enabled) setShown(false);
+    if (enabled && !fullscreen) setShown(false);
   }
 
   function install() {
@@ -577,7 +665,8 @@
   }
 
   function teardown() {
-    if (observer) { observer.disconnect(); observer = null; }
+    // 全屏期间保留 observer：`locate` 还要在 SPA 重建 Dock 时重新把全屏 class 落上去。
+    if (observer && !fullscreen) { observer.disconnect(); observer = null; }
     if (locateTimer) { W.clearTimeout(locateTimer); locateTimer = null; }
     locateScheduled = false;
     if (idleTimer) { W.clearTimeout(idleTimer); idleTimer = null; }
@@ -585,9 +674,11 @@
     D.removeEventListener('pointermove', onPointerMove);
     D.removeEventListener('pointerleave', onHideSignal);
     W.removeEventListener('blur', onHideSignal);
-    releaseAll();
-    notifyResize(); // 空间还原了，也让窗口管理器重排一次
-    applyDockReclaim(false); // 样式层的预留清除表要真的卸下来（见文件头「开关链路」）
+    if (!fullscreen) {
+      releaseAll();
+      notifyResize(); // 空间还原了，也让窗口管理器重排一次
+      applyDockReclaim(false); // 样式层的预留清除表要真的卸下来（见文件头「开关链路」）
+    }
   }
 
   /** set_config 的免刷新入口（shim 的 `__FNOS_APPLY_CONFIG__` 转调；幂等）。 */
@@ -611,8 +702,8 @@
       if (props.indexOf(reclaimed[i].prop) < 0) props.push(reclaimed[i].prop);
     }
     return {
-      enabled: enabled, found: !!dock, targets: targets.length, axis: axis, edgeMin: edgeMin,
-      shown: shown, reclaimed: props, lastMiss: lastMiss,
+      enabled: enabled, fullscreen: fullscreen, found: !!dock, targets: targets.length,
+      axis: axis, edgeMin: edgeMin, shown: shown, reclaimed: props, lastMiss: lastMiss,
     };
   };
 

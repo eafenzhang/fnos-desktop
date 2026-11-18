@@ -60,9 +60,9 @@ function press(env, ev) {
   return ev;
 }
 
-test('源码级：只认四个动作、只认物理 Ctrl、不碰 DOM 内容、不开 IPC', () => {
+test('源码级：只认白名单动作（含 Esc 退出全屏）、只认物理 Ctrl、不碰 DOM、不开 IPC', () => {
   assert.ok(KEYS.includes("var KEY_TITLE_PREFIX = 'FNOSKEY:';"), '前缀必须写死成 FNOSKEY:');
-  for (const act of ["'new'", "'close'", "'next'", "'prev'"]) {
+  for (const act of ["'new'", "'close'", "'next'", "'prev'", "'exit-fullscreen'"]) {
     assert.ok(KEYS.includes(act), `白名单动作缺失：${act}`);
   }
   assert.ok(KEYS.includes('if (!e.ctrlKey || e.altKey || e.metaKey) return null;'),
@@ -102,7 +102,6 @@ test('非白名单一律不碰：不 preventDefault、不写标题', () => {
     { key: 't', metaKey: true },               // Win+T
     { key: 'a' },                              // Ctrl+A 全选：留给页面
     { key: 'w', shiftKey: true },              // Ctrl+Shift+W：不是我们要的
-    { key: 'Escape' },
     { key: 'F5' },
     { key: 't', repeat: true },                // 长按
   ];
@@ -113,6 +112,17 @@ test('非白名单一律不碰：不 preventDefault、不写标题', () => {
     assert.equal(env.doc.title, 'fnOS 桌面', `不得写控制标题：${JSON.stringify(over)}`);
     assert.equal(ev.prevented, false, `不得吞掉非白名单按键：${JSON.stringify(over)}`);
   }
+});
+
+test('Esc → exit-fullscreen：只上报给宿主，不吞页面自己的 Esc', () => {
+  const env = fakeEnv();
+  load(env);
+  const ev = press(env, key({ key: 'Escape', ctrlKey: false }));
+  assert.equal(env.doc.title, 'FNOSKEY:exit-fullscreen', 'Esc 必须经标题通道上报');
+  assert.equal(ev.prevented, false, '页面自己的 Esc（关弹窗/取消）必须保留');
+  assert.equal(ev.stopped, false, '不得阻止冒泡');
+  env.timers[env.timers.length - 1].fn();
+  assert.equal(env.doc.title, 'fnOS 桌面', '控制标题必须还原');
 });
 
 test('编辑区（input / textarea / contenteditable）：会关掉东西的两个不抢，切标签照常', () => {

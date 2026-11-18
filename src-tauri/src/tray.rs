@@ -20,7 +20,7 @@ use crate::{config::Config, MAIN_WINDOW};
 use tauri::{
     image::Image,
     menu::{Menu, MenuItem, PredefinedMenuItem},
-    tray::TrayIconBuilder,
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     AppHandle, Manager, Runtime,
 };
 
@@ -67,9 +67,22 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
             }
             "quit" => {
                 crate::commands::save_window_geom(app);
+                crate::commands::restore_taskbar(); // 全屏中退出时不能让任务栏一直消失
                 app.exit(0);
             }
             _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            // 用户要求：单击托盘图标 = 显示主窗口。Windows 的单击在 WM_LBUTTONUP
+            // 触发（MouseButtonState::Up = 释放）；不抢右键菜单。
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                show_main(tray.app_handle());
+            }
         })
         .build(app)?;
     Ok(())
@@ -141,5 +154,25 @@ mod tests {
             code.contains("&show, &reload, &settings, &check_update, &sep, &quit"),
             "检查更新必须挂进托盘菜单（位于系统设置与分隔线之间）"
         );
+    }
+
+    /// 用户要求：单击托盘图标显示主窗口（左键释放；不是右键菜单）。
+    #[test]
+    fn tray_left_click_shows_main_window() {
+        let src = include_str!("tray.rs");
+        let code_end = src.find("#[cfg(test)]").expect("测试模块存在");
+        let code = &src[..code_end];
+        assert!(code.contains("on_tray_icon_event"), "必须挂托盘图标事件");
+        assert!(code.contains("TrayIconEvent::Click"), "必须识别单击事件");
+        assert!(
+            code.contains("button: MouseButton::Left")
+                && code.contains("button_state: MouseButtonState::Up"),
+            "只认左键释放（WM_LBUTTONUP），右键留给菜单"
+        );
+        assert!(
+            code.contains("show_main(tray.app_handle())"),
+            "单击必须显示/前置主窗口"
+        );
+        assert!(code.contains("show_menu_on_left_click(false)"), "右键菜单语义不变");
     }
 }

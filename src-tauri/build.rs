@@ -51,6 +51,8 @@ fn main() {
             "tab_new",
             "tab_switch",
             "tab_close",
+            // 全屏按钮 / Esc 退出全屏；同样只授 titlebar。
+            "set_fullscreen",
         ]),
     ))
     .expect("failed to run tauri-build");

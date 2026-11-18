@@ -23,7 +23,7 @@ use tauri::Manager;
 pub const MAIN_WINDOW: &str = "main";
 
 fn main() {
-    tauri::Builder::default()
+    let result = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             if let Some(w) = app.get_window(MAIN_WINDOW) {
                 let _ = w.show();
@@ -69,14 +69,26 @@ fn main() {
                     // false 时不拦这次关闭 → 主窗口真的关闭；它是最后一个窗口时
                     // tauri 发出 `ExitRequested` 并结束进程。
                     if commands::close_to_tray(app) {
+                        // 收进托盘前退出全屏：否则任务栏被藏起来、窗口又不可见，用户只能
+                        // 靠托盘「显示窗口」找回一个仍然全屏的窗口。
+                        commands::leave_fullscreen(app);
                         api.prevent_close();
                         let _ = window.hide();
                     }
                 }
                 // gap (a)：tauri 的 label 注册表在 `Destroyed` 才释放，新窗口必须在这里建
-                tauri::WindowEvent::Destroyed => commands::on_main_destroyed(app),
+                tauri::WindowEvent::Destroyed => {
+                    commands::stop_fullscreen_watcher();
+                    commands::restore_taskbar();
+                    commands::on_main_destroyed(app)
+                }
                 // T14d：子 Webview 不会随窗口自动重排——最大化 / 还原 / 拖边缘都要重摆。
-                tauri::WindowEvent::Resized(size) => commands::relayout_main_window(window, *size),
+                // 全屏状态被外部改回普通态（toggle_maximize / Win+Up）时也要把标题栏、
+                // Dock、Windows 任务栏拉回来。
+                tauri::WindowEvent::Resized(size) => {
+                    commands::reconcile_fullscreen(window);
+                    commands::relayout_main_window(window, *size)
+                }
                 // 跨不同缩放比的显示器拖动（100% ⇄ 150%）：tao 发的是 ScaleFactorChanged，
                 // **不保证**再补一条 Resized。子 Webview 的 bounds 是按**物理**像素算的，
                 // 只处理 Resized 会让 32px 标题栏在换屏后残留旧缩放的条高（表现为标题栏
@@ -119,7 +131,11 @@ fn main() {
             commands::tab_new,
             commands::tab_switch,
             commands::tab_close,
+            // 全屏按钮（titlebar）与 Esc 退出全屏共用；只授 titlebar。
+            commands::set_fullscreen,
         ])
-        .run(tauri::generate_context!())
-        .expect("fnOS 启动失败");
+        .run(tauri::generate_context!());
+    // 进程正常结束（托盘退出 / 最后一个窗口关闭）时兜底还原任务栏；幂等，没藏过就什么都不做。
+    commands::restore_taskbar();
+    result.expect("fnOS 启动失败");
 }

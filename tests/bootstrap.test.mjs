@@ -131,6 +131,14 @@ test('本壳样式覆盖：绝对定位的整屏覆盖层恢复不透明（应�
     '必须有「壁纸层上移 1px 并加高 1px」的规则');
   assert.ok(!css.includes('clip-path:inset(1px 0 0 0)'),
     '不得再用 clip-path 顶裁（会把页面底色露成一条线）');
+  // 上游 mod 的 figma squircle 在应用中心打开缩放动画期间按 getBoundingClientRect()
+  // 量到 28×17，而开关真实布局是 40×24；ResizeObserver 只看布局尺寸，动画结束不重算，
+  // 于是白色滑块溢出被裁小的轨道。必须撤掉这层裁剪。
+  assert.ok(css.indexOf('.semi-switch[data-squircle-id]{clip-path:none !important;}') >= 0,
+    '必须撤掉上游对 .semi-switch 的 figma squircle 裁剪（动画期量错尺寸）');
+  // 全屏：dock.js 给桌面任务栏加类，样式层负责让它真的离场（与自动隐藏开关无关）。
+  assert.ok(css.indexOf('.fnos-shell-dock-fullscreen-hidden{display:none !important;}') >= 0,
+    '必须有全屏隐藏 Dock 的规则');
 });
 
 // Dock 预留清除（T14c 修复轮 14～15）：与上面那张表**分开**，按自动隐藏开关装卸。

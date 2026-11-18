@@ -27,6 +27,7 @@
  *   Ctrl+W            关闭当前标签页（fnOS 主页标签不可关，宿主会拒绝）
  *   Ctrl+Tab          下一个标签页
  *   Ctrl+Shift+Tab    上一个标签页
+ *   Esc               退出全屏（只在全屏时生效；不 preventDefault，页面自己的 Esc 保留）
  *
  * 带 Alt / Meta 的一律不碰（那属于系统级快捷键）；只认**物理** Ctrl。
  */
@@ -90,8 +91,13 @@
    */
   function actionFor(e) {
     if (!e || e.repeat) return null;            // 长按不连发（浏览器的切标签也不是连发）
-    if (!e.ctrlKey || e.altKey || e.metaKey) return null; // 只认物理 Ctrl；Alt/Meta 留给系统
     var key = String(e.key || '');
+    // Esc：只在全屏时退出（宿主判状态，非全屏直接忽略）。它不参与编辑区例外——
+    // 无论焦点在输入框还是页面，Esc 都该能退出全屏；但也**不吞**页面自己的 Esc。
+    if (key === 'Escape' && !e.ctrlKey && !e.altKey && !e.metaKey && !e.shiftKey) {
+      return 'exit-fullscreen';
+    }
+    if (!e.ctrlKey || e.altKey || e.metaKey) return null; // 只认物理 Ctrl；Alt/Meta 留给系统
     var lower = key.toLowerCase();
     if (key === 'Tab') {
       return e.shiftKey ? 'prev' : 'next';      // 导航：编辑区里也放行
@@ -105,6 +111,11 @@
   D.addEventListener('keydown', function (e) {
     var action = actionFor(e);
     if (!action) return;
+    // Esc 只上报、不消费：页面自己的「关闭弹窗 / 取消」语义必须保留。
+    if (action === 'exit-fullscreen') {
+      emit(action);
+      return;
+    }
     // 只有真的要消费时才 preventDefault：绝不能把页面的其它组合键吃掉。
     try { e.preventDefault(); } catch (err) { /* 不可取消就照发（宿主侧仍会执行） */ }
     try { e.stopPropagation(); } catch (err) { /* 忽略 */ }

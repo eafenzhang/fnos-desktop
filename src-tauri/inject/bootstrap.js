@@ -133,7 +133,17 @@
     // （用户实测）。改成把壁纸层整体**上移 1px 并加高 1px**：顶行的蓝线移到视口外，
     // 底部仍与容器对齐，不露任何底色；图片壁纸与纯色壁纸都适用（两种都实测过）。
     '#root .absolute.inset-0.z-0.object-contain' +
-    '{top:-1px !important;bottom:auto !important;height:calc(100% + 1px) !important;}';
+    '{top:-1px !important;bottom:auto !important;height:calc(100% + 1px) !important;}' +
+    // 上游 mod 的 figma squircle 只配了 `.semi-switch`（mod.js 第 1 行，cornerRadius 999）。
+    // 它在应用中心/设置弹窗的**打开缩放动画**期间用 getBoundingClientRect() 量尺寸，
+    // 拿到的是缩放后的 28×17；开关的真实布局是 40×24。ResizeObserver 观察的是**布局**
+    // 尺寸，动画结束不会再回调，于是 clip-path 把 40×24 的开关一直裁成 28×17——白色滑块
+    // 溢出轨道（用户实测截图）。开关本身就是 border-radius:12px 的胶囊，原生圆角就是
+    // 正确形状；直接撤掉这层裁剪，不改上游资源，也不跟它的尺寸缓存打架。
+    '.semi-switch[data-squircle-id]{clip-path:none !important;}' +
+    // 全屏：inject/dock.js 给桌面任务栏（Dock）加这个类。与 dockAutoHide 开关无关——
+    // 全屏要的是整块桌面；退出时 dock.js 移除它并把接管交还给自动隐藏（或其原状态）。
+    '.fnos-shell-dock-fullscreen-hidden{display:none !important;}';
 
   /**
    * Dock 预留清除（T14c 修复轮 14～15）——**单独一张表，按自动隐藏开关装卸**。

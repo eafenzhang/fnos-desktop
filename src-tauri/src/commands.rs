@@ -1460,6 +1460,280 @@ pub async fn tab_close<R: Runtime>(app: AppHandle<R>, label: String) -> Result<(
     Ok(())
 }
 
+/// 全屏开关（titlebar 的全屏按钮专用；ESC 走 [`exit_fullscreen_if_needed`]）。
+///
+/// 副作用不止窗口本身：
+/// - 主页面里的 fnOS 桌面任务栏（Dock）由 `inject/dock.js` 的
+///   `__FNOS_DOCK_FULLSCREEN__` 强制隐藏，并回收它让出的那条宽度；
+/// - 标题栏按钮字形经 `__FNOS_WIN_FULLSCREEN_SET__` 推送，避免「点完不知道状态」。
+#[tauri::command]
+pub fn set_fullscreen<R: Runtime>(app: AppHandle<R>, value: bool) -> Result<(), String> {
+    let window = app
+        .get_window(MAIN_WINDOW)
+        .ok_or_else(|| "主窗口未打开".to_string())?;
+    // 不按「与窗口当前状态相同」提前返回：enter/exit 同时负责标题栏/Dock/任务栏的
+    // 副作用，重复调用必须幂等且能把「窗口被外部改回普通态」的残留状态拉回来。
+    let result = if value {
+        enter_fullscreen(&app, &window)
+    } else {
+        exit_fullscreen(&app, &window)
+    };
+    result.map_err(|e| format!("切换全屏失败：{e}"))
+}
+
+/// Windows 桌面任务栏是否**由本壳**藏起来（只还原自己藏过的，不碰用户/其它程序隐藏的状态）。
+#[cfg(windows)]
+static TASKBAR_HIDDEN_BY_SHELL: AtomicBool = AtomicBool::new(false);
+
+/// 显示/隐藏 Windows 桌面任务栏（`Shell_TrayWnd`）。
+///
+/// 注意：这是**系统级**副作用。只在 `IsWindowVisible` 为真时由本壳隐藏，并在退出全屏、
+/// 关窗到托盘、窗口销毁、托盘退出时还原；进程被强杀时无法还原（Windows 任务栏可通过
+/// 重启 Explorer 恢复）。不处理多显示器的 `Shell_SecondaryTrayWnd`——主窗口当前在主屏。
+#[cfg(windows)]
+fn set_windows_taskbar_visible(visible: bool) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        FindWindowW, IsWindowVisible, ShowWindow, SW_HIDE, SW_SHOW,
+    };
+    let class: Vec<u16> = "Shell_TrayWnd\0".encode_utf16().collect();
+    let hwnd = unsafe { FindWindowW(class.as_ptr(), std::ptr::null()) };
+    if hwnd.is_null() {
+        return;
+    }
+    if visible {
+        if TASKBAR_HIDDEN_BY_SHELL.swap(false, Ordering::SeqCst) {
+            unsafe {
+                ShowWindow(hwnd, SW_SHOW);
+            }
+        }
+    } else if unsafe { IsWindowVisible(hwnd) } != 0 {
+        TASKBAR_HIDDEN_BY_SHELL.store(true, Ordering::SeqCst);
+        unsafe {
+            ShowWindow(hwnd, SW_HIDE);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn set_windows_taskbar_visible(_visible: bool) {}
+
+/// 兜底还原任务栏（窗口销毁 / 托盘退出 / 主进程正常结束时调用；幂等）。
+pub fn restore_taskbar() {
+    set_windows_taskbar_visible(true);
+}
+
+/// 全屏顶边热区（逻辑像素）：鼠标进入窗口顶部这么多像素时悬浮出标题栏。
+const FULLSCREEN_TITLEBAR_HOT_ZONE: f64 = 4.0;
+/// 标题栏显示后，鼠标下移超过「标题栏高 + 这么多像素」才收起（防边缘抖动）。
+const FULLSCREEN_TITLEBAR_HIDE_SLACK: f64 = 4.0;
+
+/// 全屏悬浮标题栏 watcher 的代次。每次进入/退出全屏自增；旧线程在一个轮询周期内自行退出。
+static FULLSCREEN_WATCH_GEN: AtomicU64 = AtomicU64::new(0);
+/// 全屏时标题栏当前是否悬浮显示。
+static FULLSCREEN_TITLEBAR_SHOWN: AtomicBool = AtomicBool::new(false);
+/// 本壳认为当前是否处于全屏（用于检测窗口被外部改回普通态时拉回标题栏/任务栏状态）。
+static FULLSCREEN_STATE: AtomicBool = AtomicBool::new(false);
+
+fn stop_fullscreen_watch() {
+    FULLSCREEN_WATCH_GEN.fetch_add(1, Ordering::SeqCst);
+}
+
+/// 停掉全屏悬浮标题栏 watcher（窗口销毁 / 退出全屏）。
+pub fn stop_fullscreen_watcher() {
+    stop_fullscreen_watch();
+}
+
+/// 鼠标位置（物理屏幕坐标）；无桌面会话 / 非 Windows 时返回 None。
+#[cfg(windows)]
+fn cursor_screen_pos() -> Option<(i32, i32)> {
+    use windows_sys::Win32::Foundation::POINT;
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos;
+    let mut point = POINT { x: 0, y: 0 };
+    (unsafe { GetCursorPos(&mut point) } != 0).then_some((point.x, point.y))
+}
+
+#[cfg(not(windows))]
+fn cursor_screen_pos() -> Option<(i32, i32)> {
+    None
+}
+
+/// 把标题栏子 Webview 提到内容 Webview 之上（Tauri 的 child Webview 没有 z-order API）。
+#[cfg(windows)]
+fn bring_webview_to_front<R: Runtime>(webview: &tauri::Webview<R>) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        SetWindowPos, HWND_TOP, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    };
+    let _ = webview.with_webview(|platform| {
+        let mut hwnd = Default::default();
+        if unsafe { platform.controller().ParentWindow(&mut hwnd) }.is_ok() {
+            unsafe {
+                SetWindowPos(
+                    hwnd.0,
+                    HWND_TOP,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                );
+            }
+        }
+    });
+}
+
+#[cfg(not(windows))]
+fn bring_webview_to_front<R: Runtime>(_webview: &tauri::Webview<R>) {}
+
+/// 全屏时显示/隐藏悬浮标题栏（位置/尺寸由 [`relayout_main_window`] 维护）。
+fn set_fullscreen_titlebar_visible<R: Runtime>(app: &AppHandle<R>, visible: bool) {
+    let Some(window) = app.get_window(MAIN_WINDOW) else {
+        return;
+    };
+    if !window.is_fullscreen().unwrap_or(false) {
+        return;
+    }
+    let Some(titlebar) = app.get_webview(TITLEBAR_WEBVIEW) else {
+        return;
+    };
+    if visible {
+        let _ = titlebar.show();
+        bring_webview_to_front(&titlebar);
+        FULLSCREEN_TITLEBAR_SHOWN.store(true, Ordering::SeqCst);
+    } else {
+        let _ = titlebar.hide();
+        FULLSCREEN_TITLEBAR_SHOWN.store(false, Ordering::SeqCst);
+    }
+}
+
+/// 全屏顶边悬停 watcher：60ms 轮询鼠标位置。
+/// 进入顶部热区 → 悬浮标题栏；鼠标离开标题栏区域 → 收起。
+fn start_fullscreen_titlebar_watcher<R: Runtime>(app: AppHandle<R>) {
+    let generation = FULLSCREEN_WATCH_GEN.fetch_add(1, Ordering::SeqCst) + 1;
+    std::thread::spawn(move || {
+        while FULLSCREEN_WATCH_GEN.load(Ordering::SeqCst) == generation {
+            let Some(window) = app.get_window(MAIN_WINDOW) else {
+                break;
+            };
+            if !window.is_fullscreen().unwrap_or(false) {
+                break;
+            }
+            let (Ok(pos), Ok(size)) = (window.outer_position(), window.outer_size()) else {
+                break;
+            };
+            let scale = window.scale_factor().unwrap_or(1.0);
+            let strip = (TAB_STRIP_H * scale) as i32;
+            let hot = (FULLSCREEN_TITLEBAR_HOT_ZONE * scale).round() as i32;
+            let hide_after = strip + (FULLSCREEN_TITLEBAR_HIDE_SLACK * scale).round() as i32;
+            let Some((cx, cy)) = cursor_screen_pos() else {
+                break;
+            };
+            let in_window = cx >= pos.x
+                && cx < pos.x + size.width as i32
+                && cy >= pos.y
+                && cy < pos.y + size.height as i32;
+            let in_hot = in_window && cy <= pos.y + hot;
+            let in_titlebar = in_window && cy <= pos.y + hide_after;
+            let shown = FULLSCREEN_TITLEBAR_SHOWN.load(Ordering::SeqCst);
+            if !shown && in_hot {
+                let app_for_main = app.clone();
+                let _ = app.run_on_main_thread(move || {
+                    set_fullscreen_titlebar_visible(&app_for_main, true);
+                });
+            } else if shown && !in_titlebar {
+                let app_for_main = app.clone();
+                let _ = app.run_on_main_thread(move || {
+                    set_fullscreen_titlebar_visible(&app_for_main, false);
+                });
+            }
+            std::thread::sleep(std::time::Duration::from_millis(60));
+        }
+    });
+}
+
+/// 进入全屏：全屏窗口 + 内容铺满 + 标题栏先隐藏 + 启动顶部悬停 watcher。
+fn enter_fullscreen<R: Runtime>(
+    app: &AppHandle<R>,
+    window: &tauri::Window<R>,
+) -> tauri::Result<()> {
+    window.set_fullscreen(true)?;
+    FULLSCREEN_STATE.store(true, Ordering::SeqCst);
+    if let Ok(size) = window.inner_size() {
+        relayout_main_window(window, size);
+    }
+    if let Some(titlebar) = app.get_webview(TITLEBAR_WEBVIEW) {
+        let _ = titlebar.hide();
+    }
+    FULLSCREEN_TITLEBAR_SHOWN.store(false, Ordering::SeqCst);
+    start_fullscreen_titlebar_watcher(app.clone());
+    apply_fullscreen_side_effects(app, true);
+    Ok(())
+}
+
+/// 退出全屏：停 watcher + 恢复普通布局 + 标题栏常显。
+fn exit_fullscreen<R: Runtime>(
+    app: &AppHandle<R>,
+    window: &tauri::Window<R>,
+) -> tauri::Result<()> {
+    window.set_fullscreen(false)?;
+    FULLSCREEN_STATE.store(false, Ordering::SeqCst);
+    stop_fullscreen_watch();
+    if let Some(titlebar) = app.get_webview(TITLEBAR_WEBVIEW) {
+        let _ = titlebar.show();
+    }
+    FULLSCREEN_TITLEBAR_SHOWN.store(false, Ordering::SeqCst);
+    if let Ok(size) = window.inner_size() {
+        relayout_main_window(window, size);
+    }
+    apply_fullscreen_side_effects(app, false);
+    Ok(())
+}
+
+/// 退出全屏（若当前全屏）。关窗到托盘 / 窗口重建前调用，避免把任务栏留在一个隐藏窗口后面。
+pub fn leave_fullscreen<R: Runtime>(app: &AppHandle<R>) {
+    let Some(window) = app.get_window(MAIN_WINDOW) else {
+        return;
+    };
+    if window.is_fullscreen().unwrap_or(false) {
+        let _ = exit_fullscreen(app, &window);
+    }
+}
+
+/// 窗口的全屏状态被**外部**改变时（双击标题栏触发 toggle_maximize、Win+Up/Down 等），
+/// 把标题栏 / Dock / Windows 任务栏拉回与窗口一致。由 `main.rs` 的 Resized 事件调用。
+pub fn reconcile_fullscreen<R: Runtime>(window: &tauri::Window<R>) {
+    let actual = window.is_fullscreen().unwrap_or(false);
+    if actual == FULLSCREEN_STATE.load(Ordering::SeqCst) {
+        return;
+    }
+    let app = window.app_handle();
+    if actual {
+        let _ = enter_fullscreen(app, window);
+    } else {
+        let _ = exit_fullscreen(app, window);
+    }
+}
+
+/// 全屏的页面/标题栏联动（[`set_fullscreen`] 与 ESC 通道共用）。
+fn apply_fullscreen_side_effects<R: Runtime>(app: &AppHandle<R>, on: bool) {
+    // Windows 任务栏在 fullscreen 下仍会盖在窗口底部（实测截图），必须显式藏掉。
+    set_windows_taskbar_visible(!on);
+    if let Some(webview) = app.get_webview(MAIN_WINDOW) {
+        let _ = webview.eval(format!(
+            "window.__FNOS_DOCK_FULLSCREEN__ && window.__FNOS_DOCK_FULLSCREEN__({on});"
+        ));
+    }
+    if let Some(titlebar) = app.get_webview(TITLEBAR_WEBVIEW) {
+        let _ = titlebar.eval(format!(
+            "window.__FNOS_WIN_FULLSCREEN_SET__ && window.__FNOS_WIN_FULLSCREEN_SET__({on});"
+        ));
+    }
+}
+
+/// 只在确实全屏时退出（ESC 通道用；非全屏的 Esc 留给页面自己）。
+fn exit_fullscreen_if_needed<R: Runtime>(app: &AppHandle<R>) {
+    leave_fullscreen(app);
+}
+
 /// 窗口 resize 后把所有子 Webview 摆回正确位置（`main.rs` 的 `Resized` 事件转发到这里）。
 /// 子 Webview **不会**随窗口自动重排——最大化 / 还原 / 拖边缘都靠这一趟。
 pub fn relayout_main_window<R: Runtime>(window: &tauri::Window<R>, size: tauri::PhysicalSize<u32>) {
@@ -1467,6 +1741,14 @@ pub fn relayout_main_window<R: Runtime>(window: &tauri::Window<R>, size: tauri::
         return;
     };
     let strip = (TAB_STRIP_H * scale) as i32;
+    // 全屏时标题栏是**悬浮层**：内容 Webview 铺满整个窗口（从 y=0 开始），标题栏
+    // 仍保持 0..32px 的位置，但只在顶部热区悬停时显示、盖在内容上方。
+    let fullscreen = window.is_fullscreen().unwrap_or(false);
+    let (content_y, content_h) = if fullscreen {
+        (0, size.height)
+    } else {
+        (strip, size.height.saturating_sub(strip as u32))
+    };
     for wv in window.webviews() {
         let bounds = if wv.label() == TITLEBAR_WEBVIEW {
             tauri::Rect {
@@ -1478,11 +1760,8 @@ pub fn relayout_main_window<R: Runtime>(window: &tauri::Window<R>, size: tauri::
             }
         } else {
             tauri::Rect {
-                position: tauri::Position::Physical(tauri::PhysicalPosition::new(0, strip)),
-                size: tauri::Size::Physical(tauri::PhysicalSize::new(
-                    size.width,
-                    (size.height as f64 - strip as f64) as u32,
-                )),
+                position: tauri::Position::Physical(tauri::PhysicalPosition::new(0, content_y)),
+                size: tauri::Size::Physical(tauri::PhysicalSize::new(size.width, content_h)),
             }
         };
         let _ = wv.set_bounds(bounds);
@@ -1714,20 +1993,28 @@ pub fn handle_title<R: Runtime>(webview: &Webview<R>, title: &str, app: &AppHand
     push_tabs(app);
 }
 
-/// 处理一条标签页快捷键（P0-3）：`next` / `prev` / `close` / `new`，其余一律丢弃。
+/// 处理一条标签页快捷键（P0-3）：`next` / `prev` / `close` / `new`，以及全屏退出
+/// `exit-fullscreen`（Esc）。其余一律丢弃。
 ///
 /// ## 为什么这条通道可以接受「页面写得动」
 ///
 /// `document.title` 是页面可控的，任何站点都能写 `FNOSKEY:close`。三个理由让它不构成
-/// 安全问题：① 动作只有四个，且**每一个都等价于用户亲手点标签条**（关/切/开标签），
-/// 不触碰配置、文件系统、网络或任何 IPC 命令；② 调用方（[`handle_title`]）只接受
-/// **当前激活标签**发来的命令——后台页不能替你关掉正在用的标签；③ 下面的冷却把它压成
-/// 「120ms 最多一次」，刷屏不产生可感知影响。
+/// 安全问题：① 动作只有这几个，且**每一个都等价于用户亲手点标签条 / 按 Esc**（关/切/开
+/// 标签、退出全屏），不触碰配置、文件系统、网络或任何 IPC 命令；② 调用方
+/// （[`handle_title`]）只接受**当前激活标签**发来的命令——后台页不能替你关掉正在用的
+/// 标签；③ 下面的冷却把它压成「120ms 最多一次」，刷屏不产生可感知影响。
+///
+/// `exit-fullscreen` 走冷却**之前**的分支：它只在确实全屏时动作一次，重复调用是 no-op；
+/// 而 Esc 是页面自己的常用键，不该被标签快捷键的冷却窗口吞掉。
 ///
 /// 动作不合法就静默丢弃（不写日志——这条通路人人都能触发，写日志等于给页面一个日志放大器）。
 fn handle_tab_key<R: Runtime>(app: &AppHandle<R>, action: &str) {
     use std::sync::atomic::Ordering;
     let action = action.trim();
+    if action == "exit-fullscreen" {
+        exit_fullscreen_if_needed(app);
+        return;
+    }
     if !matches!(action, "next" | "prev" | "close" | "new") {
         return;
     }
@@ -2070,6 +2357,13 @@ pub fn on_page_event<R: Runtime>(
         return;
     }
     flog!("[fnos] 主窗口页面已加载: {url}");
+    // 全屏是宿主侧状态，但 Dock 的隐藏类是页面 DOM 上的：页内导航 / 重载换了一篇文档后
+    // 要重新落一次（否则全屏中刷新页面，任务栏会自己冒回来）。
+    if let Some(window) = app.get_window(MAIN_WINDOW) {
+        if window.is_fullscreen().unwrap_or(false) {
+            apply_fullscreen_side_effects(app, true);
+        }
+    }
     // Task 13a：页内导航（`reload_main` 的 `navigate`、页面里的链接、重定向）**不走**
     // `begin_load`，所以上面那段带世代闸门的代码会直接 return——清理必须放在闸门**之前**，
     // 否则新文档与旧上报不同文档（换 origin，或同一个 origin 下的另一篇文档）时那条证据会
@@ -2893,6 +3187,11 @@ pub fn save_window_geom<R: Runtime>(app: &AppHandle<R>) {
     if win.is_maximized().unwrap_or(false) {
         return;
     }
+    // 全屏同理：inner_size / outer_position 是全屏尺寸，存下去下次启动会变成一个
+    // 近似全屏的普通窗口。退出全屏后 Tauri 会恢复原几何，不需要这里记。
+    if win.is_fullscreen().unwrap_or(false) {
+        return;
+    }
     let Ok(size) = win.inner_size() else {
         return;
     };
@@ -2956,10 +3255,14 @@ mod tests {
             "动作必须在白名单里"
         );
         assert!(
+            body.contains("action == \"exit-fullscreen\"") && body.contains("exit_fullscreen_if_needed"),
+            "Esc 退出全屏必须走独立分支（不占标签快捷键冷却）"
+        );
+        assert!(
             body.contains("KEY_COOLDOWN_MS") && body.contains("compare_exchange"),
             "必须有刷屏冷却（页面可控通道）"
         );
-        // 不得出现「提升权限」式的动作：这条通道只能切/关/开标签
+        // 不得出现「提升权限」式的动作：这条通道只能切/关/开标签与退出全屏
         for forbidden in ["set_config", "reset_config", "import_wallpaper", "open_url"] {
             assert!(!body.contains(forbidden), "快捷键通道不得触达 {forbidden}");
         }
@@ -4133,6 +4436,41 @@ mod tests {
             let build = include_str!("../build.rs");
             assert!(build.contains(&format!("\"{cmd}\"")), "build.rs 命令清单缺少：{cmd}");
         }
+        // 全屏命令（同步命令，不是 async）+ 命令清单 + 页面/标题栏联动
+        assert!(
+            src.contains("pub fn set_fullscreen<R: Runtime>"),
+            "缺少全屏命令：set_fullscreen"
+        );
+        assert!(
+            include_str!("../build.rs").contains("\"set_fullscreen\""),
+            "build.rs 命令清单缺少：set_fullscreen"
+        );
+        let fullscreen_at = src.find("pub fn set_fullscreen").expect("set_fullscreen 必须存在");
+        let fullscreen_body = &src[fullscreen_at..fullscreen_at + 1600];
+        assert!(
+            fullscreen_body.contains("enter_fullscreen(&app, &window)")
+                && fullscreen_body.contains("exit_fullscreen(&app, &window)"),
+            "全屏命令必须走进入/退出全屏的完整流程"
+        );
+        assert!(
+            src.contains("fn enter_fullscreen<R: Runtime>")
+                && src.contains("fn exit_fullscreen<R: Runtime>")
+                && src.contains("titlebar.hide()")
+                && src.contains("start_fullscreen_titlebar_watcher"),
+            "进入全屏必须隐藏标题栏并启动顶部悬停 watcher"
+        );
+        assert!(
+            src.contains("bring_webview_to_front") && src.contains("ParentWindow"),
+            "悬浮标题栏必须用 WebView2 子窗口 HWND 提到内容之上"
+        );
+        assert!(
+            src.contains("__FNOS_DOCK_FULLSCREEN__") && src.contains("__FNOS_WIN_FULLSCREEN_SET__"),
+            "全屏联动必须调用 dock.js 的隐藏口并回推标题栏状态"
+        );
+        assert!(
+            src.contains("set_windows_taskbar_visible(!on)") && src.contains("pub fn restore_taskbar"),
+            "全屏必须隐藏 Windows 任务栏，并提供退出/销毁时的还原口"
+        );
         // fnOS 主页标签不可关闭（关了就没有「回桌面」的地方）
         let close_at = src.find("pub async fn tab_close<R: Runtime>").expect("tab_close 必须存在");
         let close_body = &src[close_at..close_at + 900];
@@ -4153,6 +4491,7 @@ mod tests {
             "allow-tab-new",
             "allow-tab-switch",
             "allow-tab-close",
+            "allow-set-fullscreen",
         ] {
             assert!(cap.contains(perm), "标签页栏缺少权限：{perm}");
         }
@@ -4167,8 +4506,10 @@ mod tests {
             "tab_new",
             "tab_switch",
             "tab_close",
+            "set_fullscreen",
             "__FNOS_TABS_SET__",
             "__FNOS_WIN_MAX_SET__",
+            "__FNOS_WIN_FULLSCREEN_SET__",
             "plugin:window|minimize",
             "plugin:window|toggle_maximize",
             "plugin:window|close",
