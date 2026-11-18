@@ -13,8 +13,35 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 
 const read = (rel) => readFileSync(new URL(rel, import.meta.url), 'utf8');
+
+test('NOTICE 的 SHA-256/大小表与 vendored 文件逐项一致，commit 与 injector 常量一致', () => {
+  const notice = read('../src-tauri/assets/fnos-mods/NOTICE');
+  const pinned = notice.match(/Pinned commit: ([0-9a-f]{40})/);
+  assert.ok(pinned, 'NOTICE 必须有 Pinned commit');
+  const injector = read('../src-tauri/src/injector.rs');
+  const constant = injector.match(/pub const MODS_COMMIT: &str = "([0-9a-f]{40})";/);
+  assert.ok(constant, 'injector.rs 必须有 MODS_COMMIT');
+  assert.equal(constant[1], pinned[1], 'NOTICE 与 injector 的 vendored commit 必须一致');
+  const base = new URL('../src-tauri/assets/fnos-mods/', import.meta.url);
+  let count = 0;
+  for (const line of notice.split(/\r?\n/)) {
+    const m = /^\s+([0-9a-f]{64})\s+(\d+)\s+(\S+)$/.exec(line);
+    if (!m) continue;
+    const [, hash, size, rel] = m;
+    const bytes = readFileSync(new URL(rel, base));
+    assert.equal(bytes.length, Number(size), `${rel} 的大小与 NOTICE 不一致`);
+    assert.equal(
+      createHash('sha256').update(bytes).digest('hex'),
+      hash,
+      `${rel} 的 SHA-256 与 NOTICE 不一致`
+    );
+    count += 1;
+  }
+  assert.ok(count >= 25, 'NOTICE 哈希表不应为空');
+});
 
 test('版本号三处一致：package.json / tauri.conf.json / Cargo.toml', () => {
   // 发版靠 tag 与两处版本人工同步；任何一处漂移都会让「装完还是旧版、永远提示更新」

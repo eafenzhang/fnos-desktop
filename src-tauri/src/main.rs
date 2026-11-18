@@ -32,6 +32,8 @@ fn main() {
             }
         }))
         .setup(|app| {
+            // 上次全屏中被强杀时任务栏可能仍被藏着：按 marker 恢复，避免没有任务栏。
+            commands::restore_taskbar_on_startup();
             // Task 11：`load_config` 的第二个返回值是加载报告（是否从 .bak 回退、是否
             // 读取失败），必须经 `save_and_install_state` 带进 AppState——读配置时状态
             // 还没被 manage，且「读失败」要阻止默认值覆盖磁盘。

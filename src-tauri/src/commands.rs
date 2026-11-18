@@ -703,6 +703,13 @@ fn apply_to_page<R: Runtime>(app: &AppHandle<R>, cfg: &Config) {
                 if wv.label() == TITLEBAR_WEBVIEW {
                     continue;
                 }
+                // 只推给真正持有完整载荷的页面（main / 桌面根 / 授权页）。应用标签只有
+                // keys.js，第三方标签更不该拿到 mods/local；页面自己定义的
+                // `__FNOS_APPLY_CONFIG__` 不能成为配置外泄通道。
+                let Ok(url) = wv.url() else { continue; };
+                if !should_receive_full_config(cfg, wv.label(), &url) {
+                    continue;
+                }
                 let _ = wv.eval(format!(
                     "window.__FNOS_APPLY_CONFIG__ && window.__FNOS_APPLY_CONFIG__({json});"
                 ));
@@ -767,9 +774,9 @@ pub fn build_main_window<R: Runtime>(
 ///   * `main` Webview：fnOS 主页（第一个标签页），铺在标签栏以下的全部区域；
 ///   * 之后 `window.open` 的外部应用各占一个 `tab-N` Webview（见 [`open_app_tab`]），
 ///     不再是独立窗口。
-/// 这要求 tauri 的 `unstable` feature（`Window::add_child`，桌面端可用）。
-/// 所有子 Webview 都**不会**随窗口 resize 自动重排——[`relayout_main_window`] 在
-/// `Resized` 事件里统一摆位。
+///     这要求 tauri 的 `unstable` feature（`Window::add_child`，桌面端可用）。
+///     所有子 Webview 都**不会**随窗口 resize 自动重排——[`relayout_main_window`] 在
+///     `Resized` 事件里统一摆位。
 fn build_main_window_with<R: Runtime>(
     app: &AppHandle<R>,
     url: tauri::Url,
@@ -837,7 +844,10 @@ fn build_main_window_with<R: Runtime>(
     // [`tab_webview_callbacks`]）。`main` 这个 label 同时是注入页的 IPC 身份：
     // `capabilities/default.json` 之外它没有任何授权，远程页面的显式拒绝在
     // `capabilities/remote-deny.json`。
-    let script = init_script_cached(app, cfg);
+    let script = injector::wrap_origin_script(
+        &shell_origins(cfg),
+        &init_script_cached(app, cfg),
+    );
     let mut main_webview = tab_webview_builder(MAIN_WINDOW, url.clone(), app, Some(generation));
     if !script.is_empty() {
         // gap (a)：`inject_enabled=false` 时 `build_init_script` 返回空串，此时**不注册**
@@ -1203,7 +1213,26 @@ fn create_popup_window<R: Runtime>(
             // （如 platform.deepseek.com）不执行 mods/shim。见 injector::wrap_popup_script。
             let gated = injector::wrap_popup_script(&desktop_origin, &script);
             if !gated.is_empty() {
-                builder = builder.initialization_script(gated);
+                // T14f：WebView2 的 SetNewWindow 导航可能快于初始化脚本注册，直接
+                // `window.open('/signin')` 的弹窗首个文档会整份漏掉（实测连
+                // `__FNOS_SHELL__` 都没有；about:blank 起步的弹窗不受影响）。
+                // 页面加载完成后再补一次；载荷已执行过的文档由 `guard_late_script`
+                // 里的 `__FNOS_SHELL__` 判据跳过，不会重复装 dock / windowpos。
+                let late = injector::guard_late_script(&gated);
+                let trusted_origin = desktop_origin.clone();
+                builder = builder
+                    .initialization_script(gated)
+                    .on_page_load(move |window, payload| {
+                        if payload.event() != PageLoadEvent::Finished {
+                            return;
+                        }
+                        if payload.url().origin().ascii_serialization() != trusted_origin {
+                            return;
+                        }
+                        if let Err(e) = window.eval(&late) {
+                            flog!("[fnos] 弹窗补注入失败：{e}");
+                        }
+                    });
             }
         }
     }
@@ -1222,6 +1251,56 @@ fn is_desktop_or_auth_page(desktop: &tauri::Url, url: &tauri::Url) -> bool {
         || is_auth_like_url(url)
 }
 
+/// 允许完整载荷 / 控制通道的 fnOS origin：桌面地址 + 配置里的 homeUrl / nasUrl。
+///
+/// homeUrl 是官网入口（默认 https://fnos.net/），nasUrl 是真实桌面；FN Connect 登录后
+/// 主 Webview 可能从前者跳到后者，所以两处都要放行。第三方 origin 不在列表里。
+fn shell_origins(cfg: &Config) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut add = |url: &tauri::Url| {
+        let origin = url.origin().ascii_serialization();
+        if !out.contains(&origin) {
+            out.push(origin);
+        }
+    };
+    add(&resolve_main_url(cfg, None));
+    for raw in [&cfg.shell.home_url, &cfg.shell.nas_url] {
+        if let Ok(url) = tauri::Url::parse(raw) {
+            add(&url);
+        }
+    }
+    out
+}
+
+fn is_trusted_shell_url(cfg: &Config, url: &tauri::Url) -> bool {
+    let origin = url.origin().ascii_serialization();
+    shell_origins(cfg).iter().any(|allowed| allowed == &origin)
+}
+
+/// 这个 webview 当前文档是否有资格拿完整 mods 配置（main / 桌面根页面 / 登录授权页）。
+/// 应用标签（/seek、/p、/app/...）只拿 keys.js，不接收 mods/local 配置推送。
+fn should_receive_full_config(cfg: &Config, label: &str, url: &tauri::Url) -> bool {
+    if !is_trusted_shell_url(cfg, url) {
+        return false;
+    }
+    if label == MAIN_WINDOW {
+        return true;
+    }
+    let desktop = resolve_main_url(cfg, None);
+    is_desktop_or_auth_page(&desktop, url)
+}
+
+/// 控制标题（PROBE / REPORT / CHUNK）只接受来自**受信 origin** 的主文档。
+/// 否则主标签被同页导航到第三方后，对方写一个 `FNOSPROBE:`/`FNOSREPORT:` 就能伪造
+/// 加载失败或状态证据。`FNOSKEY` 不在此列：激活标签（含第三方应用）本来就允许发。
+fn is_control_origin_trusted<R: Runtime>(app: &AppHandle<R>, webview: &Webview<R>) -> bool {
+    webview
+        .url()
+        .ok()
+        .map(|url| is_trusted_shell_url(&current(app), &url))
+        .unwrap_or(false)
+}
+
 /// 按目标页面选择注入档位：
 /// - 桌面根页面 / 登录授权页（且与 fnOS 同源）→ 完整载荷（缓存过的初始化脚本）；
 /// - 其他应用标签与第三方标签 → 只注入标签快捷键（[`injector::build_core_script`]）。
@@ -1231,7 +1310,8 @@ fn is_desktop_or_auth_page(desktop: &tauri::Url, url: &tauri::Url) -> bool {
 fn init_script_for_tab<R: Runtime>(app: &AppHandle<R>, cfg: &Config, url: &tauri::Url) -> String {
     let desktop = resolve_main_url(cfg, None);
     if same_origin(&desktop, url) && is_desktop_or_auth_page(&desktop, url) {
-        init_script_cached(app, cfg)
+        let script = init_script_cached(app, cfg);
+        injector::wrap_origin_script(&shell_origins(cfg), &script)
     } else {
         injector::build_core_script()
     }
@@ -1447,9 +1527,7 @@ pub async fn tab_switch<R: Runtime>(app: AppHandle<R>, label: String) -> Result<
         .tabs
         .lock()
         .unwrap()
-        .order
-        .iter()
-        .any(|l| *l == label);
+        .order.contains(&label);
     if !exists {
         return Err(format!("标签页不存在：{label}"));
     }
@@ -1522,38 +1600,105 @@ pub fn set_fullscreen<R: Runtime>(app: AppHandle<R>, value: bool) -> Result<(), 
 /// Windows 桌面任务栏是否**由本壳**藏起来（只还原自己藏过的，不碰用户/其它程序隐藏的状态）。
 #[cfg(windows)]
 static TASKBAR_HIDDEN_BY_SHELL: AtomicBool = AtomicBool::new(false);
-
-/// 显示/隐藏 Windows 桌面任务栏（`Shell_TrayWnd`）。
-///
-/// 注意：这是**系统级**副作用。只在 `IsWindowVisible` 为真时由本壳隐藏，并在退出全屏、
-/// 关窗到托盘、窗口销毁、托盘退出时还原；进程被强杀时无法还原（Windows 任务栏可通过
-/// 重启 Explorer 恢复）。不处理多显示器的 `Shell_SecondaryTrayWnd`——主窗口当前在主屏。
+/// 被本壳隐藏的任务栏 HWND（主屏 `Shell_TrayWnd` + 各副屏 `Shell_SecondaryTrayWnd`）。
 #[cfg(windows)]
-fn set_windows_taskbar_visible(visible: bool) {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{
-        FindWindowW, IsWindowVisible, ShowWindow, SW_HIDE, SW_SHOW,
-    };
-    let class: Vec<u16> = "Shell_TrayWnd\0".encode_utf16().collect();
-    let hwnd = unsafe { FindWindowW(class.as_ptr(), std::ptr::null()) };
-    if hwnd.is_null() {
-        return;
-    }
-    if visible {
-        if TASKBAR_HIDDEN_BY_SHELL.swap(false, Ordering::SeqCst) {
-            unsafe {
-                ShowWindow(hwnd, SW_SHOW);
+static HIDDEN_TASKBARS: Mutex<Vec<isize>> = Mutex::new(Vec::new());
+
+#[cfg(windows)]
+fn taskbar_marker_path() -> std::path::PathBuf {
+    paths::config_dir().join("taskbar-hidden.flag")
+}
+
+/// 枚举所有任务栏窗口（主屏 + 副屏）。用 isize 存 HWND，避免 static 里的裸指针 Send 问题。
+#[cfg(windows)]
+fn taskbar_handles() -> Vec<isize> {
+    use windows_sys::Win32::Foundation::{BOOL, HWND, LPARAM};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{EnumWindows, GetClassNameW};
+
+    unsafe extern "system" fn collect(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let out = &mut *(lparam as *mut Vec<isize>);
+        let mut buf = [0u16; 64];
+        let n = GetClassNameW(hwnd, buf.as_mut_ptr(), buf.len() as i32);
+        if n > 0 {
+            let name = String::from_utf16_lossy(&buf[..n as usize]);
+            if name == "Shell_TrayWnd" || name == "Shell_SecondaryTrayWnd" {
+                out.push(hwnd as isize);
             }
         }
-    } else if unsafe { IsWindowVisible(hwnd) } != 0 {
-        TASKBAR_HIDDEN_BY_SHELL.store(true, Ordering::SeqCst);
-        unsafe {
-            ShowWindow(hwnd, SW_HIDE);
+        1
+    }
+
+    let mut out = Vec::new();
+    unsafe {
+        EnumWindows(Some(collect), &mut out as *mut _ as LPARAM);
+    }
+    out
+}
+
+/// 显示/隐藏 Windows 桌面任务栏（主屏 + 副屏）。
+///
+/// 这是**系统级**副作用：只在 `IsWindowVisible` 为真时由本壳隐藏；退出全屏、关窗到托盘、
+/// 窗口销毁、托盘退出时还原。隐藏期间会在配置目录写 `taskbar-hidden.flag`，若进程被强杀，
+/// 下次启动据该标记把任务栏恢复，避免用户永远没有任务栏。
+#[cfg(windows)]
+fn set_windows_taskbar_visible(visible: bool) {
+    use windows_sys::Win32::Foundation::HWND;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{IsWindowVisible, ShowWindow, SW_HIDE, SW_SHOW};
+
+    if visible {
+        if !TASKBAR_HIDDEN_BY_SHELL.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        let mut hidden = HIDDEN_TASKBARS.lock().unwrap();
+        for handle in hidden.drain(..) {
+            unsafe {
+                ShowWindow(handle as HWND, SW_SHOW);
+            }
+        }
+        let _ = std::fs::remove_file(taskbar_marker_path());
+    } else {
+        if TASKBAR_HIDDEN_BY_SHELL.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let mut hidden = HIDDEN_TASKBARS.lock().unwrap();
+        hidden.clear();
+        for handle in taskbar_handles() {
+            if unsafe { IsWindowVisible(handle as HWND) } != 0 {
+                hidden.push(handle);
+                unsafe {
+                    ShowWindow(handle as HWND, SW_HIDE);
+                }
+            }
+        }
+        if !hidden.is_empty() {
+            let _ = std::fs::write(taskbar_marker_path(), b"1");
         }
     }
 }
 
 #[cfg(not(windows))]
 fn set_windows_taskbar_visible(_visible: bool) {}
+
+/// 启动时恢复任务栏：上一次进程若在全屏中被强杀，`taskbar-hidden.flag` 还在，
+/// 此时无条件恢复所有任务栏并清掉标记（正常退出路径不会留下它）。
+pub fn restore_taskbar_on_startup() {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::HWND;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_SHOW};
+
+        if taskbar_marker_path().exists() {
+            for handle in taskbar_handles() {
+                unsafe {
+                    ShowWindow(handle as HWND, SW_SHOW);
+                }
+            }
+            let _ = std::fs::remove_file(taskbar_marker_path());
+        }
+        TASKBAR_HIDDEN_BY_SHELL.store(false, Ordering::SeqCst);
+        HIDDEN_TASKBARS.lock().unwrap().clear();
+    }
+}
 
 /// 兜底还原任务栏（窗口销毁 / 托盘退出 / 主进程正常结束时调用；幂等）。
 pub fn restore_taskbar() {
@@ -2005,19 +2150,19 @@ pub fn handle_title<R: Runtime>(webview: &Webview<R>, title: &str, app: &AppHand
     let is_main = webview.label() == MAIN_WINDOW;
     if let Some(payload) = title.strip_prefix(PROBE_TITLE_PREFIX) {
         // 探针标题是「页面 → 宿主」的回传通道，不是给用户看的标题：不镜像、只处理。
-        if is_main {
+        if is_main && is_control_origin_trusted(app, webview) {
             on_load_probe(app, payload);
         }
         return;
     }
     if let Some(payload) = title.strip_prefix(report::CHUNK_TITLE_PREFIX) {
-        if is_main {
+        if is_main && is_control_origin_trusted(app, webview) {
             on_page_chunk(webview, payload);
         }
         return;
     }
     if let Some(payload) = title.strip_prefix(report::REPORT_TITLE_PREFIX) {
-        if is_main {
+        if is_main && is_control_origin_trusted(app, webview) {
             on_page_report(webview, payload);
         }
         return;
@@ -2951,7 +3096,7 @@ fn store_wallpaper(
     }
     // 上面已经保证扩展名在允许表内；这里再取一次是为了做「扩展名与内容一致」的检查
     let ext = config::wallpaper_ext(name).ok_or_else(|| "扩展名不在允许表内".to_string())?;
-    let max_b64 = (config::MAX_WALLPAPER_BYTES + 2) / 3 * 4;
+    let max_b64 = config::MAX_WALLPAPER_BYTES.div_ceil(3) * 4;
     if data_base64.len() > max_b64 {
         return Err(format!(
             "图片超过 {} MiB 上限",
@@ -3287,7 +3432,10 @@ pub fn save_window_geom<R: Runtime>(app: &AppHandle<R>) {
         return;
     }
     let scale = win.scale_factor().unwrap_or(1.0);
-    let mut cfg = current(app);
+    // 锁内 read-modify-write-save：并发的 set_config/reset_config 不能被这份几何克隆
+    // 覆盖（Config::save 的 SAVE_LOCK 只防字节交错，不防丢失更新）。
+    let state = app.state::<AppState>();
+    let mut cfg = state.config.lock().unwrap();
     cfg.shell.window.w = size.width as f64 / scale;
     cfg.shell.window.h = size.height as f64 / scale;
     if let Ok(pos) = win.outer_position() {
@@ -3299,7 +3447,6 @@ pub fn save_window_geom<R: Runtime>(app: &AppHandle<R>) {
     // 窗口被拖到小于下限时内存/磁盘记下限值，比将来拿一个不可用尺寸去建窗安全。
     cfg.shell.window.clamp_to_usable();
     let _ = cfg.save(&Config::config_path());
-    *app.state::<AppState>().config.lock().unwrap() = cfg;
 }
 
 #[cfg(test)]
@@ -3561,7 +3708,7 @@ mod tests {
         let mut raw = Config::default();
         raw.shell.nas_url = "http://192.168.1.10:5666/webui/".into();
         assert!(is_recognized(&raw, Some("http://192.168.1.10:5666")));
-        assert!(is_recognized(&raw, Some("http://192.168.1.10:5667")) == false);
+        assert!(!is_recognized(&raw, Some("http://192.168.1.10:5667")));
     }
 
     /// 自动重试退避：15s → 30s → 60s → 120s，第 5 次起不再重试（错误页要如实写出来）。
@@ -3905,12 +4052,46 @@ mod tests {
         let jpeg = base64::encode(&[0xffu8, 0xd8, 0xff, 0xe0, 0x00]);
         assert!(store_wallpaper(&dir, "a.png", &jpeg).is_err());
         // ⑤ 超过 8 MiB：先被 base64 长度闸门挡下（不进入解码，也就不会分配几十 MB）
-        let max_b64 = (config::MAX_WALLPAPER_BYTES + 2) / 3 * 4;
+        let max_b64 = config::MAX_WALLPAPER_BYTES.div_ceil(3) * 4;
         let huge = "A".repeat(max_b64 + 1);
         let err = store_wallpaper(&dir, "a.png", &huge).expect_err("超限必须被拒");
         assert!(err.contains("8 MiB"), "{err}");
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// titlebar 的四个命令（三个标签页 + 全屏）也必须在 main/build/capability 四处齐全。
+    #[test]
+    fn titlebar_commands_are_registered_in_main_build_and_capability() {
+        let src = include_str!("commands.rs");
+        let main_rs = include_str!("main.rs");
+        let build = include_str!("../build.rs");
+        let cap = include_str!("../capabilities/titlebar.json");
+        for (cmd, perm, is_async) in [
+            ("tab_new", "allow-tab-new", true),
+            ("tab_switch", "allow-tab-switch", true),
+            ("tab_close", "allow-tab-close", true),
+            ("set_fullscreen", "allow-set-fullscreen", false),
+        ] {
+            let sig = if is_async {
+                format!("pub async fn {cmd}<R: Runtime>")
+            } else {
+                format!("pub fn {cmd}<R: Runtime>")
+            };
+            assert!(src.contains(&sig), "commands.rs 缺少 {cmd}");
+            assert!(
+                main_rs.contains(&format!("commands::{cmd}")),
+                "main.rs invoke_handler 缺少 {cmd}"
+            );
+            assert!(
+                build.contains(&format!("\"{cmd}\"")),
+                "build.rs AppManifest 缺少 {cmd}"
+            );
+            assert!(
+                cap.contains(&format!("\"{perm}\"")),
+                "titlebar.json 缺少 {perm}"
+            );
+        }
     }
 
     /// Task 13b 的注册不变式：每个 IPC 命令都必须在**四**个地方出现，且授权面没有扩大。
@@ -4401,6 +4582,51 @@ mod tests {
         );
     }
 
+    /// 受信 origin / 完整配置推送范围：主页面、桌面根与授权页；应用页和第三方不拿。
+    #[test]
+    fn only_shell_origins_get_full_payload_and_config_pushes() {
+        let mut cfg = Config::default();
+        cfg.shell.home_url = "https://fnos.net/".into();
+        cfg.shell.nas_url = "https://nas.example.com/".into();
+        let page = |u: &str| tauri::Url::parse(u).unwrap();
+        let origins = shell_origins(&cfg);
+        assert!(origins.contains(&"https://fnos.net".to_string()));
+        assert!(origins.contains(&"https://nas.example.com".to_string()));
+        assert!(is_trusted_shell_url(
+            &cfg,
+            &page("https://nas.example.com/seek")
+        ));
+        assert!(!is_trusted_shell_url(
+            &cfg,
+            &page("https://example.com/")
+        ));
+        assert!(should_receive_full_config(
+            &cfg,
+            MAIN_WINDOW,
+            &page("https://fnos.net/")
+        ));
+        assert!(should_receive_full_config(
+            &cfg,
+            "tab-1",
+            &page("https://nas.example.com/")
+        ));
+        assert!(should_receive_full_config(
+            &cfg,
+            "tab-1",
+            &page("https://nas.example.com/signin?client_id=x")
+        ));
+        assert!(!should_receive_full_config(
+            &cfg,
+            "tab-1",
+            &page("https://nas.example.com/seek/")
+        ));
+        assert!(!should_receive_full_config(
+            &cfg,
+            MAIN_WINDOW,
+            &page("https://example.com/")
+        ));
+    }
+
     /// 应用标签不再拿桌面完整载荷；根页面与登录/授权页仍拿。
     #[test]
     fn app_tabs_get_the_core_script_not_the_desktop_payload() {
@@ -4522,6 +4748,13 @@ mod tests {
             "只有与 fnOS 同源的弹窗才注入初始化脚本（第三方登录页不该被 mods 覆盖）"
         );
         assert!(
+            popup.contains("on_page_load")
+                && popup.contains("PageLoadEvent::Finished")
+                && popup.contains("guard_late_script")
+                && popup.contains(".eval("),
+            "首个文档可能漏掉初始化脚本：加载完成后必须补注入（且带幂等判据）"
+        );
+        assert!(
             src.matches(".on_new_window(").count() >= 1,
             "标签页 Webview 都要挂这条裁定（tab_webview_builder 统一组装）"
         );
@@ -4547,6 +4780,7 @@ mod tests {
         assert!(tier.contains("is_desktop_or_auth_page"));
         assert!(tier.contains("same_origin(&desktop, url)"));
         assert!(tier.contains("init_script_cached(app, cfg)"));
+        assert!(tier.contains("wrap_origin_script"));
         assert!(tier.contains("injector::build_core_script()"));
         assert!(
             body.contains("activate_tab(app, &label)"),
@@ -4603,6 +4837,12 @@ mod tests {
         assert!(
             src.contains("set_windows_taskbar_visible(!on)") && src.contains("pub fn restore_taskbar"),
             "全屏必须隐藏 Windows 任务栏，并提供退出/销毁时的还原口"
+        );
+        assert!(
+            src.contains("restore_taskbar_on_startup")
+                && src.contains("taskbar-hidden.flag")
+                && src.contains("Shell_SecondaryTrayWnd"),
+            "任务栏必须支持副屏，并能从强杀后的 marker 恢复"
         );
         // fnOS 主页标签不可关闭（关了就没有「回桌面」的地方）
         let close_at = src.find("pub async fn tab_close<R: Runtime>").expect("tab_close 必须存在");

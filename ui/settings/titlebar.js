@@ -77,11 +77,56 @@
    * 用户要求（标签样式改造）：**首页标签永远固定在最左**，与宿主推送顺序无关；
    * 重复的 `main` 条目只渲染一次，且永远不渲染关闭钮（main 不可关闭）。
    */
+  var renderedSig = '';
+  var renderedIds = [];
+  var renderedNodes = Object.create(null);
+
+  function childByClass(el, cls) {
+    if (!el || !el.children) return null;
+    for (var i = 0; i < el.children.length; i++) {
+      if (String(el.children[i].className || '').split(/\s+/).indexOf(cls) >= 0) {
+        return el.children[i];
+      }
+    }
+    return null;
+  }
+
+  function scrollActive(host) {
+    var active = null;
+    for (var i = 0; i < host.children.length; i++) {
+      var cls = String(host.children[i].className || '');
+      if (cls.split(/\s+/).indexOf('active') >= 0) { active = host.children[i]; break; }
+    }
+    if (active && typeof active.scrollIntoView === 'function') {
+      try { active.scrollIntoView({ inline: 'nearest', block: 'nearest' }); } catch (_e) { /* 老内核 */ }
+    }
+  }
+
+  function updateHome(node, tab) {
+    var name = nasName(tab.title);
+    node.className = 'home' + (tab.active ? ' active' : '');
+    node.title = name;
+    node.setAttribute('aria-selected', tab.active ? 'true' : 'false');
+    var label = childByClass(node, 'home-name');
+    if (label) label.textContent = name;
+  }
+
+  function updateTab(node, tab) {
+    var titleText = String(tab.title == null ? tab.id : tab.title);
+    node.className = 'tab' + (tab.active ? ' active' : '');
+    node.title = titleText;
+    node.setAttribute('aria-selected', tab.active ? 'true' : 'false');
+    var label = childByClass(node, 'tab-title');
+    if (label) label.textContent = titleText;
+    var close = childByClass(node, 'tab-close');
+    if (close) close.setAttribute('aria-label', '关闭标签页：' + titleText);
+  }
+
   function render(state) {
     var tabs = state && Array.isArray(state.tabs) ? state.tabs : [];
     var host = D.getElementById('tabs');
     if (!host) return;
-    host.textContent = '';
+    host.setAttribute('role', 'tablist');
     var home = null;
     var rest = [];
     tabs.forEach(function (tab) {
@@ -91,8 +136,41 @@
       }
       rest.push(tab);
     });
-    if (home) renderHome(host, home);
-    rest.forEach(function (tab) { renderTab(host, tab); });
+    var desiredIds = (home ? ['main'] : []).concat(rest.map(function (t) { return String(t.id); }));
+    var sig = JSON.stringify({
+      home: home ? { title: nasName(home.title), active: !!home.active } : null,
+      rest: rest.map(function (t) {
+        return {
+          id: String(t.id),
+          title: String(t.title == null ? t.id : t.title),
+          active: !!t.active,
+          canClose: !!t.canClose,
+        };
+      }),
+    });
+    if (sig === renderedSig) return;
+    // 同一组标签（顺序不变、关闭钮结构不变）→ 原地更新文本/激活态。
+    // 关键是不要替换节点：用户 mousedown 之后的后台标题更新若触发重建，mouseup
+    // 会落在新节点上，点击就丢了。
+    var sameIds = desiredIds.length === renderedIds.length &&
+      desiredIds.every(function (id, i) { return id === renderedIds[i]; });
+    var canReuse = sameIds && !!renderedNodes.main &&
+      rest.every(function (t) { return !!renderedNodes[String(t.id)] === !!t.canClose; });
+    if (canReuse) {
+      updateHome(renderedNodes.main, home);
+      rest.forEach(function (t) { updateTab(renderedNodes[String(t.id)], t); });
+      renderedSig = sig;
+      scrollActive(host);
+      return;
+    }
+    // 标签集合/顺序/关闭钮结构变了：重建（这类变化是用户动作，不是标题抖动）。
+    host.textContent = '';
+    renderedNodes = Object.create(null);
+    if (home) renderedNodes.main = renderHome(host, home);
+    rest.forEach(function (tab) { renderedNodes[String(tab.id)] = renderTab(host, tab); });
+    renderedIds = desiredIds;
+    renderedSig = sig;
+    scrollActive(host);
   }
 
   /** 「桌面」元素：fnOS 品牌图标 + NAS 名称，固定最左、不可关闭。 */
@@ -103,6 +181,9 @@
     home.dataset.tabId = 'main';
     home.dataset.action = 'switch';
     home.title = name;
+    home.setAttribute('role', 'tab');
+    home.setAttribute('aria-selected', tab.active ? 'true' : 'false');
+    home.setAttribute('tabindex', '0');
     var img = D.createElement('img');
     img.src = 'icons/icon16.png';
     img.alt = 'fnOS';
@@ -113,18 +194,23 @@
     label.textContent = name;
     home.appendChild(label);
     host.appendChild(home);
+    return home;
   }
 
   /** 一个外部应用标签（固定 144px；关闭钮由 canClose 决定）。 */
   function renderTab(host, tab) {
     var item = D.createElement('div');
+    var titleText = String(tab.title == null ? tab.id : tab.title);
     item.className = 'tab' + (tab.active ? ' active' : '');
     item.dataset.tabId = String(tab.id);
     item.dataset.action = 'switch';
-    item.title = String(tab.title == null ? tab.id : tab.title);
+    item.title = titleText;
+    item.setAttribute('role', 'tab');
+    item.setAttribute('aria-selected', tab.active ? 'true' : 'false');
+    item.setAttribute('tabindex', '0');
     var title = D.createElement('span');
     title.className = 'tab-title';
-    title.textContent = String(tab.title == null ? tab.id : tab.title);
+    title.textContent = titleText;
     item.appendChild(title);
     if (tab.canClose) {
       var close = D.createElement('button');
@@ -133,9 +219,11 @@
       close.dataset.tabId = String(tab.id);
       close.textContent = GLYPH_CLOSE;
       close.title = '关闭标签页';
+      close.setAttribute('aria-label', '关闭标签页：' + titleText);
       item.appendChild(close);
     }
     host.appendChild(item);
+    return item;
   }
 
   /** minimize / maximize 按钮引用（供状态推送切换字形与禁用态）。 */
@@ -162,6 +250,7 @@
       b.dataset.action = action;
       b.textContent = glyph;
       b.title = title;
+      b.setAttribute('aria-label', title);
       host.appendChild(b);
       return b;
     };
@@ -178,6 +267,7 @@
     if (!maxBtn) return;
     maxBtn.textContent = max ? GLYPH_RESTORE : GLYPH_MAXIMIZE;
     maxBtn.title = max ? '还原' : '最大化';
+    maxBtn.setAttribute('aria-label', maxBtn.title);
   }
 
   /** 宿主推送的全屏状态 → 切换四角括号图标 / 提示，并处理窗口按钮的禁用态。 */
@@ -189,6 +279,7 @@
       if (icon) fullscreenBtn.appendChild(icon);
       fullscreenBtn.dataset.fsState = fullscreenOn ? 'exit' : 'enter';
       fullscreenBtn.title = fullscreenOn ? '退出全屏（Esc）' : '全屏';
+      fullscreenBtn.setAttribute('aria-label', fullscreenBtn.title);
     }
     // 全屏下任务栏已被藏起来：最小化会把用户困在一个没有任务栏的桌面；最大化对
     // fullscreen 窗口没有意义，还可能触发 toggle_maximize 把窗口退出全屏。两者禁用。
@@ -245,12 +336,71 @@
   }
 
   // 宿主推送口（Rust eval；单向、必须在脚本顶层就位——首条推送可能先于 boot 到达）。
+  function activeTabState() {
+    var tabs = latestTabs && Array.isArray(latestTabs.tabs) ? latestTabs.tabs : [];
+    for (var i = 0; i < tabs.length; i++) {
+      if (tabs[i].active) return { tabs: tabs, index: i, tab: tabs[i] };
+    }
+    return { tabs: tabs, index: -1, tab: null };
+  }
+
+  function titlebarSwitch(delta) {
+    var cur = activeTabState();
+    if (!cur.tabs.length) return;
+    var idx = cur.index >= 0 ? cur.index : 0;
+    var next = (idx + delta + cur.tabs.length) % cur.tabs.length;
+    var tab = cur.tabs[next];
+    if (tab && tab.id) invoke('tab_switch', { label: tab.id });
+  }
+
+  /** 标题栏有焦点时的快捷键：与 keys.js 的语义一致（只认物理 Ctrl）。 */
+  function onTitlebarKey(ev) {
+    if (!ev) return;
+    if (ev.key === 'Escape' && fullscreenOn) {
+      try { ev.preventDefault(); } catch (_e) { /* 不可取消也照发 */ }
+      invoke('set_fullscreen', { value: false });
+      return;
+    }
+    if (!ev.ctrlKey && !ev.altKey && !ev.metaKey && !ev.shiftKey
+      && (ev.key === 'Enter' || ev.key === ' ')) {
+      var target = ev.target;
+      if (target && target.dataset && target.dataset.action) {
+        try { ev.preventDefault(); } catch (_e) { /* 忽略 */ }
+        onClick(ev);
+        return;
+      }
+    }
+    if (!ev.ctrlKey || ev.altKey || ev.metaKey || ev.repeat) return;
+    var key = String(ev.key || '');
+    if (key === 'Tab') {
+      try { ev.preventDefault(); } catch (_e) {}
+      titlebarSwitch(ev.shiftKey ? -1 : 1);
+      return;
+    }
+    if (ev.shiftKey) return;
+    var lower = key.toLowerCase();
+    if (lower === 't') {
+      try { ev.preventDefault(); } catch (_e) {}
+      invoke('tab_new');
+      return;
+    }
+    if (lower === 'w') {
+      var cur = activeTabState();
+      if (cur.tab && cur.tab.id && cur.tab.id !== 'main') {
+        try { ev.preventDefault(); } catch (_e) {}
+        invoke('tab_close', { label: cur.tab.id });
+      }
+    }
+  }
+
   /** 合并高频标签状态推送：可见时每帧最多渲染一次；隐藏（全屏悬浮栏）时同步渲染，
    *  因为隐藏页面的 rAF 可能被节流/暂停，不能让标签条带着旧状态被唤出。 */
   var pendingTabs = null;
   var tabsScheduled = false;
+  var latestTabs = { tabs: [] };
   function scheduleTabs(state) {
     pendingTabs = state;
+    latestTabs = state || { tabs: [] };
     if (typeof W.requestAnimationFrame !== 'function' || (D && D.hidden)) {
       render(state);
       return;
@@ -273,13 +423,17 @@
     bar.style.height = STRIP_H + 'px';
     renderControls();
     D.addEventListener('click', onClick);
-    // 焦点在标题栏时（点过按钮/标签条）Esc 也要能退出全屏；内容区由 keys.js 上报。
-    D.addEventListener('keydown', function (ev) {
-      if (ev.key === 'Escape' && fullscreenOn) {
-        try { ev.preventDefault(); } catch (_e) { /* 不可取消也照发 */ }
-        invoke('set_fullscreen', { value: false });
-      }
-    });
+    // 焦点在标题栏时也要有 Esc / Ctrl+T/W/Tab（内容区由 keys.js 处理）。
+    D.addEventListener('keydown', onTitlebarKey);
+    // 标签溢出：滚轮映射到标签区的横向滚动
+    var tabsEl = D.getElementById('tabs');
+    if (tabsEl && typeof tabsEl.addEventListener === 'function') {
+      tabsEl.addEventListener('wheel', function (ev) {
+        if (Math.abs(ev.deltaY) <= Math.abs(ev.deltaX)) return;
+        tabsEl.scrollLeft += ev.deltaY;
+        try { ev.preventDefault(); } catch (_e) { /* 不可取消就算了 */ }
+      }, { passive: false });
+    }
     // 双击标签条空白区 = 最大化 / 还原（系统标题栏的标准语义）
     bar.addEventListener('dblclick', function (ev) {
       if (fullscreenOn) return; // 全屏下双击不得把窗口 toggle_maximize 出去

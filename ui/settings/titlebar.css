@@ -45,8 +45,12 @@ body {
 /* 整条标签区拉满栏高（平铺样式的点击区更大，文字垂直居中） */
 .tabs {
   display: flex; align-items: center; gap: 6px; min-width: 0;
-  align-self: stretch; overflow: hidden;
+  align-self: stretch;
+  /* 标签多到超出宽度时可横向滚动（隐藏滚动条，滚轮在 titlebar.js 里映射） */
+  overflow-x: auto; overflow-y: hidden;
+  scrollbar-width: none;
 }
+.tabs::-webkit-scrollbar { display: none; }
 .tab {
   display: flex; align-items: center; gap: 4px;
   /* 固定 144px（用户定值）：标题过长在预留的关闭钮空间内省略号截断，
@@ -70,7 +74,8 @@ body {
    * 按钮始终占 14px 位，悬浮出现时标题不跳动（144px 固定宽下标题截断位置恒定） */
   visibility: hidden;
 }
-.tab:hover .tab-close { visibility: visible; }
+.tab:hover .tab-close,
+.tab:focus-within .tab-close { visibility: visible; }
 .tab .tab-close:hover { background: var(--close-hover); color: #fff; }
 /* 标签区与「+」之间的 1px 整高分隔线（用户参考图） */
 .bar-sep { flex: 0 0 auto; width: 1px; align-self: stretch; background: var(--bar-line); }
@@ -103,4 +108,13 @@ body {
 .controls .win-btn.fullscreen svg path {
   fill: none; stroke: currentColor; stroke-width: 1.3;
   stroke-linecap: square; stroke-linejoin: miter;
+}
+/* 键盘可达性：标签/首页是 tabindex=0 的 div，必须看得见焦点 */
+.home:focus-visible,
+.tab:focus-visible,
+.new-tab:focus-visible,
+.tab-close:focus-visible,
+.controls .win-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
 }

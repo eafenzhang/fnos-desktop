@@ -22,10 +22,19 @@ function fakeEnv(opts = {}) {
     document: doc,
     top: null,
     self: null,
+    location: { origin: 'https://nas.example.com' },
     setTimeout(fn, ms) { timers.push({ fn, ms }); return timers.length; },
     clearTimeout() {},
   };
-  win.top = win;
+  if (opts.childOf) {
+    win.top = {
+      location: { origin: 'https://nas.example.com' },
+      _msgs: [],
+      postMessage(msg, origin) { this._msgs.push({ msg, origin }); },
+    };
+  } else {
+    win.top = win;
+  }
   win.self = win;
   return { win, doc, listeners, timers };
 }
@@ -71,7 +80,9 @@ test('源码级：只认白名单动作（含 Esc 退出全屏）、只认物理
   assert.ok(KEYS.includes('isContentEditable'), '编辑区不得抢键');
   assert.ok(!KEYS.includes('innerHTML'), '不写页面内容');
   assert.ok(!KEYS.includes('invoke('), '不开 IPC（走既有的标题通道）');
-  assert.ok(KEYS.includes('W.top === W.self'), '只在顶层文档工作');
+  assert.ok(KEYS.includes('W.top === W.self'), '顶层文档自己处理');
+  assert.ok(KEYS.includes('postMessage') && KEYS.includes('FNOSKEY_RELAY'),
+    '同源 iframe 必须把白名单动作转发给顶层');
 });
 
 test('Ctrl+T → new，Ctrl+W → close，Ctrl+Tab → next，Ctrl+Shift+Tab → prev', () => {
@@ -123,6 +134,35 @@ test('Esc → exit-fullscreen：只上报给宿主，不吞页面自己的 Esc',
   assert.equal(ev.stopped, false, '不得阻止冒泡');
   env.timers[env.timers.length - 1].fn();
   assert.equal(env.doc.title, 'fnOS 桌面', '控制标题必须还原');
+});
+
+test('上报控制标题占用 title 时，快捷键延后而不是覆盖/回放控制串', () => {
+  const env = fakeEnv();
+  env.doc.title = 'FNOSREPORT:{"type":"FNOS_GET_LAUNCHPAD_APP_ITEMS"}';
+  load(env);
+  press(env, key({ key: 't' }));
+  assert.equal(env.doc.title, 'FNOSREPORT:{"type":"FNOS_GET_LAUNCHPAD_APP_ITEMS"}',
+    '不得抢写正在传输的上报标题');
+  assert.equal(env.timers.length, 1, '必须排一个延后重试');
+  env.doc.title = 'fnOS 桌面';
+  env.timers[0].fn();
+  assert.equal(env.doc.title, 'FNOSKEY:new', '上报结束后再发快捷键');
+  env.timers[env.timers.length - 1].fn();
+  assert.equal(env.doc.title, 'fnOS 桌面', '控制标题最终要还给页面');
+});
+
+test('同源 iframe：快捷键转发给顶层；Esc 不吞页面事件', () => {
+  const env = fakeEnv({ childOf: true });
+  load(env);
+  const ev = press(env, key({ key: 't' }));
+  assert.equal(env.win.top._msgs.length, 1, 'Ctrl+T 必须转给顶层');
+  assert.equal(env.win.top._msgs[0].msg.action, 'new');
+  assert.equal(env.win.top._msgs[0].origin, 'https://nas.example.com', 'postMessage 必须限定同源');
+  assert.equal(ev.prevented, true, '消费掉的快捷键在 iframe 里也要 preventDefault');
+  const esc = press(env, key({ key: 'Escape', ctrlKey: false }));
+  assert.equal(env.win.top._msgs.length, 2);
+  assert.equal(env.win.top._msgs[1].msg.action, 'exit-fullscreen');
+  assert.equal(esc.prevented, false, 'Esc 不吞 iframe 页面自己的行为');
 });
 
 test('编辑区（input / textarea / contenteditable）：会关掉东西的两个不抢，切标签照常', () => {

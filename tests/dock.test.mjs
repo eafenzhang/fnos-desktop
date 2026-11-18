@@ -262,6 +262,20 @@ test('全屏与自动隐藏叠加：退出后交还 auto-hide，不拆它的接�
   assert.equal(w.__FNOS_DOCK_STATE__().fullscreen, false);
 });
 
+test('关闭自动隐藏：先卸预留清除表，再派发 resize（fnOS 必须按真实布局重排）', () => {
+  const doc = fakeDom();
+  const order = [];
+  doc._win.__FNOS_SHELL_CSS__ = { setDockReclaim: (on) => order.push('dock:' + on) };
+  doc._win.dispatchEvent = (e) => { if (e && e.type === 'resize') order.push('resize'); return true; };
+  const w = load(doc, { dockAutoHide: true });
+  const dock = fakeEl({ w: 68, h: 800, left: 0, hasList: true });
+  doc._candidates = [dock];
+  settle(doc);
+  order.length = 0;
+  w.__FNOS_APPLY_SHELL__({ dockAutoHide: false });
+  assert.deepEqual(order, ['dock:false', 'resize'], '必须先卸样式表再 resize');
+});
+
 // ---------- 定位策略 ----------
 
 test('关闭自动隐藏会取消待触发的 locate（不得在关掉后又把 Dock 藏起来）', () => {

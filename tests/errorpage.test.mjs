@@ -44,8 +44,11 @@ test('错误页把失败地址 / 原因 / 下一步 / 自动重试退避都画�
   for (const id of ['eurl', 'ereason', 'erretry', 'ertips']) {
     assert.ok(HTML.includes(`id="${id}"`), `缺少 id=${id} 的节点`);
   }
-  assert.ok(HTML.includes('重新加载主窗口'), '必须告诉用户托盘里的重试入口');
-  assert.ok(HTML.includes('设置窗'), '必须告诉用户设置窗里的重试入口');
+  assert.ok(HTML.includes('「重新加载」'), '必须使用托盘菜单的真实名称');
+  assert.ok(
+    !HTML.includes('重新加载主窗口') && !HTML.includes('设置窗'),
+    '不得再指向已不存在的旧入口（托盘名不符 / 设置窗状态条已移除）'
+  );
   // 退避用尽后的那一支：不谎称「还会重试」，也不谎报次数语义（failures = 连续失败次数）
   assert.ok(HTML.includes('自动重试已停止'), '退避用尽时必须明确说自动重试已停止');
   assert.ok(HTML.includes('已连续失败'), '必须按「连续失败次数」而不是「已重试次数」措辞');

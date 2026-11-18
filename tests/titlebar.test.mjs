@@ -24,6 +24,7 @@ function fakeTitlebar() {
     appendChild(child) { this.children.push(child); },
     setAttribute(k, v) { this.attributes[k] = v; },
     addEventListener(type, fn) { events.push([type, fn]); },
+    scrollIntoView(opts) { this._scrolled = opts || {}; },
     // 真实 DOM 语义：置空 textContent 会清掉所有子节点（render 靠它做幂等）
     set textContent(v) { if (v === '') this.children.length = 0; this._text = v; },
     get textContent() { return this._text || ''; },
@@ -35,7 +36,8 @@ function fakeTitlebar() {
     getElementById(id) { return this._els[id] || null; },
     createElement(tag) { return el(tag); },
     createElementNS(_ns, tag) { return el(tag); },
-    addEventListener() {},
+    _listeners: {},
+    addEventListener(type, fn) { this._listeners[type] = fn; },
   };
   doc.body.classList = {
     _set: new Set(),
@@ -79,11 +81,17 @@ test('渲染：main 合并为最左「桌面」元素（品牌图标 + NAS 名�
   const name = home.children.find((c) => c.className === 'home-name');
   assert.equal(name.textContent, 'MiniNas', 'NAS 名称 = 页面标题剥掉「- 飞牛 fnOS」后缀');
   assert.ok(!home.children.some((c) => c.className === 'tab-close'), '桌面元素不可关闭');
+  assert.equal(home.attributes.role, 'tab');
+  assert.equal(home.attributes['aria-selected'], 'true');
   // 外部标签照旧渲染在桌面元素之后
   const tab = kids[1];
   assert.equal(tab.dataset.tabId, 'tab-1');
   assert.ok(tab.className.includes('tab') && !tab.className.includes('active'));
   assert.ok(tab.children.some((c) => c.className === 'tab-close'));
+  assert.equal(tab.attributes.role, 'tab');
+  assert.equal(tab.attributes['aria-selected'], 'false');
+  const closeBtn = tab.children.find((c) => c.className === 'tab-close');
+  assert.equal(closeBtn.attributes['aria-label'], '关闭标签页：hermes-studio');
   // 再推一次：幂等（不叠加）
   w.__FNOS_TABS_SET__({
     tabs: [
@@ -92,6 +100,21 @@ test('渲染：main 合并为最左「桌面」元素（品牌图标 + NAS 名�
     ],
   });
   assert.equal(doc.getElementById('tabs').children.length, 2);
+  // 仅标题变化：原地更新，不替换节点（否则点击会被打断）
+  const firstTabNode = doc.getElementById('tabs').children[1];
+  w.__FNOS_TABS_SET__({
+    tabs: [
+      { id: 'main', title: 'MiniNas - 飞牛 fnOS', active: true, canClose: false },
+      { id: 'tab-1', title: 'hermes-2', active: false, canClose: true },
+    ],
+  });
+  assert.equal(doc.getElementById('tabs').children[1], firstTabNode, '标题变化不得替换节点');
+  assert.equal(
+    firstTabNode.children.find((c) => c.className === 'tab-title').textContent,
+    'hermes-2',
+    '原地更新标题文本'
+  );
+  assert.equal(firstTabNode.attributes['aria-selected'], 'false');
 });
 
 test('用户参考图样式：平铺标签、激活蓝色、首页固定最左不可关、+ 前有 1px 分隔线', () => {
@@ -145,6 +168,10 @@ test('窗口控制：系统图标字体的 ─ □ ×（46px 整高），点击�
   const controls = doc.getElementById('controls').children;
   assert.deepEqual(controls.map((b) => b.dataset.action), ['fullscreen', 'minimize', 'maximize', 'close']);
   assert.equal(controls[0].className, 'win-btn fullscreen');
+  assert.equal(controls[0].attributes['aria-label'], '全屏');
+  assert.equal(controls[1].attributes['aria-label'], '最小化');
+  assert.equal(controls[2].attributes['aria-label'], '最大化');
+  assert.equal(controls[3].attributes['aria-label'], '关闭');
   assert.equal(controls[1].className, 'win-btn');
   assert.equal(controls[2].className, 'win-btn maximize');
   assert.equal(controls[3].className, 'win-btn close', '关闭钮必须带 close class（悬停红）');
@@ -166,6 +193,7 @@ test('窗口控制：系统图标字体的 ─ □ ×（46px 整高），点击�
   w.__FNOS_WIN_FULLSCREEN_SET__(true);
   assert.equal(controls[0].dataset.fsState, 'exit', '全屏状态切到退出图标');
   assert.ok(controls[0].title.includes('退出全屏'));
+  assert.equal(controls[0].attributes['aria-label'], '退出全屏（Esc）');
   assert.ok(controls[0].children.some((c) => c.tagName === 'SVG'), '退出态仍是四角括号 SVG');
   assert.equal(controls[1].disabled, true, '全屏下最小化必须禁用（任务栏被藏起来）');
   assert.equal(controls[2].disabled, true, '全屏下最大化必须禁用（会 toggle 退出全屏）');
@@ -179,6 +207,43 @@ test('窗口控制：系统图标字体的 ─ □ ×（46px 整高），点击�
   }
   assert.ok(TB_JS.includes("invoke('set_fullscreen', { value: !fullscreenOn })"),
     '全屏按钮必须调用宿主 set_fullscreen 命令');
+});
+
+test('标签溢出：激活标签滚入可见区；标题栏内 Ctrl+T/W/Tab 可用', () => {
+  const { doc } = fakeTitlebar();
+  const w = loadTitlebar(doc);
+  const tabs = [{ id: 'main', title: 'MiniNas', active: false, canClose: false }];
+  for (let i = 1; i < 10; i++) {
+    tabs.push({ id: 'tab-' + i, title: 'app ' + i, active: i === 8, canClose: true });
+  }
+  w.__FNOS_TABS_SET__({ tabs });
+  const host = doc.getElementById('tabs');
+  const active = host.children.find((c) => String(c.className).split(/\s+/).includes('active'));
+  assert.ok(active, '必须有激活标签');
+  assert.ok(active._scrolled, '激活标签必须滚入可见区');
+  const mk = (over) => ({
+    key: 'Tab', ctrlKey: true, shiftKey: false, altKey: false, metaKey: false,
+    repeat: false, prevented: false,
+    preventDefault() { this.prevented = true; },
+    ...over,
+  });
+  let ev = mk({});
+  doc._listeners.keydown(ev);
+  assert.deepEqual(w._invokes[w._invokes.length - 1], ['tab_switch', { label: 'tab-9' }],
+    'Ctrl+Tab 必须切到下一个标签');
+  assert.equal(ev.prevented, true);
+  ev = mk({ shiftKey: true });
+  doc._listeners.keydown(ev);
+  assert.deepEqual(w._invokes[w._invokes.length - 1], ['tab_switch', { label: 'tab-7' }],
+    'Ctrl+Shift+Tab 必须切到上一个标签');
+  ev = mk({ key: 'w' });
+  doc._listeners.keydown(ev);
+  assert.deepEqual(w._invokes[w._invokes.length - 1], ['tab_close', { label: 'tab-8' }],
+    'Ctrl+W 必须关闭当前标签');
+  ev = mk({ key: 't' });
+  doc._listeners.keydown(ev);
+  assert.deepEqual(w._invokes[w._invokes.length - 1], ['tab_new', undefined],
+    'Ctrl+T 必须新开标签');
 });
 
 test('点击分发：标签切换 / 关闭 / 新建都带上正确的命令与参数', () => {
@@ -207,11 +272,17 @@ test('纪律：不碰页面内容、高度 32 跨语言一致、授权面精确'
   assert.ok(TB_JS.includes('STRIP_H = 32'), '栏高 32 与 Rust TAB_STRIP_H 一致');
   assert.ok(TB_JS.includes('requestAnimationFrame') && TB_JS.includes('scheduleTabs'),
     '高频标签状态推送必须按帧合并（隐藏时同步渲染）');
+  assert.ok(TB_CSS.includes('overflow-x: auto') && TB_CSS.includes('scrollbar-width: none'),
+    '标签溢出时必须横向滚动（隐藏滚动条）');
+  assert.ok(TB_JS.includes('scrollIntoView') && TB_JS.includes('onTitlebarKey'),
+    '激活标签要滚入可见区；标题栏要有 Ctrl+T/W/Tab');
   // 系统标题栏一致性（修复轮 4）：图标必须走系统字体栈，按钮 46px 整高
   assert.ok(TB_CSS.includes('"Segoe Fluent Icons"') && TB_CSS.includes('"Segoe MDL2 Assets"'),
     '窗口按钮必须用系统图标字体（与 Windows 标题栏同款字形）');
   assert.ok(TB_CSS.includes('width: 46px'), '按钮宽度必须与系统标题栏一致（46px）');
   assert.ok(TB_CSS.includes('.controls .win-btn.fullscreen svg'), '全屏按钮必须有 SVG 图标样式');
+  assert.ok(TB_CSS.includes(':focus-visible') && TB_CSS.includes(':focus-within'),
+    '键盘焦点与关闭钮的 focus-within 可见性必须有样式');
   // 标签固定 144px（用户定值）：关闭钮预留位、标题 flex 截断省略号
   assert.ok(TB_CSS.includes('width: 144px; min-width: 144px; max-width: 144px;'),
     '标签必须固定 144px 宽');
@@ -221,8 +292,9 @@ test('纪律：不碰页面内容、高度 32 跨语言一致、授权面精确'
   // 关闭钮：默认隐藏、鼠标悬浮才显示（用户要求）；用 visibility 保留占位
   assert.ok(/\.tab \.tab-close \{[^}]*visibility: hidden;/s.test(TB_CSS),
     '关闭钮默认必须隐藏');
-  assert.ok(TB_CSS.includes('.tab:hover .tab-close { visibility: visible; }'),
-    '鼠标悬浮标签时关闭钮必须显示');
+  assert.ok(
+    /\.tab:hover \.tab-close,\s*\.tab:focus-within \.tab-close \{ visibility: visible; \}/.test(TB_CSS),
+    '鼠标悬浮/键盘焦点时关闭钮必须显示');
   assert.ok(!/\.tab \.tab-close \{[^}]*display: none/s.test(TB_CSS),
     '不得用 display:none（会丢占位，悬浮时标题跳动）');
   // 授权面：三个标签页命令 + 窗口控制（含全屏）+ 拖拽，别无其它

@@ -207,7 +207,7 @@ pub fn parse_web_url(raw: &str) -> Option<Url> {
     if !matches!(url.scheme(), "http" | "https") {
         return None;
     }
-    if url.host_str().map_or(true, str::is_empty) {
+    if url.host_str().is_none_or(str::is_empty) {
         return None;
     }
     Some(url)
@@ -999,6 +999,16 @@ impl Config {
             return (Config::default(), write_backup(path, &text));
         }
 
+        // 新版本 schema 不能被旧版本静默降级（normalize 会把它改回 1，未知字段还会
+        // 在下一次保存时被丢掉）。按「无法安全解释」处理：留 .bak，用默认值启动。
+        if value
+            .get("schemaVersion")
+            .and_then(Value::as_u64)
+            .is_some_and(|v| v > SCHEMA_VERSION as u64)
+        {
+            return (Config::default(), write_backup(path, &text));
+        }
+
         match serde_json::from_value::<Config>(sanitize_config_value(value)) {
             Ok(mut c) => {
                 c.normalize();
@@ -1366,6 +1376,25 @@ mod tests {
         assert_eq!(std::fs::read(&bak).unwrap(), corrupt);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 新版本 schema 不能被旧版本静默降级/覆盖：留 .bak、用默认值启动、原文件不动。
+    #[test]
+    fn newer_schema_is_not_downgraded_or_overwritten() {
+        let dir = temp_dir("newer-schema");
+        let p = dir.join("config.json");
+        let text = r##"{"schemaVersion":999,"mods":{"brandColor":"#336699"}}"##;
+        std::fs::write(&p, text).unwrap();
+        let (c, report) = Config::load_with_report(&p);
+        assert_eq!(c.schema_version, SCHEMA_VERSION);
+        assert_eq!(c.mods.brand_color, DEFAULT_BRAND_COLOR, "不能按旧 schema 解释新配置");
+        assert!(report.recovered_from_backup, "必须留 .bak 证据");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("config.json.bak")).unwrap(),
+            text
+        );
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), text, "原文件不得被改写");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 「旧版本 / 缺字段」必须补齐为**上游默认值**，而不是类型零值：

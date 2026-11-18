@@ -1,16 +1,18 @@
 [package]
 name = "fnos-desktop"
-version = "0.3.17"
+version = "0.3.18"
 edition = "2021"
 build = "build.rs"
 
 [build-dependencies]
-tauri-build = { version = "2", features = [] }
+# 多 Webview 依赖 tauri 2.12 的 unstable API（Window::add_child / NewWindowResponse::Create）；
+# 精确锁定，避免一次 cargo update 把 2.13 的破坏性变更带进来。
+tauri-build = { version = "=2.7.0", features = [] }
 
 [dependencies]
 # T14d：`unstable` 开启多 Webview（`Window::add_child`）——标签页栏 = 独立 Webview，
 # 每个标签页 = 主窗口里的一个子 Webview。这是 tauri 2 对多 Webview 的门（桌面端稳定可用）。
-tauri = { version = "2", features = ["tray-icon", "image-png", "unstable"] }
+tauri = { version = "=2.12.0", features = ["tray-icon", "image-png", "unstable"] }
 tauri-plugin-single-instance = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -29,10 +31,9 @@ sha2 = "0.10"
 # 原生 MessageBoxW：检查结果要能从托盘动作直接反馈给用户（release 无控制台，
 # 主窗口页面也不是放这条消息的地方——那是 fnOS 的 WebUI）。
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
-# 全屏悬浮标题栏：拿 WebView2 子窗口的 HWND（controller.ParentWindow），再用
-# SetWindowPos 把它提到内容 Webview 之上——Tauri 的 child Webview 没有暴露 z-order。
-# 版本与 tauri 2.12 锁定的 webview2-com 一致，不会引入第二份 COM 绑定。
-webview2-com = "0.39"
+# 全屏悬浮标题栏：通过 Tauri 的 PlatformWebview::controller() 调 ParentWindow 拿子窗口
+# HWND，再用 SetWindowPos 提到内容 Webview 之上。webview2-com 是 tauri 的传递依赖，
+# 不在本清单重复声明（避免将来锁出第二份版本）。
 
 [profile.release]
 lto = true

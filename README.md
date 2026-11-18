@@ -12,9 +12,12 @@
 ## 功能
 
 - **桌面窗口**：把 fnOS WebUI（默认 `https://fnos.net/`，可配置为自己的 NAS 地址）装进
-  独立窗口；只有命中 fnOS WebUI 的页面才注入，其余站点原样浏览。
-- **托盘常驻**：显示窗口 / 重新加载 / 系统设置 / 检查更新 / 退出；关闭窗口默认收到托盘
-  （`closeToTray` 可关）。
+  独立窗口；只有命中 fnOS WebUI 的页面才注入，其余站点原样浏览。完整载荷还带**运行时
+  origin 闸门**：同一个 Webview 里导航到第三方站点后，`__FNOS_SHELL__`、mods、dock、
+  keepalive 立即停止执行；`FNOSREPORT:` / `FNOSPROBE:` / `FNOSCHUNK:` 控制标题也只接受
+  配置过的 fnOS origin。
+- **托盘常驻**：左键单击显示/前置主窗口；右键菜单含 显示窗口 / 重新加载 / 系统设置 /
+  检查更新 / 退出；关闭窗口默认收到托盘（`closeToTray` 可关）。
 - **检查更新 + 自动升级**：托盘一键检查 GitHub Releases；有新版本时**自动下载安装包**
   （下载到配置目录 `updates\`，同名复用前先校验、`.part` 原子落盘 + 进程内唯一名、
   体积健全性校验、**sha256 与 release 的 `assets[].digest` 比对**），确认后
@@ -23,6 +26,15 @@
 - **多标签页 + 自带标题栏**：主窗口是无边框窗口，顶部一条自绘栏（品牌图标 + 标签 + ─ □ ×）；
   fnOS 里 `window.open` 出来的外部应用开成标签页而不是独立窗口，同一页面被反复
   `window.open` 时**复用切换、不重复开**（FN Connect 中继流程靠这条止血）。
+  标签条支持 `Ctrl+T` / `Ctrl+W` / `Ctrl+Tab` / `Ctrl+Shift+Tab`，带 `role=tab` /
+  `aria-selected`、键盘焦点与横向滚动，标签多时当前页自动滚入视野。
+- **登录 / 授权弹窗**：OAuth、SSO 与 `about:blank` 弹窗走原生 WebView2 弹窗，保留
+  `window.opener`、`window.open` 返回值与 `window.close()`；只有落在配置的 fnOS origin
+  上的文档才注入完整载荷，GitHub / Google / DeepSeek 等第三方登录页不执行任何壳代码。
+  直接 `window.open('/signin')` 的弹窗首个文档还有页面加载后的补注入兜底。
+- **全屏**：标题栏最小化左侧的全屏按钮；全屏时隐藏 fnOS Dock 与 **主屏 + 副屏** Windows
+  任务栏，标题栏也隐藏，鼠标移到顶部时悬浮显示；`Esc` 或按钮退出。任务栏隐藏期间写
+  `taskbar-hidden.flag`，进程被强杀后下次启动会自动恢复，不会把桌面留在「无任务栏」状态。
 - **本地日志**：所有 `[fnos]` 日志同时写 `%APPDATA%\com.fnos.desktop\app.log`
   （4 MiB 轮转；`FNOS_LOG=0` 关）——release 版没有控制台，这是唯一可回传的现场。
 - **Dock 自动隐藏**（`inject/dock.js`，默认关，设置里开）：平时滑出屏幕、指针顶到边缘
@@ -35,11 +47,12 @@
 - **登录保活**（`inject/keepalive.js`）：fnOS 登录态是会话级 cookie，桌面闲置久了会失效；
   本壳按 `keepAliveMinutes`（默认 10 分钟，0 = 关）在同源上请求一次令牌接口续期。
   路径写死 + 同源校验，无用户可控 URL。
-- **设置窗 = 上游原版界面**：设置窗里就是上游扩展自己的 popup UI（字节不改动，
-  装在 iframe 里），经本壳的 `chrome.*` 兼容层直接读写真实配置，改完免刷新生效。
+- **设置窗 = 上游原版界面**：设置窗里就是上游扩展自己的 popup UI（`popup.js` 逐字节
+  不改动；`popup.html` 仅多一行 `chrome-shim.js` 引入，见 `NOTICE`），装在 iframe 里，
+  经本壳的 `chrome.*` 兼容层直接读写真实配置，改完免刷新生效。
   「完美图标」（启动台图标形状统一 / 逐项重绘）等上游功能在本壳下完整可用。
 - **内置错误页与自动重试**：加载失败 / 离线时切到内置错误页（15s → 30s → 60s → 120s
-  退避，第 5 次停止），也可手动重试。
+  退避，第 5 次停止）；托盘「重新加载」可手动重试。
 
 ## 安装
 
@@ -120,10 +133,10 @@ npm test                    # 前端契约测试（shim / bootstrap / dock / win
 | 路径 | 内容 |
 |---|---|
 | `src-tauri/src/` | Rust 侧：`paths`（配置/资源路径）、`config`（配置与归一化）、`injector`（注入载荷与资产嵌入）、`logfile`（release 版日志落盘）、`tray`（托盘）、`updater`（检查更新 / 自动下载 / 校验 / 静默安装）、`commands`（IPC + 窗口 / 错误页 / 加载观测 / 标签页） |
-| `src-tauri/inject/` | `shim.js`（页面侧 chrome.\* 兼容层 + 上报通道）、`bootstrap.js`（配置装配与注入闸门）、`dock.js`（Dock 自动隐藏 + 空间回收）、`keepalive.js`（登录保活）、`windowpos.js`（桌面内窗口居中 / 最大化往返跟随） |
+| `src-tauri/inject/` | `shim.js`（页面侧 chrome.\* 兼容层 + 上报通道）、`bootstrap.js`（配置装配与注入闸门）、`dock.js`（Dock 自动隐藏 + 空间回收）、`keepalive.js`（登录保活）、`windowpos.js`（桌面内窗口居中 / 最大化往返跟随）、`keys.js`（标签快捷键 + 同源 iframe 转发） |
 | `src-tauri/assets/fnos-mods/` | 上游 vendored 资源 + `LICENSE` + `NOTICE`（provenance 与 SHA-256 表） |
-| `ui/settings/` | 设置窗前端（零依赖、零构建链）：上游 `popup.html`/`popup.js` 逐字节副本 + `chrome-shim.js`（iframe 里的 chrome.\* 兼容层）+ `app.js`（宿主桥）+ `titlebar.*`（一行式标签栏）+ 内置错误页 |
-| `tests/` | Node 契约测试（151 项）与 Rust 单测（126 项） |
+| `ui/settings/` | 设置窗前端（零依赖、零构建链）：上游 `popup.js` 逐字节副本 + `popup.html`（仅多一行 `chrome-shim.js` 引入）+ `chrome-shim.js`（iframe 里的 chrome.\* 兼容层）+ `app.js`（宿主桥）+ `titlebar.*`（一行式标签栏）+ 内置错误页 |
+| `tests/` | Node 契约测试（173 项）与 Rust 单测（146 项） |
 | `docs/` | 设计文档与验收记录 |
 | `.github/workflows/` | 测试门禁 / 自动构建 / 发版 |
 
@@ -131,21 +144,25 @@ npm test                    # 前端契约测试（shim / bootstrap / dock / win
 
 | 现象 | 行为 |
 |---|---|
-| 页面不是 fnOS WebUI | 上游签名判定不注入；设置窗提示并支持一键加白名单 |
+| 页面不是 fnOS WebUI | 上游签名判定不注入；运行时 origin 闸门再拦一次；设置窗提示并支持一键加白名单 |
 | 外链 CSS 被拦 / `mod.js` 的 data URL 被拦 | `adoptedStyleSheets` 兜底 / 兜底执行原始脚本 |
-| 主窗口加载失败 / 离线 | 内置错误页 + 三种重试入口 + 自动退避（第 5 次停止） |
+| 主窗口加载失败 / 离线 | 内置错误页 + 托盘「重新加载」+ 自动退避（第 5 次停止） |
 | 页面 20 秒不完成 | 看门狗兜底判失败 |
 | `config.json` 损坏 | 回退默认值，原文件保留为 `.bak` |
+| `config.json` 来自更高版本 | 不降级覆盖；原文件备份为 `.bak`，本次用默认配置启动 |
+| 全屏时进程被强杀 | 留下 `taskbar-hidden.flag`；下次启动无条件恢复主副屏任务栏并清除标记 |
+| 第三方登录页（GitHub / Google / DeepSeek） | 原生弹窗保留登录语义，但运行时闸门拒绝执行全部 mods / shim |
 | 检查更新网络失败 | 托盘弹窗如实告知，绝不静默 |
 | 下载的安装包校验失败 | 比对 GitHub Release 的 `assets[].digest`（sha256）；不匹配即丢弃重下，绝不执行 |
 | 重复点「检查更新」 | 有重入闸门：第二次点击直接提示「正在检查 / 下载更新」，不并发下载 |
-| 第三方应用页乱写 `document.title` | 上报/探针通道只认主标签，外部页无法伪造加载失败或覆盖状态证据 |
+| 第三方应用页乱写 `document.title` | 控制标题只接受配置过的 fnOS origin，外部页无法伪造加载失败或覆盖状态证据 |
 
 ## 已知限制
 
 - **不含字体文件**：上游 popup 的字体导入控件在上游 HTML 里本就是注释掉的；
   `customFont*` 写入请求被如实拒绝（不假装成功）。字体覆盖只能用本机已装字体或网络字体。
-- **载荷约 423KB / 每次导航**（7 个 CSS + `mod.js` + `content-script.js`），每次导航重新注入。
+- **完整载荷约 423KB / 每次导航**（7 个 CSS + `mod.js` + `content-script.js`），只发给
+  桌面根页面与登录/授权页；`/p`、`/seek` 这类应用标签只注入几 KB 的快捷键核心脚本。
   脚本正文按配置指纹缓存在内存里，开新标签页不再重读壁纸 / 重做 base64。
 - **失败判定只覆盖首次导航**：页面内跳转失败不切错误页。
 - **release 版没有控制台**（`windows_subsystem = "windows"`）：日志落在

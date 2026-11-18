@@ -5,7 +5,7 @@
 # - push 标签 v*：测试 → 构建 → 创建 GitHub Release 并上传 NSIS 安装包 —— 这就是「发布新版本」。
 #   （tauri-action 的 tagName 为空时不建 Release，只构建——同一份 job 承载两条线。）
 #
-# 为什么测试要进 CI：本仓有 126 项 Rust 单测 + 151 项前端契约测试（含大量「源码级锁」，
+# 为什么测试要进 CI：本仓有 146 项 Rust 单测 + 173 项前端契约测试（含大量「源码级锁」，
 # 锁的是跨语言常量、授权面、注入段序这类**编译期看不出来**的不变式）。此前它们只在本地跑，
 # 发版靠 `git tag && git push` 直接出包——测试红了也照样发。测试 job 失败会直接拦住
 # 后面的 build job（`needs: test`），发版流程因此有了一道真正的门。
@@ -25,7 +25,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write # 发 Release 需要写权限（冒烟构建只读不到它）
+  contents: read # 默认最小权限；只有 build job 需要写 Release
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -61,15 +61,16 @@ jobs:
         working-directory: src-tauri
         run: cargo test --all-targets --locked
 
-      # clippy 先作为**告警**门禁（不 -D warnings）：既有基线有若干条风格告警，
-      # 这里至少保证 deny 级别的错误与明显回归在 CI 里能看见。
+      # clippy 现在是**硬门禁**（-D warnings）：基线已清零，新告警会直接拦住发版。
       - name: Rust lint (clippy)
         working-directory: src-tauri
-        run: cargo clippy --all-targets --locked
+        run: cargo clippy --all-targets --locked -- -D warnings
 
   build:
     needs: test
     runs-on: windows-latest
+    permissions:
+      contents: write # 只有发布 job 需要创建/发布 Release
     steps:
       - uses: actions/checkout@v4
 

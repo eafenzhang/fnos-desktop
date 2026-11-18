@@ -38,16 +38,62 @@
   var D = W.document;
   if (!D || typeof D.addEventListener !== 'function') return;
 
-  // 只在顶层文档工作（与 dock.js / keepalive.js 同一条纪律）
+  // 顶层文档自己处理；**同源 iframe** 把白名单动作转给顶层（fnOS 的应用窗口就是 iframe）。
+  // 跨源 iframe 一律不转：它们没有资格触发标签操作。
   var isTopFrame = false;
-  try { isTopFrame = W.top === W.self; } catch (e) { isTopFrame = false; }
-  if (!isTopFrame) return;
+  var relayTop = null;
+  try {
+    isTopFrame = W.top === W.self;
+    if (!isTopFrame && W.top && W.top.location
+      && W.top.location.origin === W.location.origin) {
+      relayTop = W.top;
+    }
+  } catch (e) { isTopFrame = false; relayTop = null; }
+  if (!isTopFrame && !relayTop) return;
 
   var KEY_TITLE_PREFIX = 'FNOSKEY:';
+  var RELAY_TYPE = 'FNOSKEY_RELAY';
+  var ACTIONS = { next: 1, prev: 1, close: 1, new: 1, 'exit-fullscreen': 1 };
   var RESTORE_DELAY_MS = 60; // 让 WebView2 至少上报一次改后的标题（同帧两次改动会被合并）
 
   var reportBase = null;
   var restoreTimer = null;
+
+  // 与 shim.js 共用 document.title：上报/分片正在占用标题时，快捷键不能抢写，
+  // 否则会把半截上报覆盖掉或把控制串当成页面原标题再回放一次。等上报窗口结束再发。
+  var REPORT_PREFIXES = ['FNOSREPORT:', 'FNOSCHUNK:', 'FNOSPROBE:'];
+  var PENDING_RETRY_MS = 420;
+  var PENDING_MAX = 4;
+  var pendingAction = null;
+  var pendingTimer = null;
+  var pendingTries = 0;
+
+  function isReportTitle(t) {
+    for (var i = 0; i < REPORT_PREFIXES.length; i++) {
+      if (t.indexOf(REPORT_PREFIXES[i]) === 0) return true;
+    }
+    return false;
+  }
+
+  function schedulePending() {
+    if (pendingTimer !== null) return;
+    pendingTimer = W.setTimeout(flushPending, PENDING_RETRY_MS);
+  }
+
+  function flushPending() {
+    pendingTimer = null;
+    if (!pendingAction) return;
+    if (pendingTries >= PENDING_MAX) {
+      pendingAction = null;
+      pendingTries = 0;
+      return;
+    }
+    pendingTries += 1;
+    var action = pendingAction;
+    pendingAction = null;
+    emit(action);
+    if (pendingAction !== null) schedulePending();
+  }
 
   /** 把控制标题还给页面（只在自己写过的那条还以控制前缀开头时才动）。 */
   function restoreTitle() {
@@ -61,6 +107,14 @@
 
   /** 写一条快捷键命令到标题通道。 */
   function emit(action) {
+    var current = '';
+    try { current = String(D.title || ''); } catch (e) { current = ''; }
+    if (current.indexOf(KEY_TITLE_PREFIX) !== 0 && isReportTitle(current)) {
+      pendingAction = action;
+      schedulePending();
+      return;
+    }
+    pendingTries = 0;
     try {
       if (reportBase === null) reportBase = String(D.title || '');
       D.title = KEY_TITLE_PREFIX + action;
@@ -70,6 +124,16 @@
     }
     if (restoreTimer !== null) W.clearTimeout(restoreTimer);
     restoreTimer = W.setTimeout(restoreTitle, RESTORE_DELAY_MS);
+  }
+
+  // 顶层接收同源子 frame 的转发；只认白名单动作，跨源消息在 origin 检查处丢弃。
+  if (isTopFrame && typeof W.addEventListener === 'function') {
+    W.addEventListener('message', function (e) {
+      if (!e || e.source === W || e.origin !== W.location.origin) return;
+      var data = e.data;
+      if (!data || data.type !== RELAY_TYPE || !ACTIONS[data.action]) return;
+      emit(data.action);
+    });
   }
 
   /** 事件目标是不是「用户正在输入」的地方——不在这里抢键（保留页面的编辑语义）。 */
@@ -111,6 +175,17 @@
   D.addEventListener('keydown', function (e) {
     var action = actionFor(e);
     if (!action) return;
+    // 同源子 frame：把动作转发给顶层（顶层负责写标题通道/执行）。
+    if (!isTopFrame) {
+      if (action === 'exit-fullscreen') {
+        try { relayTop.postMessage({ type: RELAY_TYPE, action: action }, W.location.origin); } catch (err) {}
+        return; // 不吞页面自己的 Esc
+      }
+      try { e.preventDefault(); } catch (err) { /* 不可取消就照发 */ }
+      try { e.stopPropagation(); } catch (err) { /* 忽略 */ }
+      try { relayTop.postMessage({ type: RELAY_TYPE, action: action }, W.location.origin); } catch (err) {}
+      return;
+    }
     // Esc 只上报、不消费：页面自己的「关闭弹窗 / 取消」语义必须保留。
     if (action === 'exit-fullscreen') {
       emit(action);

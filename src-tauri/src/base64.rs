@@ -21,7 +21,7 @@ const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwx
 
 /// 把字节编码成标准 base64（带 padding）。空输入 → 空串。
 pub fn encode(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
         let b0 = chunk[0] as u32;
         let b1 = *chunk.get(1).unwrap_or(&0) as u32;
@@ -58,7 +58,7 @@ fn value_of(c: u8) -> Option<u32> {
 /// 标准 base64 → 字节。任何形状不合法都返回 `Err`（固定短语，不带用户输入）。
 pub fn decode(input: &str) -> Result<Vec<u8>, String> {
     let bytes = input.as_bytes();
-    if bytes.len() % 4 != 0 {
+    if !bytes.len().is_multiple_of(4) {
         return Err("base64 长度不是 4 的倍数".to_string());
     }
     let groups = bytes.len() / 4;
@@ -177,7 +177,7 @@ mod tests {
             let b64 = encode(bytes);
             assert_eq!(
                 b64.len(),
-                (bytes.len() + 2) / 3 * 4,
+                bytes.len().div_ceil(3) * 4,
                 "{key} 的 base64 长度必须符合 4/3 膨胀公式"
             );
             assert_eq!(

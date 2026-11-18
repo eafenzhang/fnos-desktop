@@ -80,28 +80,60 @@
   var lastVW = 0;             // 上一次见到的视口尺寸（尺寸没变的 resize 一律忽略）
   var lastVH = 0;
 
-  /** 窗口此刻是不是「铺满内容区」= 最大化形态（内容区 = 包含块，也就是它的父容器）。 */
+  /**
+   * 内容盒（不含 padding）。`clientWidth` 把 padding 算在内，而 Dock 自动隐藏关闭时
+   * fnOS 会给内容区留 `pl-[66px]`；把它当成整块内容区会让窗口偏左 33px，并把铺满
+   * 工作区的窗口误判成未最大化。绝对定位的 left/top 相对的是 padding 盒，所以换算时
+   * 还要把 padL/padT 加回去。
+   */
+  function contentBox(area) {
+    var w = area.clientWidth || 0;
+    var h = area.clientHeight || 0;
+    var padL = 0, padR = 0, padT = 0, padB = 0;
+    try {
+      var cs = W.getComputedStyle ? W.getComputedStyle(area) : null;
+      if (cs) {
+        padL = parseFloat(cs.paddingLeft) || 0;
+        padR = parseFloat(cs.paddingRight) || 0;
+        padT = parseFloat(cs.paddingTop) || 0;
+        padB = parseFloat(cs.paddingBottom) || 0;
+      }
+    } catch (e) { /* 量不到按 0 处理 */ }
+    return {
+      w: Math.max(0, w - padL - padR),
+      h: Math.max(0, h - padT - padB),
+      padL: padL,
+      padT: padT,
+    };
+  }
+
+  /** 窗口此刻是不是「铺满内容区」= 最大化形态（按内容盒而不是含 padding 的 client box）。 */
   function isMaximized(el) {
     var area = el && el.parentElement;
     if (!area) return false;
-    var availW = area.clientWidth || 0;
-    var availH = area.clientHeight || 0;
+    var avail = contentBox(area);
     var w = el.offsetWidth || 0;
     var h = el.offsetHeight || 0;
-    if (!(availW > 0 && availH > 0 && w > 0 && h > 0)) return false;
-    return w >= availW - 4 && h >= availH - 4;
+    if (!(avail.w > 0 && avail.h > 0 && w > 0 && h > 0)) return false;
+    return w >= avail.w - 4 && h >= avail.h - 4;
   }
 
   /** 内容区与窗口的实测几何（量不到时返回 null）。 */
   function measure(el) {
     var area = el && el.parentElement;
     if (!area) return null;
-    var availW = area.clientWidth || 0;
-    var availH = area.clientHeight || 0;
+    var avail = contentBox(area);
     var w = el.offsetWidth || 0;
     var h = el.offsetHeight || 0;
-    if (!(availW > 0 && availH > 0 && w > 0 && h > 0)) return null;
-    return { availW: availW, availH: availH, w: w, h: h };
+    if (!(avail.w > 0 && avail.h > 0 && w > 0 && h > 0)) return null;
+    return {
+      availW: avail.w,
+      availH: avail.h,
+      padL: avail.padL,
+      padT: avail.padT,
+      w: w,
+      h: h,
+    };
   }
 
   /** 比例夹取：0 = 正中，±1 = 贴到内容区边缘（再往外没有意义）。 */
@@ -138,7 +170,7 @@
     // 铺满内容区 = 最大化形态：不动它（那条路径由本壳的样式覆盖处理）
     if (m.w >= m.availW - 4 && m.h >= m.availH - 4) return true;
     var st = stateOf(el);
-    writePos(st, el, (m.availW - m.w) / 2, (m.availH - m.h) / 2);
+    writePos(st, el, m.padL + (m.availW - m.w) / 2, m.padT + (m.availH - m.h) / 2);
     if (st) {
       st.ratioX = 0;
       st.ratioY = 0;
@@ -155,8 +187,8 @@
    */
   function applyRatio(st, el, m) {
     writePos(st, el,
-      m.availW / 2 + st.ratioX * (m.availW / 2) - m.w / 2,
-      m.availH / 2 + st.ratioY * (m.availH / 2) - m.h / 2);
+      m.padL + m.availW / 2 + st.ratioX * (m.availW / 2) - m.w / 2,
+      m.padT + m.availH / 2 + st.ratioY * (m.availH / 2) - m.h / 2);
     st.areaW = m.availW;
     st.areaH = m.availH;
   }
@@ -242,8 +274,10 @@
     var left = parseFloat(el.style.left);
     var top = parseFloat(el.style.top);
     if (isFinite(left) && isFinite(top)) {
-      st.ratioX = clampRatio((left + m.w / 2 - m.availW / 2) / (m.availW / 2));
-      st.ratioY = clampRatio((top + m.h / 2 - m.availH / 2) / (m.availH / 2));
+      var contentLeft = left - m.padL;
+      var contentTop = top - m.padT;
+      st.ratioX = clampRatio((contentLeft + m.w / 2 - m.availW / 2) / (m.availW / 2));
+      st.ratioY = clampRatio((contentTop + m.h / 2 - m.availH / 2) / (m.availH / 2));
     }
   }
 

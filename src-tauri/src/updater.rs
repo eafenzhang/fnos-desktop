@@ -233,7 +233,7 @@ pub fn pick_installer_asset(release: &Value) -> Result<(String, String, Option<S
             .get("browser_download_url")
             .and_then(|u| u.as_str())
             .unwrap_or("");
-        if !(name.ends_with("x64-setup.exe") && !url.is_empty()) {
+        if !name.ends_with("x64-setup.exe") || url.is_empty() {
             continue;
         }
         let digest = asset_sha256(asset)?;
@@ -476,7 +476,10 @@ fn kill_stale_installer(installer: &std::path::Path) {
 /// 带重试地启动安装器（`/S` 静默 + `/R` 装完自动重启）。每次失败后：结束同名残留
 /// 进程 → 等 [`INSTALL_SPAWN_RETRY_DELAY_MS`] → 再试；[`INSTALL_SPAWN_TRIES`] 次仍失败
 /// 才把错误交回调用方（弹窗里会带上手动运行的路径建议）。
-fn spawn_installer_with_retry(installer: &std::path::Path, retry_delay: std::time::Duration) -> Result<(), String> {
+fn spawn_installer_with_retry(
+    installer: &std::path::Path,
+    retry_delay: std::time::Duration,
+) -> Result<std::process::Child, String> {
     let mut last: Option<std::io::Error> = None;
     for attempt in 1..=INSTALL_SPAWN_TRIES {
         let mut cmd = std::process::Command::new(installer);
@@ -487,7 +490,7 @@ fn spawn_installer_with_retry(installer: &std::path::Path, retry_delay: std::tim
             cmd.creation_flags(CREATE_NO_WINDOW); // 静默安装本就无窗口，兜住控制台闪现
         }
         match cmd.spawn() {
-            Ok(_) => return Ok(()),
+            Ok(child) => return Ok(child),
             Err(e) => {
                 last = Some(e);
                 if attempt < INSTALL_SPAWN_TRIES {
@@ -507,10 +510,23 @@ fn spawn_installer_with_retry(installer: &std::path::Path, retry_delay: std::tim
 /// 静默安装：NSIS `/S` + `/R`（装完自动重启应用）。tauri 的 NSIS 模板在静默模式下
 /// 会先结束正在运行的旧进程，所以文件锁不构成问题；这里再兜一层——800ms 后主动退出。
 fn start_install<R: Runtime>(app: &AppHandle<R>, installer: &std::path::Path) -> Result<(), String> {
-    spawn_installer_with_retry(installer, std::time::Duration::from_millis(INSTALL_SPAWN_RETRY_DELAY_MS))
-        .map_err(|e| format!("{e}（安装包路径：{}；也可以稍后在文件管理器里手动运行它）", installer.display()))?;
+    let mut child = spawn_installer_with_retry(
+        installer,
+        std::time::Duration::from_millis(INSTALL_SPAWN_RETRY_DELAY_MS),
+    )
+    .map_err(|e| format!("{e}（安装包路径：{}；也可以稍后在文件管理器里手动运行它）", installer.display()))?;
     // 安装器（onInit 阶段）会结束本进程；万一没结束，这里主动退，把文件锁让出来。
+    // 但先给安装器一个失败窗口：SmartScreen/杀软拦截或用户取消时它会很快退出——
+    // 这时外壳必须留下来，否则用户既没更新，也没了正在用的窗口。
     std::thread::sleep(std::time::Duration::from_millis(800));
+    if let Ok(Some(status)) = child.try_wait() {
+        if !status.success() {
+            return Err(format!(
+                "安装器启动后立即退出（{status}），可能被 SmartScreen / 杀毒软件拦截。\n\n安装包路径：{}；可在文件管理器里手动运行。",
+                installer.display()
+            ));
+        }
+    }
     save_window_geom(app);
     app.exit(0);
     Ok(())
@@ -616,14 +632,14 @@ pub fn check_from_tray<R: Runtime>(app: AppHandle<R>) {
             return;
         }
         Err(e) => {
-            message_box("fnOS 检查更新", &format!("{e}"), MB_ICON_WARNING);
+            message_box("fnOS 检查更新", &e.to_string(), MB_ICON_WARNING);
             return;
         }
     };
     let validated = match validate_download_url(&download_url) {
         Ok(u) => u,
         Err(e) => {
-            message_box("fnOS 检查更新", &format!("{e}"), MB_ICON_WARNING);
+            message_box("fnOS 检查更新", &e.to_string(), MB_ICON_WARNING);
             return;
         }
     };
@@ -635,7 +651,7 @@ pub fn check_from_tray<R: Runtime>(app: AppHandle<R>) {
     ) {
         Ok(p) => p,
         Err(e) => {
-            message_box("fnOS 检查更新", &format!("{e}"), MB_ICON_WARNING);
+            message_box("fnOS 检查更新", &e.to_string(), MB_ICON_WARNING);
             return;
         }
     };
@@ -656,7 +672,7 @@ pub fn check_from_tray<R: Runtime>(app: AppHandle<R>) {
     );
     if choice == ID_OK {
         if let Err(e) = start_install(&app, &installer) {
-            message_box("fnOS 检查更新", &format!("{e}"), MB_ICON_WARNING);
+            message_box("fnOS 检查更新", &e.to_string(), MB_ICON_WARNING);
         }
     }
 }
@@ -929,6 +945,10 @@ mod tests {
         assert!(
             code.contains("kill_stale_installer"),
             "重试之间必须清同名残留安装器进程（运行中的 exe 自锁）"
+        );
+        assert!(
+            code.contains("try_wait()") && code.contains("!status.success()"),
+            "安装器启动后立即失败时必须保留外壳并报错，不能直接退出"
         );
     }
 

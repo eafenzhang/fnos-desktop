@@ -702,8 +702,10 @@
     W.removeEventListener('blur', onHideSignal);
     if (!fullscreen) {
       releaseAll();
-      notifyResize(); // 空间还原了，也让窗口管理器重排一次
-      applyDockReclaim(false); // 样式层的预留清除表要真的卸下来（见文件头「开关链路」）
+      // 先卸样式层的预留清除表，再派发 resize：否则 fnOS 会按仍被回收的布局重排，
+      // 之后样式表卸下布局再变一次却没有第二个 resize，窗口会停在错误位置。
+      applyDockReclaim(false);
+      notifyResize();
     }
   }
 

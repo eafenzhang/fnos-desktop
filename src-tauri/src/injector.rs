@@ -205,8 +205,8 @@ fn precheck_wallpaper_len(len: u64, is_file: bool) -> Precheck {
 //  unused_doc_comments —— 而本项目的门禁要求 0 warning。）
 #[cfg(test)]
 thread_local! {
-    static WALLPAPER_STAT_ATTEMPTS: std::cell::Cell<usize> = std::cell::Cell::new(0);
-    static WALLPAPER_READ_ATTEMPTS: std::cell::Cell<usize> = std::cell::Cell::new(0);
+    static WALLPAPER_STAT_ATTEMPTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static WALLPAPER_READ_ATTEMPTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -589,16 +589,46 @@ pub fn build_core_script() -> String {
 /// 脚本正文原样包在函数里：载荷本身由多个 IIFE + 一次 `window.__FNOS_SHELL__` 赋值组成，
 /// 不依赖顶层 `var`/函数声明的全局可见性（见 `inject/*.js` 的写法）。
 pub fn wrap_popup_script(origin: &str, script: &str) -> String {
-    if origin.is_empty() || script.is_empty() {
+    if origin.is_empty() {
+        return String::new();
+    }
+    wrap_origin_script(&[origin.to_string()], script)
+}
+
+/// 给「页面加载完成后补注入」的载荷加一道幂等闸门。
+///
+/// 原生弹窗的**首个文档**可能漏掉 `initialization_script`：WebView2 在
+/// `SetNewWindow` 之后立刻开始导航，而 tauri 注册初始化脚本发生在建窗返回之前，
+/// 页面快（缓存命中）时导航先完成。实测直接 `window.open('/signin')` 的弹窗里
+/// 连 `__FNOS_SHELL__` 都没有，而 about:blank 起步、之后再导航的弹窗正常——
+/// 漏的正是首个文档。
+///
+/// `on_page_load` 补注入覆盖这个缺口；正常执行过初始化脚本的文档已经带
+/// `__FNOS_SHELL__`，这里直接返回，避免 dock / windowpos / shim 被装两遍。
+pub fn guard_late_script(script: &str) -> String {
+    if script.is_empty() {
+        return String::new();
+    }
+    format!("(function(){{if(typeof window.__FNOS_SHELL__!=='undefined')return;{script}\n}})();")
+}
+
+/// 给完整载荷加一道**多 origin**运行时闸门（主页面 / 完整档标签 / 弹窗共用）。
+///
+/// `initialization_script` 对 webview 里的每一篇文档都执行，而主页面/tab 会在同一
+/// Webview 内导航。没有这道闸门，主标签一旦跳到第三方站点，`__FNOS_SHELL__`、shim、
+/// dock/windowpos/keepalive 仍会在该站点执行。允许的 origin 由配置的 homeUrl / nasUrl /
+/// 桌面地址组成（例如 fnos.net 入口跳到 NAS 桌面时两处都要放行）。
+pub fn wrap_origin_script(origins: &[String], script: &str) -> String {
+    if origins.is_empty() || script.is_empty() {
         return String::new();
     }
     // origin 来自 `url::Url::origin().ascii_serialization()`，这里仍走 JSON 转义：
     // 闸门是安全边界，不能因为调用方将来传入别的东西就产生字符串/代码注入。
-    let origin_json = serde_json::to_string(origin).expect("origin 是字符串，序列化不会失败");
+    let origins_json = serde_json::to_string(origins).expect("origin 列表序列化不会失败");
     format!(
         "(function(){{try{{var p=location.protocol;\
          if(p!=='http:'&&p!=='https:')return;\
-         if(location.origin!=={origin_json})return;}}catch(e){{return;}}\n\
+         if({origins_json}.indexOf(location.origin)<0)return;}}catch(e){{return;}}\n\
          {script}\n}})();\n"
     )
 }
@@ -683,8 +713,8 @@ mod tests {
             "about: 等非 http(s) 文档直接返回（about:blank 的 origin 继承自 opener）"
         );
         assert!(
-            wrapped.contains("location.origin!==\"https://nas.example.com\""),
-            "origin 必须逐字比对（JSON 转义后的字符串）"
+            wrapped.contains("[\"https://nas.example.com\"].indexOf(location.origin)<0"),
+            "origin 必须逐字比对（JSON 转义后的数组）"
         );
         assert!(wrapped.contains("return;"), "不匹配的文档必须提前返回");
         assert!(wrapped.contains(&payload), "闸门内必须原样保留完整载荷");
@@ -693,6 +723,41 @@ mod tests {
         assert!(
             wrap_popup_script("https://nas.example.com", "").is_empty(),
             "空载荷不得生成脚本"
+        );
+    }
+
+    /// 页面加载后的补注入必须先看 `__FNOS_SHELL__`，避免正常初始化脚本执行过的
+    /// 文档被装第二遍（dock / windowpos 会重复挂观察器）。
+    #[test]
+    fn late_injection_skips_documents_that_already_ran_the_payload() {
+        let gated = wrap_popup_script("https://nas.example.com", "PAYLOAD_BODY");
+        let late = guard_late_script(&gated);
+        let guard_at = late.find("typeof window.__FNOS_SHELL__!=='undefined'").expect("幂等判据");
+        let gate_at = late.find("location.origin").expect("origin 闸门");
+        let body_at = late.find("PAYLOAD_BODY").expect("载荷正文");
+        assert!(
+            guard_at < gate_at && gate_at < body_at,
+            "顺序必须是 幂等判据 → origin 闸门 → 载荷"
+        );
+        assert!(late.trim_end().ends_with("})();"), "补注入必须包在函数作用域里");
+        assert!(guard_late_script("").is_empty(), "空脚本不得生成补注入");
+    }
+
+    /// 主页面/完整档标签允许多个配置 origin（homeUrl + nasUrl）。
+    #[test]
+    fn origin_script_allows_each_configured_origin() {
+        let payload = script(&Config::default());
+        let origins = vec![
+            "https://fnos.net".to_string(),
+            "https://nas.example.com".to_string(),
+        ];
+        let wrapped = wrap_origin_script(&origins, &payload);
+        assert!(wrapped.contains("[\"https://fnos.net\",\"https://nas.example.com\"]"));
+        assert!(wrapped.contains(".indexOf(location.origin)<0"));
+        assert!(wrapped.contains(&payload), "闸门内必须原样保留完整载荷");
+        assert!(
+            wrap_origin_script(&[], &payload).is_empty(),
+            "空 origin 列表不得生成脚本"
         );
     }
 
@@ -742,8 +807,8 @@ mod tests {
             "居中按内容区与窗口的实测尺寸算"
         );
         assert!(
-            js.contains("w >= availW - 4"),
-            "铺满内容区的最大化窗口不得被改动"
+            js.contains("w >= avail.w - 4"),
+            "铺满内容区的最大化窗口不得被改动（按内容盒计算）"
         );
         assert!(js.contains("W.top === W.self"), "只在顶层文档工作");
         assert!(!js.contains("innerHTML"), "不写页面内容");
@@ -1226,7 +1291,7 @@ mod tests {
             );
             assert_eq!(
                 b64.len(),
-                (bytes.len() + 2) / 3 * 4,
+                bytes.len().div_ceil(3) * 4,
                 "{key} 的 base64 长度必须符合 4/3 膨胀公式"
             );
             // 文本资源那一支不受影响：assets 里不许出现同名 png
@@ -1511,6 +1576,8 @@ mod tests {
     ///
     /// 指纹漏一项 = 用户改了配置、新开的标签页却仍是旧脚本（最难查的一类问题）；
     /// 多算无关项只是白重建一次。所以这里按「进脚本的键逐个变一次」锁定。
+    type ConfigMutator = (&'static str, Box<dyn Fn(&mut Config)>);
+
     #[test]
     fn script_fingerprint_covers_every_key_that_reaches_the_script() {
         let base = Config::default();
@@ -1519,7 +1586,7 @@ mod tests {
         assert_eq!(fp, script_fingerprint(&base.clone()), "同样的配置 → 同样的指纹");
 
         // 每一个都真实改变脚本正文的键：改动必须让指纹变化
-        let mutators: Vec<(&str, Box<dyn Fn(&mut Config)>)> = vec![
+        let mutators: Vec<ConfigMutator> = vec![
             ("injectEnabled", Box::new(|c: &mut Config| {
                 c.shell.inject_enabled = !c.shell.inject_enabled;
             })),

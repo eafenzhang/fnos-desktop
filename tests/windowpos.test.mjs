@@ -76,6 +76,14 @@ function fakeCtx(opts = {}) {
     setTimeout(fn) { this._timers.push(fn); return this._timers.length; },
     clearTimeout() { /* 桩：定时器一并在 drain 时执行 */ },
     drain() { const fns = this._timers.slice(); this._timers.length = 0; fns.forEach((fn) => fn()); },
+    getComputedStyle() {
+      return {
+        paddingLeft: (opts.padL || 0) + 'px',
+        paddingRight: (opts.padR || 0) + 'px',
+        paddingTop: (opts.padT || 0) + 'px',
+        paddingBottom: (opts.padB || 0) + 'px',
+      };
+    },
   };
   win.top = win;
   win.self = win;
@@ -163,6 +171,16 @@ test('落位是**同步**的：观察回调返回时窗口已经在正中（不�
   assert.equal(win._inline.left, '50px', '同步落位：插入与首帧之间就写好了（否则用户先看到级联位置）');
   assert.equal(win._inline.top, '90px', '垂直方向同理');
   assert.equal(win._inline.visibility, undefined, '尺寸量得到就不需要按住');
+});
+
+test('Dock 预留 padding 时按内容盒居中（不把 66px 预留算进工作区）', () => {
+  const ctx = fakeCtx({ padL: 66 });
+  load(ctx);
+  const win = newWindow(ctx);
+  fireDoc(ctx, [{ addedNodes: [win] }]);
+  // 内容盒宽 1200 - 66 = 1134；left = 66 + (1134 - 1100)/2 = 83
+  assert.equal(win._inline.left, '83px', '预留宽度必须排除在内容盒之外');
+  assert.equal(win._inline.top, '90px');
 });
 
 test('递归命中：整棵子树一次插入时，子树里的窗口也要同步落位', () => {
