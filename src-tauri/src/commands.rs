@@ -1131,10 +1131,13 @@ fn same_origin(a: &tauri::Url, b: &tauri::Url) -> bool {
 /// 让新窗口复用 opener 的 WebView2 环境（同一个 user-data 目录 / cookie / storage），
 /// 登录状态与标签页共享。
 ///
-/// 只对与 fnOS 主页面同源的弹窗（典型：fnOS 自带的 `/signin` 授权页）注入初始化脚本：
-/// 那套脚本里有「授权按钮可见性」等 CSS 修正；第三方登录页（GitHub / Google）不需要
-/// mods，也不该被 fnOS 的样式覆盖。判据同时看**目标地址**与 **opener 当前地址**——
-/// fnOS 桌面开出的 `about:blank` 弹窗之后可能被 opener 导航到任意站点，注入链要跟着走。
+/// **注入是带运行时闸门的**：`same_site` 只决定要不要注册载荷（判据同时看**目标地址**
+/// 与 **opener 当前地址**——fnOS 桌面开出的 `about:blank` 弹窗之后可能被 opener 导航到
+/// 任意站点，注册必须跟着走）；载荷本身在每次文档创建时检查 `location`，只有落在 fnOS
+/// 桌面 origin 的 http(s) 文档才执行。这样 fnOS 自己的 `/signin` 授权页（「授权按钮
+/// 可见性」等 CSS 修正）仍然拿到完整载荷，而第三方登录页（GitHub / Google / DeepSeek
+/// Platform）即使通过了 `same_site` 也不会执行 mods/shim，更不会把 `FNOSREPORT:…`
+/// 写进原生标题栏。见 [`injector::wrap_popup_script`]。
 fn create_popup_window<R: Runtime>(
     app: &AppHandle<R>,
     opener_label: &str,
@@ -1149,6 +1152,7 @@ fn create_popup_window<R: Runtime>(
     let has_position = features.position().is_some();
     let cfg = current(app);
     let main_url = resolve_main_url(&cfg, None);
+    let desktop_origin = main_url.origin().ascii_serialization();
     let same_site = same_origin(&main_url, url)
         || app
             .get_webview(opener_label)
@@ -1165,8 +1169,10 @@ fn create_popup_window<R: Runtime>(
     .window_features(features)
     .title(tab_initial_title(url))
     .on_document_title_changed(|window, title| {
-        // 弹窗标题跟随页面；与主窗口的标签标题互不干扰。
-        if !title.trim().is_empty() {
+        // 弹窗标题跟随页面；但控制标题（探针/上报/分片/快捷键）是「页面 → 宿主」
+        // 的回传通道，不是页面标题。主窗口走 handle_title 会分流这些前缀，弹窗没有
+        // 那条分流——不在这里跳过的话，`FNOSREPORT:…` 会被 set_title 显示到标题栏。
+        if !title.trim().is_empty() && !is_control_title(&title) {
             let _ = window.set_title(&title);
         }
     });
@@ -1176,7 +1182,14 @@ fn create_popup_window<R: Runtime>(
     if same_site {
         let script = init_script_cached(app, &cfg);
         if !script.is_empty() {
-            builder = builder.initialization_script(script);
+            // `initialization_script` 按 webview 注册，对弹窗里**每一次文档**都会执行。
+            // `same_site` 只说明弹窗是从 fnOS 页面开出来的，不能说明最终文档还是 fnOS；
+            // 载荷本身必须再过一道运行时 origin 闸门——about:blank 与第三方登录页
+            // （如 platform.deepseek.com）不执行 mods/shim。见 injector::wrap_popup_script。
+            let gated = injector::wrap_popup_script(&desktop_origin, &script);
+            if !gated.is_empty() {
+                builder = builder.initialization_script(gated);
+            }
         }
     }
     builder.build()
@@ -1603,6 +1616,20 @@ fn set_error_state<R: Runtime>(app: &AppHandle<R>, info: &ErrorInfo) -> u64 {
     clear_report_slots(&state);
     *state.chunk_report.lock().unwrap() = None;
     generation
+}
+
+/// 是否是本壳的**控制标题**（探针 / 上报 / 分片 / 标签快捷键）——这些字符串走
+/// `document.title` 只是「页面 → 宿主」的传输，不是页面自己的标题。
+///
+/// 主窗口的 [`handle_title`] 按前缀分流后**不**把它们镜像到窗口标题；任何把
+/// `document.title` 直接镜像到原生标题的地方（典型：弹窗的
+/// `on_document_title_changed`）都必须先用它过滤。四个前缀集中在这里，避免将来
+/// 新增一条控制通道时漏掉某个镜像点。
+fn is_control_title(title: &str) -> bool {
+    title.starts_with(PROBE_TITLE_PREFIX)
+        || title.starts_with(report::CHUNK_TITLE_PREFIX)
+        || title.starts_with(report::REPORT_TITLE_PREFIX)
+        || title.starts_with(KEY_TITLE_PREFIX)
 }
 
 /// 主窗口 `document.title` 变化：两条控制前缀走这里，其余照旧镜像到窗口标题。
@@ -3983,6 +4010,26 @@ mod tests {
         );
     }
 
+    /// 控制标题是页面 → 宿主的传输，不是页面标题；弹窗镜像标题前必须能识别它们。
+    #[test]
+    fn control_titles_cover_every_page_to_host_prefix() {
+        assert!(is_control_title(&format!(
+            "{PROBE_TITLE_PREFIX}{{\"err\":1}}"
+        )));
+        assert!(is_control_title(&format!(
+            "{}{{\"type\":\"FNOS_CHECK\"}}",
+            report::CHUNK_TITLE_PREFIX
+        )));
+        assert!(is_control_title(&format!(
+            "{}{{\"type\":\"FNOS_CHECK\"}}",
+            report::REPORT_TITLE_PREFIX
+        )));
+        assert!(is_control_title(&format!("{KEY_TITLE_PREFIX}close")));
+        assert!(!is_control_title("DeepSeek 开放平台"));
+        assert!(!is_control_title(""));
+        assert!(!is_control_title("MiniNas - 飞牛 fnOS"));
+    }
+
     /// T14c 修复轮 11 → T14d 升级 → T14e 弹窗修复：`window.open` / `target=_blank` 走
     /// **混合裁定**——普通应用启动（无窗口特征、非登录地址）开标签页；`about:blank`、
     /// 带尺寸/坐标、登录类地址走 `Create` 建原生弹窗（保留 opener / 返回值 /
@@ -4026,6 +4073,14 @@ mod tests {
         assert!(
             popup.contains("on_document_title_changed"),
             "弹窗标题必须跟随 document.title"
+        );
+        assert!(
+            popup.contains("is_control_title"),
+            "弹窗标题必须过滤控制前缀（FNOSREPORT/FNOSPROBE/FNOSCHUNK/FNOSKEY 不是页面标题）"
+        );
+        assert!(
+            popup.contains("injector::wrap_popup_script"),
+            "弹窗载荷必须带运行时 origin 闸门（about:blank / 第三方文档不得执行 mods/shim）"
         );
         assert!(
             popup.contains("initialization_script") && popup.contains("same_site"),

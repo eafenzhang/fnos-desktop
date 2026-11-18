@@ -572,6 +572,37 @@ pub fn build_core_script() -> String {
     format!("/* fnOS Desktop Shell core v{SHELL_VERSION} */\n{KEYS_JS}\n")
 }
 
+/// 给**原生弹窗**的完整载荷加一道运行时 origin 闸门。
+///
+/// 为什么需要：`initialization_script` 是**按 webview** 注册的，对弹窗里的**每一次文档**
+/// 都会执行；而 `create_popup_window` 的 `same_site` 只能说明「这个弹窗是从 fnOS 页面开出来的」
+/// （opener 同源，或请求地址本身同源），不能说明**最终文档**还是 fnOS。登录弹窗的典型形态是
+/// `about:blank` 起步、再由 opener 导航到 `platform.deepseek.com` 这类第三方地址——没有这道
+/// 闸门，整份 mods / dock / keepalive / shim 会在第三方登录页上执行：安装本壳样式、向第三方
+/// origin 发保活、用 `document.title` 发上报（标题栏里出现 `FNOSREPORT:…`）。
+///
+/// 闸门要求：文档是 http(s)，且 **origin 与 fnOS 桌面完全相等**。`about:blank` 的 origin
+/// 继承自 opener（会等于 fnOS），但协议不是 http(s)，所以**故意不在 about:blank 上执行**；
+/// 等它导航到真正的 fnOS 文档时再执行。这样 fnOS 自己的 `/signin` 弹窗（无论直接打开还是
+/// about:blank 转过去）仍然拿到完整载荷，第三方页面则一个字节都不执行。
+///
+/// 脚本正文原样包在函数里：载荷本身由多个 IIFE + 一次 `window.__FNOS_SHELL__` 赋值组成，
+/// 不依赖顶层 `var`/函数声明的全局可见性（见 `inject/*.js` 的写法）。
+pub fn wrap_popup_script(origin: &str, script: &str) -> String {
+    if origin.is_empty() || script.is_empty() {
+        return String::new();
+    }
+    // origin 来自 `url::Url::origin().ascii_serialization()`，这里仍走 JSON 转义：
+    // 闸门是安全边界，不能因为调用方将来传入别的东西就产生字符串/代码注入。
+    let origin_json = serde_json::to_string(origin).expect("origin 是字符串，序列化不会失败");
+    format!(
+        "(function(){{try{{var p=location.protocol;\
+         if(p!=='http:'&&p!=='https:')return;\
+         if(location.origin!=={origin_json})return;}}catch(e){{return;}}\n\
+         {script}\n}})();\n"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -635,6 +666,33 @@ mod tests {
                 && i_pos < i_keys
                 && i_keys < i_cs,
             "段落顺序必须是 配置→shim→bootstrap→dock→keepalive→windowpos→keys→上游"
+        );
+    }
+
+    /// 弹窗载荷必须带 origin 闸门：about:blank / 第三方登录页不得执行整份脚本。
+    #[test]
+    fn popup_script_is_gated_to_the_desktop_origin() {
+        let payload = script(&Config::default());
+        let wrapped = wrap_popup_script("https://nas.example.com", &payload);
+        assert!(
+            wrapped.starts_with("(function(){try{var p=location.protocol;"),
+            "闸门必须先检查协议"
+        );
+        assert!(
+            wrapped.contains("p!=='http:'&&p!=='https:'"),
+            "about: 等非 http(s) 文档直接返回（about:blank 的 origin 继承自 opener）"
+        );
+        assert!(
+            wrapped.contains("location.origin!==\"https://nas.example.com\""),
+            "origin 必须逐字比对（JSON 转义后的字符串）"
+        );
+        assert!(wrapped.contains("return;"), "不匹配的文档必须提前返回");
+        assert!(wrapped.contains(&payload), "闸门内必须原样保留完整载荷");
+        assert!(wrapped.trim_end().ends_with("})();"), "载荷必须包在函数作用域里");
+        assert!(wrap_popup_script("", &payload).is_empty(), "空 origin 不得生成脚本");
+        assert!(
+            wrap_popup_script("https://nas.example.com", "").is_empty(),
+            "空载荷不得生成脚本"
         );
     }
 
