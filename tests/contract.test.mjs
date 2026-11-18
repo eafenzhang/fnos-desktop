@@ -15,6 +15,18 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 
 const read = (rel) => readFileSync(new URL(rel, import.meta.url), 'utf8');
+
+test('版本号三处一致：package.json / tauri.conf.json / Cargo.toml', () => {
+  // 发版靠 tag 与两处版本人工同步；任何一处漂移都会让「装完还是旧版、永远提示更新」
+  // 或者让 CI 发布的安装包版本与 tag 不符。这里从源头钉住。
+  const pkg = JSON.parse(read('../package.json'));
+  const conf = JSON.parse(read('../src-tauri/tauri.conf.json'));
+  const cargo = read('../src-tauri/Cargo.toml').match(/^version = "([^"]+)"/m);
+  assert.ok(cargo, 'Cargo.toml 必须有顶层 version');
+  assert.equal(pkg.version, conf.version, 'package.json 与 tauri.conf.json 版本必须一致');
+  assert.equal(cargo[1], conf.version, 'Cargo.toml 与 tauri.conf.json 版本必须一致');
+});
+
 const CONFIG_RS = read('../src-tauri/src/config.rs');
 const INJECTOR_RS = read('../src-tauri/src/injector.rs');
 const REPORT_RS = read('../src-tauri/src/report.rs');

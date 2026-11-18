@@ -224,6 +224,23 @@ test('样式层预留清除随开关装卸：接管时装、还原时卸（关�
 
 // ---------- 定位策略 ----------
 
+test('关闭自动隐藏会取消待触发的 locate（不得在关掉后又把 Dock 藏起来）', () => {
+  const doc = fakeDom();
+  const w = load(doc, { dockAutoHide: true });
+  const dock = fakeEl({ w: 68, h: 800, left: 0, hasList: true });
+  doc._candidates = [dock];
+  settle(doc); // 接管并落成「藏」
+  assert.ok(dock._classes.has('fnos-shell-dock-hidden'));
+
+  // 排一个待触发的 locate（只排队，不 drain）
+  doc._moCallback();
+  // 关掉自动隐藏：teardown 必须取消它
+  w.__FNOS_APPLY_SHELL__({ dockAutoHide: false });
+  doc._win.drainTimers();
+  assert.ok(!dock._classes.has('fnos-shell-dock-hidden'), '关闭后不得被排队的 locate 再藏一次');
+  assert.ok(!dock._classes.has('fnos-shell-dock-autohide'), '接管标记必须已还原');
+});
+
 test('S1：上游根选择器命中（含列表优先、退化取第一个）', () => {
   const doc = fakeDom();
   load(doc, { dockAutoHide: true });

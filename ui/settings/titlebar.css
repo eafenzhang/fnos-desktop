@@ -1,13 +1,18 @@
-/* 一行式标题栏（T14d 修复轮 5）：左品牌图标（回桌面）+ 标签 + 新建，右边 Windows
- * 系统默认观感的 ─ □ ×。
+/* 一行式标题栏（T14d 修复轮 5；标签样式按用户参考图重做）：最左「桌面」元素
+ * （品牌图标 + NAS 名称，固定不可关）+ 平铺标签 + 新建，右边 Windows 系统默认观感的
+ * ─ □ ×。
  * 高度由 Rust 侧 TAB_STRIP_H 决定（32 逻辑像素 = Windows 11 caption 高度，用户反馈
- * 40 太高压成 32），这里保持一致。 */
+ * 40 太高压成 32），这里保持一致。
+ *
+ * 标签样式（用户参考图）：**无胶囊底**，纯文字；激活标签文字变蓝（--accent），
+ * 未激活浅灰（--tab-fg）；关闭钮仍是悬停才显示。标签区与「+」之间有一条 1px 整高
+ * 分隔线（--bar-line）。 */
 :root {
   color-scheme: dark;
   --bar-bg: #1b1c1e;
   --bar-line: #2e3034;
-  --tab-bg: #232427;
-  --tab-active: #2e3034;
+  --tab-fg: #c8c8c9;
+  --accent: #3773f5;
   --fg: #e8e8ea;
   --dim: #8b9096;
   --close-hover: #e81123;
@@ -28,28 +33,32 @@ body {
  * 点击回到桌面标签；激活时高亮，永远不可关闭（main 不渲染关闭钮）。 */
 .home {
   display: flex; align-items: center; gap: 6px; min-width: 0;
-  max-width: 144px; height: 24px; padding: 0 9px;
-  border-radius: 6px; color: var(--dim); background: transparent; cursor: pointer;
+  max-width: 144px; height: 100%; padding: 0 9px;
+  color: var(--tab-fg); background: transparent; cursor: pointer;
 }
-.home.active { background: var(--tab-active); color: var(--fg); }
-.home:not(.active):hover { background: color-mix(in srgb, var(--tab-active) 55%, transparent); }
+.home.active { color: var(--accent); }
+.home:not(.active):hover { color: var(--fg); }
 .home img { width: 16px; height: 16px; display: block; pointer-events: none; }
 .home .home-name {
-  font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
-.tabs { display: flex; align-items: center; gap: 6px; min-width: 0; overflow: hidden; }
+/* 整条标签区拉满栏高（平铺样式的点击区更大，文字垂直居中） */
+.tabs {
+  display: flex; align-items: center; gap: 6px; min-width: 0;
+  align-self: stretch; overflow: hidden;
+}
 .tab {
   display: flex; align-items: center; gap: 4px;
   /* 固定 144px（用户定值）：标题过长在预留的关闭钮空间内省略号截断，
    * 关闭钮空间常驻——hover 时标题不会跳动 */
-  width: 144px; min-width: 144px; max-width: 144px; height: 24px; padding: 0 6px 0 9px;
-  border-radius: 6px; color: var(--dim); background: transparent; cursor: pointer;
+  width: 144px; min-width: 144px; max-width: 144px; height: 100%; padding: 0 6px 0 9px;
+  color: var(--tab-fg); background: transparent; cursor: pointer;
 }
-.tab.active { background: var(--tab-active); color: var(--fg); }
-.tab:not(.active):hover { background: color-mix(in srgb, var(--tab-active) 55%, transparent); }
+.tab.active { color: var(--accent); }
+.tab:not(.active):hover { color: var(--fg); }
 .tab .tab-title {
   flex: 1 1 auto; min-width: 0;
-  font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .tab .tab-close {
   flex: 0 0 auto; width: 14px; height: 14px; border: 0; border-radius: 3px;
@@ -63,11 +72,13 @@ body {
 }
 .tab:hover .tab-close { visibility: visible; }
 .tab .tab-close:hover { background: var(--close-hover); color: #fff; }
+/* 标签区与「+」之间的 1px 整高分隔线（用户参考图） */
+.bar-sep { flex: 0 0 auto; width: 1px; align-self: stretch; background: var(--bar-line); }
 .new-tab {
-  flex: 0 0 auto; width: 22px; height: 22px; border: 0; border-radius: 5px;
-  background: transparent; color: var(--fg); font-size: 13px; cursor: pointer;
+  flex: 0 0 auto; width: 24px; height: 24px; border: 0; border-radius: 0;
+  background: transparent; color: var(--tab-fg); font-size: 14px; cursor: pointer;
 }
-.new-tab:hover { background: var(--tab-active); }
+.new-tab:hover { color: var(--fg); }
 /* 空白区域全是拖拽区（data-tauri-drag-region 由授权的 start-dragging 承接） */
 .drag-fill { flex: 1 1 auto; align-self: stretch; cursor: default; }
 /* 窗口控制：**与系统标题栏一致**（T14d 修复轮 4）——46px 整高按钮 + 系统图标字体

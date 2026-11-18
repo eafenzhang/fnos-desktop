@@ -25,6 +25,16 @@ pub const TITLEBAR_WEBVIEW: &str = "titlebar";
 /// 前端 `ui/settings/titlebar.js` 的 `STRIP_H` 与这里必须一致（有跨语言断言）。
 pub const TAB_STRIP_H: f64 = 32.0;
 
+/// 同时打开的标签页上限（含不可关闭的首页）。
+///
+/// 每个标签页都是一个完整 WebView2 实例；任何远程页面都能 `window.open`。没有上限
+/// 就等于把「页面 → 宿主资源耗尽」的开关交给页面。24 个足够正常使用。
+const MAX_OPEN_TABS: usize = 24;
+
+/// 弹窗限速：10 秒内最多 5 个。覆盖正常登录/授权流程，挡住脚本无限开窗。
+const POPUP_RATE_WINDOW_MS: u64 = 10_000;
+const POPUP_RATE_MAX: usize = 5;
+
 /// 内置错误页的资产名（相对 `tauri.conf.json` 的 `frontendDist` = `../ui/settings`）。
 ///
 /// brief 写的是 `src-tauri/src/error_page.html`，但 `WebviewUrl::App` 只能解析**应用资产**，
@@ -155,6 +165,17 @@ pub struct AppState {
     pub tabs: Mutex<TabState>,
     /// 下一个标签页的编号（`tab-N` 的 N；跨重建累加，保证 label 不与历史冲突）。
     pub next_tab: AtomicU64,
+    /// 下一个**原生弹窗**的编号（`popup-N` 的 N）。
+    ///
+    /// 与 [`Self::next_tab`] 同构但独立计数：弹窗不是主窗口里的子 Webview，不进标签条。
+    /// 只增不减：页面 `window.close()` 走 WebView2 的 `WindowCloseRequested`，窗口会被
+    /// 原生销毁而 tauri 的 label 注册表未必立刻释放——永不复用 label 就不会撞上残留项。
+    pub next_popup: AtomicU64,
+    /// 最近弹窗请求的时间戳（Unix 毫秒），用于 [`POPUP_RATE_WINDOW_MS`] 限速。
+    ///
+    /// 只保留时间窗内的条目（每次请求前 prune），所以长度上限就是
+    /// [`POPUP_RATE_MAX`] + 1，不会无限增长。
+    pub popup_recent: Mutex<Vec<u64>>,
     /// 「已为该页面开过标签」的登记表：[`page_key`]（剥 query/fragment 的
     /// scheme+host+port+path）→ 标签 label（T14e）。
     ///
@@ -486,10 +507,11 @@ pub struct SetResult {
     pub needs_reload: bool,
 }
 
-pub fn load_config<R: Runtime>(app: &AppHandle<R>) -> (Config, bool) {
+pub fn load_config<R: Runtime>(app: &AppHandle<R>) -> (Config, config::LoadReport) {
     let path = Config::config_path();
     let (cfg, report) = Config::load_with_report(&path);
-    let _ = cfg.save(&path);
+    // 读失败时**绝不**在这里写盘：那会把一份可能完好的配置用默认值覆盖掉。
+    // 首启的落盘统一由 `save_and_install_state` 按同一个 report 决定。
     // 首启的装配顺序是「先读配置、再 `manage(AppState)`」，所以这一刻通常还没有 state，
     // 回退标记必须**返回给调用方**并由 `save_and_install_state` 带进去；`try_state` 分支
     // 是给将来「运行期重新装载配置」留的对称路径。
@@ -499,7 +521,7 @@ pub fn load_config<R: Runtime>(app: &AppHandle<R>) -> (Config, bool) {
             .recovered_from_backup
             .store(report.recovered_from_backup, Ordering::SeqCst);
     }
-    (cfg, report.recovered_from_backup)
+    (cfg, report)
 }
 
 pub(crate) fn current<R: Runtime>(app: &AppHandle<R>) -> Config {
@@ -848,6 +870,7 @@ fn tab_webview_builder<R: Runtime>(
     let app_for_load = app.clone();
     let app_for_new_window = app.clone();
     let label = label.to_string();
+    let opener_label = label.clone();
     WebviewBuilder::new(&label, WebviewUrl::External(url))
         .on_document_title_changed(move |webview, title| {
             handle_title(&webview, &title, &app_for_title);
@@ -869,7 +892,9 @@ fn tab_webview_builder<R: Runtime>(
                 ),
             }
         })
-        .on_new_window(move |url, _features| new_window_verdict(&app_for_new_window, url))
+        .on_new_window(move |url, features| {
+            new_window_verdict(&app_for_new_window, &opener_label, url, features)
+        })
 }
 
 /// 「同一页面」的登记键：scheme+host+port+path（**剥掉 query/fragment**）。
@@ -883,35 +908,77 @@ fn page_key(url: &tauri::Url) -> String {
     u.to_string()
 }
 
-/// 新窗口请求的裁定（`window.open` / `target=_blank`）→ **开成标签页**（T14d）。
+/// 新窗口请求的裁定（`window.open` / `target=_blank`）：**普通应用启动 → 标签页**，
+/// **依赖浏览器弹窗语义的 → 原生弹窗**。
 ///
 /// 背景（T14c 修复轮 11，实测）：Hermes Studio 这类「外部 Web 应用」的启动路径就是
 /// `window.open('https://hermes-studio.<nas>.fnos.net/', '_blank')`——在浏览器里是新标签页，
-/// 而 WebView2 默认把这类请求**丢弃**（点图标什么都没发生）。本壳把这类请求接住：
-/// T14d 起不再是独立窗口，而是主窗口标签条里的一个新标签页（[`open_app_tab`]）。
+/// 而 WebView2 默认把这类请求**丢弃**（点图标什么都没发生）。T14d 起这类请求开成主窗口
+/// 标签条里的标签页（[`open_app_tab`]），这是本函数的主路径。
 ///
-/// 为什么返回 `Deny` 而不是 `Create`：`Window::add_child` 在 Windows 的**同步事件回调**
-/// 里会死锁（tauri 文档的 Known issues 明确警告），而 `on_new_window` 恰恰是同步回调。
-/// 所以这里把请求**转交**给异步任务后立即拒绝原生新窗口——标签页由 [`open_app_tab`]
-/// 在异步上下文里创建。代价是页面侧 `window.open` 的返回值是 `null`（fnOS 启动台与
-/// 已知应用都不使用返回值）。
+/// 但「标签页」不是真正的 `window.open`（T14e 用户实测的两类失败）：
+/// - `window.open('')` / `about:blank` 的弹窗流程要求**同步拿回真实 WindowProxy**，
+///   再往里 `document.write` 或设 `location`。转交异步开标签后返回值是 `null`，
+///   内容永远写不进去——用户看到的就是「新标签页一片空白」；
+/// - OAuth / SSO 登录弹窗要求 `window.opener`、opener 轮询 `popup.closed`、
+///   登录完成页 `window.close()` 关闭自己。宿主建的标签页没有 opener 关系，且
+///   WebView2 只允许**脚本打开的窗口**关闭自己——登录完成后结果永远回不到应用。
+///
+/// 所以这里做**混合裁定**（[`wants_native_popup`]）：`about:blank`、带窗口尺寸/坐标的
+/// `window.open(url, name, features)`、以及登录类地址（`/signin`、`/oauth`、`/auth/`…）
+/// 交给 `NewWindowResponse::Create` 建一个**真正的 WebView2 弹窗**——同一环境（cookie /
+/// storage 共享）、真实 opener、`window.open` 有返回值、`window.close()` 能关；
+/// 其余普通应用启动仍然开标签页，T14d 的形态不变。
+///
+/// 为什么只有弹窗走 `Create`：`Window::add_child` 在 Windows 的**同步事件回调**里会死锁
+/// （tauri 文档的 Known issues 明确警告），而 `on_new_window` 恰恰是同步回调；标签页由
+/// [`open_app_tab`] 在异步上下文里创建。`Create` 是 tauri/wry 为这个回调专门支持的窗口
+/// 创建路径（wry 先用 `dispatch_handler` 把回调转到消息循环再执行，tauri 文档的示例
+/// 就是在这个闭包里 `WebviewWindowBuilder::build()`），不碰 `add_child`。
 ///
 /// 复用闸门（T14e，用户实测「中继转发会一直新开标签」）：中继连接流程会**反复**
 /// `window.open` 同一地址——命中登记表（[`page_key`]，见 [`AppState::open_tabs`]）或
 /// main 当前页时**切换复用、绝不新开**；登记过的标签被关过则清掉条目照常新开。
+/// 弹窗**不走**这条闸门：浏览器对 `window.open` 的语义就是每次一个新窗口，去重会把
+/// 「重新发起登录」吞掉。
 ///
-/// 安全边界：只给 `http` / `https` / `about`（`about:blank` 是弹窗流程常见的起始页）
-/// 开标签页，其余协议（`file:` / `data:` / `javascript:` …）一律 `Deny` 并留一行日志，
-/// 且**不**转交。
+/// 安全边界：只给 `http` / `https` / `about` 放行，其余协议（`file:` / `data:` /
+/// `javascript:` …）一律 `Deny` 并留一行日志，且**不**转交。
 fn new_window_verdict<R: Runtime>(
     app: &AppHandle<R>,
+    opener_label: &str,
     url: tauri::Url,
+    features: tauri::webview::NewWindowFeatures,
 ) -> tauri::webview::NewWindowResponse<R> {
     match url.scheme() {
         "http" | "https" | "about" => {}
         other => {
             flog!("[fnos] 拒绝非 http(s) 的新窗口请求（scheme={other}）：{url}");
             return tauri::webview::NewWindowResponse::Deny;
+        }
+    }
+    // 弹窗必须在**同步回调里当场**建（Create）：一旦转交异步任务，opener 关系与
+    // `window.open` 的返回值就永久丢失——那正是空白标签 / 登录结果回不去应用的根因。
+    let popup = wants_native_popup(&url, &features);
+    flog!(
+        "[fnos] 新窗口请求 → {}：{}（size={:?} position={:?}）",
+        if popup { "原生弹窗" } else { "标签页" },
+        report::log_safe(url.as_str()),
+        features.size(),
+        features.position()
+    );
+    if popup {
+        if popup_rate_limited(app) {
+            flog!(
+                "[fnos] 弹窗请求过于频繁（{POPUP_RATE_MAX} 次 / {POPUP_RATE_WINDOW_MS}ms），已拒绝：{url}"
+            );
+            return tauri::webview::NewWindowResponse::Deny;
+        }
+        match create_popup_window(app, opener_label, &url, features) {
+            Ok(window) => return tauri::webview::NewWindowResponse::Create { window },
+            // 建窗失败（label 冲突 / WebView2 拒绝）时退回标签页：至少应用能打开，
+            // 只是登录类流程仍会受 opener 限制，日志里留证据。
+            Err(e) => flog!("[fnos] 原生弹窗创建失败，回退为标签页：{e}"),
         }
     }
     // 复用闸门（T14e：中继转发一直新开标签的止血）：目标页面已经有活着的标签
@@ -970,26 +1037,193 @@ fn new_window_verdict<R: Runtime>(
     tauri::webview::NewWindowResponse::Deny
 }
 
+/// Unix 毫秒时间戳（弹窗限速用；时钟回拨时返回 0，最多多放行一次）。
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// 纯限速判定：先把窗口外的旧记录删掉，再看窗口内是否已达上限。
+///
+/// 抽成纯函数是为了能在不构造 `AppHandle` 的情况下单测「窗口滑动」行为。
+fn popup_rate_exceeded(recent: &mut Vec<u64>, now_ms: u64) -> bool {
+    recent.retain(|t| now_ms.saturating_sub(*t) < POPUP_RATE_WINDOW_MS);
+    if recent.len() >= POPUP_RATE_MAX {
+        return true;
+    }
+    recent.push(now_ms);
+    false
+}
+
+/// 当前是否触发弹窗限速（会记录一次请求）。
+fn popup_rate_limited<R: Runtime>(app: &AppHandle<R>) -> bool {
+    let state = app.state::<AppState>();
+    let mut recent = state.popup_recent.lock().unwrap();
+    popup_rate_exceeded(&mut recent, now_unix_ms())
+}
+
+/// 是否必须开成**原生弹窗**（而不是主窗口标签页）。
+///
+/// 判据只取决于「这个请求是否依赖真实浏览器弹窗语义」：
+/// - `about:blank`：`window.open('')` 后由 opener 同步写内容 / 设地址，标签页接不住；
+/// - 带尺寸或坐标：典型的 `window.open(url, name, 'width=…,height=…')` 登录 / OAuth 弹窗；
+/// - 登录类地址：即使没写尺寸，`/signin`、`/oauth`、`/api/v1/auth/…` 这类地址也几乎一定
+///   依赖 `window.opener` 回传结果（用户实测：在标签页里登录完，应用收不到结果）。
+///
+/// 其余（应用启动的 `window.open(url, '_blank')` / `target=_blank`）继续开标签页。
+fn wants_native_popup(url: &tauri::Url, features: &tauri::webview::NewWindowFeatures) -> bool {
+    wants_native_popup_parts(url, features.size().is_some(), features.position().is_some())
+}
+
+/// [`wants_native_popup`] 的纯判定部分：不碰平台相关的 `NewWindowFeatures`，便于单测。
+fn wants_native_popup_parts(url: &tauri::Url, has_size: bool, has_position: bool) -> bool {
+    url.scheme() == "about" || has_size || has_position || is_auth_like_url(url)
+}
+
+/// 登录类地址：路径段或主机名带有明确的认证语义。
+///
+/// 只做**整段**匹配（`/author` 不算 `auth`），避免把普通页面误判成登录弹窗。
+fn is_auth_like_url(url: &tauri::Url) -> bool {
+    const AUTH_SEGMENTS: &[&str] = &[
+        "login",
+        "log-in",
+        "logon",
+        "signin",
+        "sign-in",
+        "auth",
+        "oauth",
+        "oauth2",
+        "authorize",
+        "authorization",
+        "sso",
+        "saml",
+        "openid",
+        "cas",
+    ];
+    let path_hit = url.path().split('/').filter(|s| !s.is_empty()).any(|seg| {
+        // `login.aspx` / `signin.html` 这类带扩展名的也按主名比较
+        let base = seg.split('.').next().unwrap_or(seg);
+        AUTH_SEGMENTS.iter().any(|t| base.eq_ignore_ascii_case(t))
+    });
+    if path_hit {
+        return true;
+    }
+    let host = url.host_str().unwrap_or("").to_ascii_lowercase();
+    ["login.", "signin.", "auth.", "accounts.", "account."]
+        .iter()
+        .any(|prefix| host.starts_with(prefix))
+}
+
+/// 两个 URL 是否同源（scheme + host + 默认端口规范化后的 port）。
+fn same_origin(a: &tauri::Url, b: &tauri::Url) -> bool {
+    a.scheme() == b.scheme()
+        && a.host_str() == b.host_str()
+        && a.port_or_known_default() == b.port_or_known_default()
+}
+
+/// 为一个需要真实浏览器语义的新窗口请求建**原生弹窗**。
+///
+/// 返回的 `WebviewWindow` 交给 `NewWindowResponse::Create`：wry 会把它接到 WebView2 的
+/// `NewWindowRequestedEventArgs.SetNewWindow` 上——opener 关系、`window.open` 的返回值、
+/// `postMessage` 与 `window.close()` 全部由 WebView2 自己维护。`.window_features(features)`
+/// 让新窗口复用 opener 的 WebView2 环境（同一个 user-data 目录 / cookie / storage），
+/// 登录状态与标签页共享。
+///
+/// 只对与 fnOS 主页面同源的弹窗（典型：fnOS 自带的 `/signin` 授权页）注入初始化脚本：
+/// 那套脚本里有「授权按钮可见性」等 CSS 修正；第三方登录页（GitHub / Google）不需要
+/// mods，也不该被 fnOS 的样式覆盖。判据同时看**目标地址**与 **opener 当前地址**——
+/// fnOS 桌面开出的 `about:blank` 弹窗之后可能被 opener 导航到任意站点，注入链要跟着走。
+fn create_popup_window<R: Runtime>(
+    app: &AppHandle<R>,
+    opener_label: &str,
+    url: &tauri::Url,
+    features: tauri::webview::NewWindowFeatures,
+) -> tauri::Result<tauri::WebviewWindow<R>> {
+    let n = app
+        .state::<AppState>()
+        .next_popup
+        .fetch_add(1, Ordering::Relaxed);
+    let label = format!("popup-{n}");
+    let has_position = features.position().is_some();
+    let cfg = current(app);
+    let main_url = resolve_main_url(&cfg, None);
+    let same_site = same_origin(&main_url, url)
+        || app
+            .get_webview(opener_label)
+            .and_then(|wv| wv.url().ok())
+            .map(|opener_url| same_origin(&main_url, &opener_url))
+            .unwrap_or(false);
+    let mut builder = WebviewWindowBuilder::new(
+        app,
+        &label,
+        // 与 tauri 文档示例一致：窗口先建在 about:blank，`SetNewWindow` 之后由 WebView2
+        // 把请求的目标地址接管进来（页面侧感知不到这个中转）。
+        WebviewUrl::External("about:blank".parse().expect("about:blank 是合法 URL")),
+    )
+    .window_features(features)
+    .title(tab_initial_title(url))
+    .on_document_title_changed(|window, title| {
+        // 弹窗标题跟随页面；与主窗口的标签标题互不干扰。
+        if !title.trim().is_empty() {
+            let _ = window.set_title(&title);
+        }
+    });
+    if !has_position {
+        builder = builder.center();
+    }
+    if same_site {
+        let script = init_script_cached(app, &cfg);
+        if !script.is_empty() {
+            builder = builder.initialization_script(script);
+        }
+    }
+    builder.build()
+}
+
+/// 按目标页面选择注入档位：
+/// - 与 fnOS 桌面同源的标签 → 完整载荷（缓存过的初始化脚本）；
+/// - 第三方标签 → 只注入标签快捷键（[`injector::build_core_script`]）。
+///
+/// 「同源」的比较对象是 [`resolve_main_url`]（与建窗/重建用的是同一份地址解析），
+/// 所以 `nasUrl`/`homeUrl` 的切换不会让这两个入口对同一个标签做出不同判断。
+fn init_script_for_tab<R: Runtime>(app: &AppHandle<R>, cfg: &Config, url: &tauri::Url) -> String {
+    let desktop = resolve_main_url(cfg, None);
+    if same_origin(&desktop, url) {
+        init_script_cached(app, cfg)
+    } else {
+        injector::build_core_script()
+    }
+}
+
 /// 为一个 `window.open` 请求（或标签条上的「+」）开一个**标签页**：主窗口里的新 Webview，
 /// 铺在标签栏（[`TAB_STRIP_H`]）以下的全部区域，创建即激活。
 ///
-/// - 与主标签共用同一组回调（[`tab_webview_builder`]）与注入载荷（mods / dock /
-///   keepalive / windowpos 照常生效；外部应用页面是否注入由 content-script 的 origin
-///   判定自行决定）；
+/// - 与主标签共用同一组回调（[`tab_webview_builder`]）；注入按 **origin 分档**
+///   （[`init_script_for_tab`]）：fnOS 桌面同源的标签拿完整载荷（mods / dock /
+///   keepalive / windowpos），第三方标签只拿标签快捷键；
 /// - 标签唯一（`tab-1`、`tab-2`…，进程内计数）；
 /// - 标题先取主机名第一段，之后跟随 `document.title`（[`handle_title`]）。
 pub async fn open_app_tab<R: Runtime>(app: &AppHandle<R>, url: tauri::Url) -> Result<String, String> {
     let window = app
         .get_window(MAIN_WINDOW)
         .ok_or_else(|| "主窗口未打开".to_string())?;
+    // 资源上限：标签页是完整 WebView2 实例，页面可控的 window.open 不能无限开。
+    let tab_count = app.state::<AppState>().tabs.lock().unwrap().order.len();
+    if tab_count >= MAX_OPEN_TABS {
+        flog!("[fnos] 标签页已达上限（{MAX_OPEN_TABS}），拒绝新开：{url}");
+        return Err(format!("标签页已达上限（{MAX_OPEN_TABS}）"));
+    }
     let n = app
         .state::<AppState>()
         .next_tab
         .fetch_add(1, Ordering::Relaxed);
     let label = format!("tab-{n}");
     let cfg = current(app);
-    // P0-2：走缓存，不再每次开标签都重读壁纸 + 重做 1 MiB base64
-    let script = init_script_cached(app, &cfg);
+    // P0-2：走缓存，不再每次开标签都重读壁纸 + 重做 1 MiB base64。
+    // 第三方标签只拿核心脚本（见 [`init_script_for_tab`]）。
+    let script = init_script_for_tab(app, &cfg, &url);
     let mut builder = tab_webview_builder(&label, url.clone(), app, None);
     if !script.is_empty() {
         builder = builder.initialization_script(script);
@@ -1407,37 +1641,50 @@ pub fn handle_title<R: Runtime>(webview: &Webview<R>, title: &str, app: &AppHand
         }
         return;
     }
-    // P0-3：标签页快捷键。**任何**标签页都能发（用户焦点在哪个标签就由哪个标签发），
-    // 所以这里不加 `is_main` 门；安全性由「动作白名单 + 冷却 + 命令本身就是用户点标签条
-    // 也能做的事」三条共同保证（见 [`KEY_COOLDOWN_MS`] / [`handle_tab_key`]）。
+    // P0-3：标签页快捷键。任何标签页都能发（焦点在哪个标签就由哪个标签发），但**只认
+    // 当前激活标签**：后台标签写 `FNOSKEY:close` 关掉用户正在用的标签不是「等价于点标签条」，
+    // 而是一条后台页面打断前台操作的通道。冷却/白名单保留为纵深防御。
     if let Some(action) = title.strip_prefix(KEY_TITLE_PREFIX) {
-        handle_tab_key(app, action);
+        let is_active = app.state::<AppState>().tabs.lock().unwrap().active == webview.label();
+        if is_active {
+            handle_tab_key(app, action);
+        }
         return;
     }
     // 现场排障 + 运行期证据（错误页会把自检结论写进标题，见 ui/settings/error.html）。
     //
     // `title` 是**页面可控**的（`document.title`）：日志只是它的一个渲染，必须过
-    // `report::log_safe`（fix round 1 / Important 1）——否则一句
-    // `document.title = "x\n[fnos] 页面上报已接受：…"` 就能在研究 stderr 里插出一行伪造日志。
-    // `set_title` 拿到的仍是**原文**：spec §7「窗口标题跟随页面」是产品行为，标题栏不承担
-    // 「证据」职责（Windows 会把标题栏里的控制字符当空白渲染），两者要求不同、处理也不同。
-    flog!("[fnos] 主窗口标题: {}", report::log_safe(title));
-    // T14d：标题进标签页注册表；活动标签的标题同时是**窗口标题**（任务栏显示用）。
+    // `report::log_safe`——否则一句 `document.title = "x\n[fnos] 页面上报已接受：…"`
+    // 就能在 stderr 里插出一行伪造日志。`set_title` 拿到的仍是**原文**。
+    //
+    // 先做**变化判定**：很多页面（含 fnOS 自己的保活）会反复写同一个标题；重复的
+    // 「写日志 + 全量 eval 推标签条」是页面可控的 UI/磁盘放大器。标题没变就直接返回。
     let label = webview.label();
-    if label != TITLEBAR_WEBVIEW {
-        {
-            let state = app.state::<AppState>();
-            let mut tabs = state.tabs.lock().unwrap();
-            if tabs.order.iter().any(|l| l == label) {
-                tabs.titles.insert(label.to_string(), title.to_string());
-            }
-        }
-        let active = app.state::<AppState>().tabs.lock().unwrap().active.clone();
-        if active == label {
-            let _ = webview.window().set_title(title);
-        }
-        push_tabs(app);
+    if label == TITLEBAR_WEBVIEW {
+        return;
     }
+    let (changed, active, registered) = {
+        let state = app.state::<AppState>();
+        let mut tabs = state.tabs.lock().unwrap();
+        let registered = tabs.order.iter().any(|l| l == label);
+        let changed = !registered || tabs.titles.get(label).map(String::as_str) != Some(title);
+        if registered && changed {
+            tabs.titles.insert(label.to_string(), title.to_string());
+        }
+        (changed, tabs.active == label, registered)
+    };
+    if !changed {
+        return;
+    }
+    flog!("[fnos] 主窗口标题: {}", report::log_safe(title));
+    if !registered {
+        return;
+    }
+    // T14d：活动标签的标题同时是**窗口标题**（任务栏显示用）。
+    if active {
+        let _ = webview.window().set_title(title);
+    }
+    push_tabs(app);
 }
 
 /// 处理一条标签页快捷键（P0-3）：`next` / `prev` / `close` / `new`，其余一律丢弃。
@@ -1446,8 +1693,8 @@ pub fn handle_title<R: Runtime>(webview: &Webview<R>, title: &str, app: &AppHand
 ///
 /// `document.title` 是页面可控的，任何站点都能写 `FNOSKEY:close`。三个理由让它不构成
 /// 安全问题：① 动作只有四个，且**每一个都等价于用户亲手点标签条**（关/切/开标签），
-/// 不触碰配置、文件系统、网络或任何 IPC 命令；② 只有真的把 fnOS 桌面开成标签页时才有
-/// 多个标签可操作，普通外部页刷这个前缀最多把当前标签切走一次；③ 下面的冷却把它压成
+/// 不触碰配置、文件系统、网络或任何 IPC 命令；② 调用方（[`handle_title`]）只接受
+/// **当前激活标签**发来的命令——后台页不能替你关掉正在用的标签；③ 下面的冷却把它压成
 /// 「120ms 最多一次」，刷屏不产生可感知影响。
 ///
 /// 动作不合法就静默丢弃（不写日志——这条通路人人都能触发，写日志等于给页面一个日志放大器）。
@@ -2567,10 +2814,19 @@ pub fn open_settings<R: Runtime>(app: &AppHandle<R>) {
 pub fn save_and_install_state<R: Runtime>(
     app: &AppHandle<R>,
     cfg: &Config,
-    recovered_from_backup: bool,
+    report: config::LoadReport,
 ) {
     let path = Config::config_path();
-    let _ = cfg.save(&path);
+    if report.read_failed {
+        // 读失败 ≠ 新装：本次运行用默认配置，但绝不把默认值写回磁盘——
+        // 原文件可能只是被临时占用/拒绝访问，覆盖它就是不可逆的数据丢失。
+        flog!(
+            "[fnos] 配置读取失败：本次启动使用默认配置且不写盘（原文件保留，路径 {}）",
+            path.display()
+        );
+    } else {
+        let _ = cfg.save(&path);
+    }
     app.manage(AppState {
         config: Mutex::new(cfg.clone()),
         recreating: AtomicBool::new(false),
@@ -2578,12 +2834,14 @@ pub fn save_and_install_state<R: Runtime>(
         recreate_display: Mutex::new(DisplayState::default()),
         load: Mutex::new(LoadState::default()),
         recreate_error: Mutex::new(None),
-        recovered_from_backup: AtomicBool::new(recovered_from_backup),
+        recovered_from_backup: AtomicBool::new(report.recovered_from_backup),
         page_report: Mutex::new(None),
         app_items_report: Mutex::new(None),
         chunk_report: Mutex::new(None),
         tabs: Mutex::new(TabState::with_main()),
         next_tab: AtomicU64::new(1),
+        next_popup: AtomicU64::new(1),
+        popup_recent: Mutex::new(Vec::new()),
         open_tabs: Mutex::new(std::collections::HashMap::new()),
         init_script: Mutex::new(None),
         last_key_at: AtomicU64::new(0),
@@ -3309,6 +3567,10 @@ mod tests {
             "设置窗的 capability 不得有 remote 块"
         );
         assert!(
+            remote_deny.contains("\"windows\": [\"main\", \"tab-*\", \"popup-*\"]"),
+            "远程拒绝能力必须覆盖主标签、应用标签与原生弹窗"
+        );
+        assert!(
             default_json.contains("\"windows\": [\"settings\"]"),
             "命令只授予设置窗（label = settings）"
         );
@@ -3721,31 +3983,53 @@ mod tests {
         );
     }
 
-    /// T14c 修复轮 11 → T14d 升级：`window.open` / `target=_blank` 必须开成**标签页**
-    /// （外部 Web 应用的启动路径）。实测：Hermes Studio 的启动就是 `window.open(url,
-    /// '_blank')`，浏览器里是新标签页，而 WebView2 默认丢弃 → 点图标什么都没发生。
-    /// 这里锁六件事：协议闸门、Deny + 异步转交（add_child 在同步回调里会死锁）、
-    /// 三个标签页命令、命令清单同步、标签条授权只给 titlebar、fnOS 主页标签不可关。
+    /// T14c 修复轮 11 → T14d 升级 → T14e 弹窗修复：`window.open` / `target=_blank` 走
+    /// **混合裁定**——普通应用启动（无窗口特征、非登录地址）开标签页；`about:blank`、
+    /// 带尺寸/坐标、登录类地址走 `Create` 建原生弹窗（保留 opener / 返回值 /
+    /// `window.close`，修「空白标签」与「登录后结果回不到应用」）。
+    ///
+    /// 这里锁：协议闸门、两条路径都存在且互斥、标签页仍走 Deny + 异步转交（`add_child`
+    /// 在同步回调里会死锁）、三个标签页命令、命令清单同步、标签条授权只给 titlebar、
+    /// fnOS 主页标签不可关。
     #[test]
-    fn new_window_requests_become_tabs() {
+    fn new_window_requests_become_tabs_or_popups() {
         let src = include_str!("commands.rs");
         let verdict = &src[src.find("fn new_window_verdict").expect("裁定函数必须存在")
             ..src.find("pub async fn open_app_tab").expect("标签页创建函数必须存在")];
         assert!(
             verdict.contains("\"http\" | \"https\" | \"about\""),
-            "只允许 http(s)/about 开标签页（file/data/javascript 一律拒绝）"
+            "只允许 http(s)/about 开新窗口（file/data/javascript 一律拒绝）"
         );
         assert!(
             verdict.contains("NewWindowResponse::Deny"),
-            "原生新窗口必须显式 Deny（标签页由异步任务创建）"
+            "标签页路径必须显式 Deny 原生新窗口（标签页由异步任务创建）"
         );
         assert!(
-            !verdict.contains("NewWindowResponse::Create"),
-            "不得再走 Create（add_child 在同步回调里会死锁，T14d）"
+            verdict.contains("NewWindowResponse::Create") && verdict.contains("create_popup_window"),
+            "弹窗路径必须走 Create（about:blank / 登录弹窗要求真实 opener 语义）"
+        );
+        assert!(
+            verdict.contains("wants_native_popup"),
+            "必须由纯判定函数决定弹窗 / 标签页，不能在裁定里手写一堆 if"
         );
         assert!(
             verdict.contains("tauri::async_runtime::spawn") && verdict.contains("open_app_tab"),
-            "允许的请求必须转交给异步任务开标签页"
+            "标签页请求必须转交给异步任务创建"
+        );
+        // 弹窗创建：窗口特征（含 WebView2 环境共享）+ 标题跟随 + 同源注入
+        let popup = &src[src.find("fn create_popup_window").expect("弹窗创建函数必须存在")
+            ..src.find("/// 为一个 `window.open` 请求").expect("标签页创建函数的文档必须紧随其后")];
+        assert!(
+            popup.contains(".window_features(features)"),
+            "弹窗必须带上 NewWindowFeatures（Windows 上靠它共享 WebView2 环境，否则 SetNewWindow 不成立）"
+        );
+        assert!(
+            popup.contains("on_document_title_changed"),
+            "弹窗标题必须跟随 document.title"
+        );
+        assert!(
+            popup.contains("initialization_script") && popup.contains("same_site"),
+            "只有与 fnOS 同源的弹窗才注入初始化脚本（第三方登录页不该被 mods 覆盖）"
         );
         assert!(
             src.matches(".on_new_window(").count() >= 1,
@@ -3764,9 +4048,15 @@ mod tests {
             "标签页与主标签共用同一组回调（generation = None：不进加载观测管线）"
         );
         assert!(
-            body.contains("init_script_cached(app, &cfg)"),
-            "标签页必须走**缓存过的**初始化脚本（P0-2：每次开标签都重读壁纸 + 重做 1 MiB base64 是纯浪费）"
+            body.contains("init_script_for_tab(app, &cfg, &url)"),
+            "标签页必须按 origin 选择注入档位（第三方标签不得拿完整 mods/dock/windowpos 载荷）"
         );
+        // 分档函数本身：同源 → 缓存过的完整脚本；第三方 → 只含 keys 的核心脚本
+        let tier_at = src.find("fn init_script_for_tab").expect("分档函数必须存在");
+        let tier = &src[tier_at..tier_at + 600];
+        assert!(tier.contains("same_origin(&desktop, url)"));
+        assert!(tier.contains("init_script_cached(app, cfg)"));
+        assert!(tier.contains("injector::build_core_script()"));
         assert!(
             body.contains("activate_tab(app, &label)"),
             "新标签页创建即激活"
@@ -3868,6 +4158,106 @@ mod tests {
             code.matches("background_color(tauri::window::Color").count(),
             2,
             "主窗口与错误页窗口都必须设标题栏同色背景"
+        );
+    }
+
+    /// T14e 混合裁定：哪些新窗口请求必须开成原生弹窗（而不是标签页）。
+    ///
+    /// 左边两类是用户实测失败过的场景；右边一类是 T14d 的标签页主路径，必须保持不变。
+    #[test]
+    fn popup_verdict_keeps_app_launches_as_tabs() {
+        let url = |s: &str| s.parse::<tauri::Url>().expect("测试 URL 合法");
+
+        // ① about:blank：window.open('') 后由 opener 同步写内容 / 设地址
+        assert!(
+            wants_native_popup_parts(&url("about:blank"), false, false),
+            "about:blank 必须开原生弹窗（标签页接不住 document.write / location 赋值）"
+        );
+        // ② 带窗口尺寸或坐标：典型登录弹窗 window.open(url, name, 'width=…')
+        assert!(
+            wants_native_popup_parts(&url("https://example.com/anywhere"), true, false),
+            "带尺寸的 window.open 必须开原生弹窗"
+        );
+        assert!(
+            wants_native_popup_parts(&url("https://example.com/anywhere"), false, true),
+            "带坐标的 window.open 必须开原生弹窗"
+        );
+        // ③ 登录类地址（用户日志里出现过的真实入口）
+        for s in [
+            "https://dsh.r2049.cn/api/v1/auth/q/2_AuHQ1fQUWrPPXRd_tIPKHq",
+            "https://ea121314.fnos.net/signin?client_id=Ov23liJ9BDdmuXo5RZMx",
+            "https://github.com/login",
+            "https://github.com/login/oauth/authorize?client_id=x&state=y",
+            "https://accounts.google.com/o/oauth2/v2/auth",
+            "https://example.com/portal/Login.aspx?ReturnUrl=%2f",
+        ] {
+            assert!(
+                wants_native_popup_parts(&url(s), false, false),
+                "登录类地址必须开原生弹窗（opener 要把结果回传给应用）：{s}"
+            );
+        }
+        // ④ 普通应用启动 / 外部链接：仍走标签页（T14d 的形态不变）
+        for s in [
+            "https://dsh.r2049.cn/",
+            "https://hermes-studio.ea121314.fnos.net/",
+            "https://github.com/dsh-market/dsh-market",
+            "https://fnos-apps-store.ea121314.fnos.net/",
+            "https://example.com/author",
+            "https://example.com/login-guide",
+        ] {
+            assert!(
+                !wants_native_popup_parts(&url(s), false, false),
+                "普通页面必须继续开标签页（不能把应用启动改成独立窗口）：{s}"
+            );
+        }
+    }
+
+    /// 同源判据只比较 scheme/host/默认端口：fnOS 主页面开出的 `/signin` 弹窗要命中，
+    /// 第三方登录页（GitHub / Google）不能命中——否则会把 fnOS 的 mods CSS 注进去。
+    #[test]
+    fn popup_injection_is_limited_to_the_fnos_origin() {
+        let url = |s: &str| s.parse::<tauri::Url>().expect("测试 URL 合法");
+        let main = url("https://ea121314.fnos.net/");
+        assert!(same_origin(&main, &url("https://ea121314.fnos.net/signin?client_id=x")));
+        assert!(same_origin(&url("https://x.fnos.net/a"), &url("https://x.fnos.net/b?q=1")));
+        assert!(!same_origin(&main, &url("https://github.com/login")));
+        assert!(!same_origin(&main, &url("http://ea121314.fnos.net/")));
+        assert!(!same_origin(&main, &url("https://ea121314.fnos.net:8443/")));
+    }
+
+    /// 弹窗限速：10 秒窗口内最多 5 个；窗口滑动后自动放行，旧记录被清理。
+    #[test]
+    fn popup_rate_limit_slides_and_caps() {
+        let mut recent = Vec::new();
+        for t in [1_000u64, 1_100, 1_200, 1_300, 1_400] {
+            assert!(!popup_rate_exceeded(&mut recent, t), "窗口内前 5 次必须放行：{t}");
+        }
+        assert!(popup_rate_exceeded(&mut recent, 1_500), "第 6 次必须拒绝");
+        assert_eq!(recent.len(), POPUP_RATE_MAX, "被拒绝的请求不入队");
+        // 窗口滑过第一条记录后，放行一次；其余仍在窗口内的记录保留
+        assert!(
+            !popup_rate_exceeded(&mut recent, 1_000 + POPUP_RATE_WINDOW_MS + 1),
+            "窗口滑动后必须恢复放行"
+        );
+        assert_eq!(recent.len(), POPUP_RATE_MAX);
+    }
+
+    /// 资源/频率闸门的源码锚点：标题未变不写日志不推标签条；标签页有上限；
+    /// `FNOSKEY` 只认当前激活标签（后台页不能关用户正在看的标签）。
+    #[test]
+    fn title_and_resource_limits_are_guarded() {
+        let src = include_str!("commands.rs");
+        assert!(src.contains("if !changed {"), "标题未变必须直接返回（不写日志、不推标签条）");
+        assert!(src.contains("MAX_OPEN_TABS"), "必须有标签页上限");
+        assert!(src.contains("popup_rate_limited"), "必须有弹窗限速");
+        let key_at = src
+            .find("if let Some(action) = title.strip_prefix(KEY_TITLE_PREFIX)")
+            .expect("FNOSKEY 分支必须存在");
+        let key_branch = &src[key_at..src.len().min(key_at + 600)];
+        assert!(
+            key_branch.contains("tabs.lock().unwrap().active == webview.label()")
+                && key_branch.contains("if is_active"),
+            "FNOSKEY 必须只接受激活标签发来的命令"
         );
     }
 }

@@ -32,10 +32,11 @@ fn main() {
             }
         }))
         .setup(|app| {
-            // Task 11：`load_config` 的第二个返回值是「本次会话是否从 config.json.bak 回退」，
-            // 必须经 `save_and_install_state` 带进 AppState（读配置时状态还没被 manage）。
-            let (cfg, recovered_from_backup) = commands::load_config(app.handle());
-            commands::save_and_install_state(app.handle(), &cfg, recovered_from_backup);
+            // Task 11：`load_config` 的第二个返回值是加载报告（是否从 .bak 回退、是否
+            // 读取失败），必须经 `save_and_install_state` 带进 AppState——读配置时状态
+            // 还没被 manage，且「读失败」要阻止默认值覆盖磁盘。
+            let (cfg, load_report) = commands::load_config(app.handle());
+            commands::save_and_install_state(app.handle(), &cfg, load_report);
 
             // Finding 1：这里不再有 `cfg.shell.home_url.parse().expect("home url")`——
             // 地址经 `resolve_main_url` 逐级校验回落（覆盖 → nasUrl → homeUrl → 默认常量），

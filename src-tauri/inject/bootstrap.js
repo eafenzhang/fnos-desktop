@@ -12,6 +12,7 @@
   var CSS_RECHECK_DELAY = 600; // 上游 link 注入偏晚时的第二次自检
   var POLL_INTERVAL = 250;     // 无 MutationObserver 时的退化轮询间隔
   var POLL_MAX = 20;           // 有界：始终不出现就永不动手
+  var MOD_SCRIPT_WAIT_MS = 10000; // 观察器上限：非 fnOS 页面永远不会出现该标记
   var CSS_IDS = [
     'fnos-ui-mods-basic-style',
     'fnos-ui-mods-titlebar-style',
@@ -126,11 +127,13 @@
     '.login-form:not(:has(.semi-form-field-password)) ' +
     '.semi-button-primary:not(.semi-button-disabled)' +
     '{visibility:visible !important;}' +
-    // 桌面壁纸（fnOS 的 live 壁纸 webp，object-fit: cover）**顶行本身就是一条亮蓝线**（实测
-    // rgb(38,77,143)，只占 1px）。裁掉壁纸顶部 1px，那条线就没有了；下方由页面底色承接，
-    // 视觉无缝。
+    // 桌面壁纸（fnOS 的 live 壁纸图片）**顶行本身就是一条亮蓝线**（实测 rgb(38,77,143)，
+    // 只占 1px），必须裁掉。旧做法 `clip-path: inset(1px 0 0 0)` 会**露出页面底色**
+    // （body 的 #4a5568→#3a424f 渐变）——纯色/深色壁纸时就变成标题栏下一条灰蓝细线
+    // （用户实测）。改成把壁纸层整体**上移 1px 并加高 1px**：顶行的蓝线移到视口外，
+    // 底部仍与容器对齐，不露任何底色；图片壁纸与纯色壁纸都适用（两种都实测过）。
     '#root .absolute.inset-0.z-0.object-contain' +
-    '{clip-path:inset(1px 0 0 0) !important;}';
+    '{top:-1px !important;bottom:auto !important;height:calc(100% + 1px) !important;}';
 
   /**
    * Dock 预留清除（T14c 修复轮 14～15）——**单独一张表，按自动隐藏开关装卸**。
@@ -340,6 +343,14 @@
           onModScriptSeen();
         });
         observer.observe(root, { childList: true, subtree: true });
+        // 非 fnOS 页面（第三方应用标签）上该标记永远不会出现：给观察器一个有界寿命，
+        // 否则整页生命周期都在每次 DOM 变更时跑 findModScript。到点后静默断开，
+        // 与「上游不注入就永不执行」的语义一致。
+        setTimeout(function () {
+          if (seen) return;
+          seen = true;
+          try { observer.disconnect(); } catch (e) { /* ignore */ }
+        }, MOD_SCRIPT_WAIT_MS);
         return;
       } catch (e) { /* 构造/观察失败 → 退化轮询 */ }
     }

@@ -562,6 +562,16 @@ pub fn build_init_script_with(cfg: &Config, wallpaper: Option<WallpaperAsset>) -
     )
 }
 
+/// 第三方标签页的**最小注入脚本**：只保留标签快捷键（Ctrl+T / Ctrl+W / Ctrl+Tab）。
+///
+/// 为什么分档：完整载荷里的上游 mods、dock、windowpos、keepalive 都只对 **fnOS 页面**
+/// 有意义。把它们注进外部应用标签会带来全文档观察器、向第三方 origin 发保活请求、
+/// 安装 `chrome.*` 改变站点特性检测，以及最多 1.5 MB（图标 + 壁纸）的每页内存开销。
+/// 标签快捷键依赖 `keys.js`（只写 `document.title`），必须在所有标签可用，所以留在核心档。
+pub fn build_core_script() -> String {
+    format!("/* fnOS Desktop Shell core v{SHELL_VERSION} */\n{KEYS_JS}\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -890,6 +900,25 @@ mod tests {
             v.get("binaryAssets").is_none(),
             "未配置完美图标且没有壁纸时不得输出 binaryAssets（默认载荷必须与 T13a 一致）"
         );
+    }
+
+    /// 第三方标签的核心脚本只保留快捷键：不得再带上游 mods、dock、windowpos、保活或
+    /// chrome.* 兼容层（这些只对 fnOS 页面有意义，注到外部标签是纯开销与误伤）。
+    #[test]
+    fn core_script_is_keys_only() {
+        let s = build_core_script();
+        assert!(s.contains(KEYS_JS), "核心脚本必须包含 keys.js");
+        assert!(s.contains("FNOSKEY:"), "快捷键前缀必须在");
+        for (name, section) in [
+            ("shim", SHIM_JS),
+            ("bootstrap", BOOTSTRAP_JS),
+            ("dock", DOCK_JS),
+            ("keepalive", KEEPALIVE_JS),
+            ("windowpos", WINDOWPOS_JS),
+            ("content-script", CONTENT_SCRIPT_JS),
+        ] {
+            assert!(!s.contains(section), "核心脚本不得包含 {name}");
+        }
     }
 
     #[test]

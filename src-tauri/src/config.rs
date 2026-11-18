@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use url::Url;
 
 pub const SCHEMA_VERSION: u32 = 1;
@@ -608,12 +611,19 @@ pub struct LoadReport {
     /// 本次加载是否因**文件内容不可用**而回落默认值，且损坏原件已留成 `<path>.bak`
     /// （`.bak` 的写入结果参与判定：写不成功就不声称「已保留」）。
     pub recovered_from_backup: bool,
+    /// 是否能**确定文件不存在**（全新安装）之外的读取失败：共享冲突、权限、IO 错误等。
+    ///
+    /// 这一位存在的唯一目的，是阻止启动路径把「读失败」当成「新装」并把默认配置写回
+    /// 磁盘——那会把一份可能完好的用户配置永久覆盖掉。读失败时本次运行仍用默认配置
+    /// （内存态），但**不落盘**，原文件留给用户/排障流程处理。
+    pub read_failed: bool,
 }
 
 /// 把损坏原文写成 `.bak`，并按「是否真的写成功」给出报告（Task 11 的状态条据此回显）。
 fn write_backup(path: &Path, text: &str) -> LoadReport {
     LoadReport {
         recovered_from_backup: std::fs::write(bak_path(path), text).is_ok(),
+        read_failed: false,
     }
 }
 
@@ -840,7 +850,7 @@ fn sanitize_config_value(raw: Value) -> Value {
     root.insert("local".into(), Value::Object(local));
 
     let mut shell = take_object(&mut root, "shell");
-    for key in ["homeUrl", "nasUrl"] {
+    for key in ["homeUrl", "nasUrl", "updateMirrorPrefix"] {
         sanitize_string_field(&mut shell, key);
     }
     for key in ["injectEnabled", "closeToTray", "dockAutoHide"] {
@@ -944,13 +954,19 @@ impl Config {
     pub fn load_with_report(path: &Path) -> (Config, LoadReport) {
         let bytes = match std::fs::read(path) {
             Ok(b) => b,
-            Err(_) => {
-                // 读失败（含文件不存在）：尽力拷原件留证，再回落默认
-                let copied = std::fs::copy(path, bak_path(path)).is_ok();
+            Err(e) => {
+                // 只有 NotFound 能确定是「全新安装」：其余读取失败（共享冲突 / 权限 / IO）
+                // 都可能有一份完好的配置在盘上，绝不能当成新装后写默认值覆盖。
+                let missing = e.kind() == std::io::ErrorKind::NotFound;
+                if !missing {
+                    // 尽力留证；失败也不影响后面的「不写盘」决定
+                    let _ = std::fs::copy(path, bak_path(path));
+                }
                 return (
                     Config::default(),
                     LoadReport {
-                        recovered_from_backup: copied,
+                        recovered_from_backup: false,
+                        read_failed: !missing,
                     },
                 );
             }
@@ -964,6 +980,7 @@ impl Config {
                     Config::default(),
                     LoadReport {
                         recovered_from_backup: copied,
+                        read_failed: false,
                     },
                 );
             }
@@ -1002,9 +1019,37 @@ impl Config {
         }
         let mut cfg = self.clone();
         cfg.normalize();
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, serde_json::to_string_pretty(&cfg).unwrap())?;
-        std::fs::rename(&tmp, path)
+        let bytes = serde_json::to_vec_pretty(&cfg).unwrap();
+        // 两个保存者共用同一个 `.tmp` 会互相截断（set_config 在配置锁外保存；关窗几何
+        // 保存来自另一条线程）。固定临时名 + 无锁是数据损坏的入口：短的那份写完后，
+        // 长文件会留下尾部残字节，rename 出来的就是坏 JSON。
+        // 现在：进程内串行 + 每次唯一临时名 + rename 前落盘。
+        static SAVE_LOCK: Mutex<()> = Mutex::new(());
+        static TMP_SEQ: AtomicU64 = AtomicU64::new(1);
+        let _guard = SAVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let file_name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "config.json".into());
+        let tmp = path.with_file_name(format!(
+            "{file_name}.{}.{}.tmp",
+            std::process::id(),
+            TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut file = std::fs::File::create(&tmp)?;
+        if let Err(e) = file.write_all(&bytes).and_then(|_| file.sync_all()) {
+            drop(file);
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+        drop(file);
+        match std::fs::rename(&tmp, path) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                Err(e)
+            }
+        }
     }
 }
 
@@ -1869,6 +1914,79 @@ mod tests {
         let d = load(&missing);
         assert_eq!(d.mods.brand_color, DEFAULT_BRAND_COLOR);
         assert!(!dir.join("nope.json.bak").exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 真正的 IO 读失败（不是「文件不存在」）必须与「全新安装」区分开：
+    /// 调用方据此**禁止把默认配置写回磁盘**，否则一份只是被临时占用的配置会被永久覆盖。
+    #[test]
+    fn io_read_failure_is_reported_and_must_not_be_treated_as_fresh_install() {
+        let dir = temp_dir("io-read-fail");
+        let p = dir.join("config.json");
+        // 用目录冒充配置文件：std::fs::read 会返回非 NotFound 的 IO 错误
+        std::fs::create_dir_all(&p).unwrap();
+        let (cfg, report) = Config::load_with_report(&p);
+        assert_eq!(cfg.mods.brand_color, DEFAULT_BRAND_COLOR);
+        assert!(report.read_failed, "IO 读取失败必须标记 read_failed");
+        assert!(!report.recovered_from_backup, "读失败不得谎称从备份恢复");
+        assert!(p.is_dir(), "读取失败路径不得动原路径");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// §6.5 的承诺也覆盖 `shell.updateMirrorPrefix`：单个键类型不对只回落它自己，
+    /// 不得触发「整份配置重置」。
+    #[test]
+    fn bad_update_mirror_prefix_type_does_not_reset_the_rest() {
+        let dir = temp_dir("bad-mirror-prefix");
+        let p = dir.join("config.json");
+        std::fs::write(
+            &p,
+            br#"{
+              "mods": { "fontFamily": "KeepMe" },
+              "shell": { "updateMirrorPrefix": 5, "dockAutoHide": true }
+            }"#,
+        )
+        .unwrap();
+        let c = load(&p);
+        assert_eq!(c.mods.font_family, "KeepMe", "坏键不得丢掉其它字段");
+        assert!(c.shell.dock_auto_hide);
+        assert_eq!(c.shell.update_mirror_prefix, "", "坏类型只回落它自己");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 并发保存（settings 保存与关窗几何保存可能同时发生）不得写坏 config.json：
+    /// 每次保存用唯一临时名并串行化，结果必须是某一份完整配置。
+    #[test]
+    fn concurrent_saves_never_corrupt_the_file() {
+        let dir = temp_dir("concurrent-save");
+        let p = dir.join("config.json");
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let p = p.clone();
+            handles.push(std::thread::spawn(move || {
+                let mut c = Config::default();
+                c.mods.font_family = format!("ThreadFont{i}");
+                c.save(&p).unwrap();
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        let (c, report) = Config::load_with_report(&p);
+        assert!(!report.read_failed && !report.recovered_from_backup, "结果必须是可解析的完整配置");
+        assert!(
+            (0..8).any(|i| c.mods.font_family == format!("ThreadFont{i}")),
+            "落盘的必须是某一线程写出的完整配置，实际是：{}",
+            c.mods.font_family
+        );
+        // 唯一临时文件必须在 rename 后消失
+        let leftovers: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "残留临时文件：{leftovers:?}");
         std::fs::remove_dir_all(&dir).ok();
     }
 

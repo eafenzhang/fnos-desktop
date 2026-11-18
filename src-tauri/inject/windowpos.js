@@ -337,6 +337,19 @@
         for (var k = 0; k < hits.length; k++) place(hits[k]);
       }
     }
+    sweepDetached();
+  }
+
+  /**
+   * 清掉已从文档移除的窗口：窗口被移除时**不会**产生它自己的属性变更，
+   * 其逐窗口 MutationObserver 与 `tracked` 里的强引用会一直留到下一次 resize。
+   * 全局观察器每次回调顺带扫一遍（受管窗口只有个位数，成本可忽略）。
+   */
+  function sweepDetached() {
+    for (var i = tracked.length - 1; i >= 0; i--) {
+      var st = tracked[i];
+      if (!st || !st.el || !st.el.isConnected) stopTrack(st);
+    }
   }
 
   /** 页面加载时就已存在的窗口（上次会话留下的）也一并居中。 */

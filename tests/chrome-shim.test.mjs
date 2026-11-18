@@ -165,7 +165,16 @@ test('分区：上游 popup.js 是逐字节原样的，只有 popup.html 多一�
   // 所以 D4 的拒绝是纵深防御：代码路径存在（popup.js:2161-2196），控件不在。
   const html = read('../ui/settings/popup.html');
   const vendoredHtml = read('../src-tauri/assets/fnos-mods/popup.html');
-  assert.equal(html.length, vendoredHtml.length + 43, '只允许插入那一行 43 字节的 shim 标签');
+  // 不比较字节数（换行/空白/工具变化就会误报）：把唯一允许插入的那一行去掉后，
+  // 其余内容必须与 vendored 副本逐字相同（行尾统一后再比）。
+  const shimLine = /^[ \t]*<script src="\.\/chrome-shim\.js"><\/script>\r?\n/m;
+  assert.ok(shimLine.test(html), '必须插入 chrome-shim 标签');
+  const normalizeEol = (s) => s.replace(/\r\n/g, '\n');
+  assert.equal(
+    normalizeEol(html.replace(shimLine, '')),
+    normalizeEol(vendoredHtml),
+    '除那一行 shim 标签外，popup.html 必须与 vendored 副本逐字相同',
+  );
   assert.ok(html.includes('<script src="./chrome-shim.js"></script>'));
   assert.ok(vendoredHtml.includes('<!-- <div class="field">\n        <p class="field-label">导入字体文件')
     || vendoredHtml.includes('导入字体文件'), '上游 popup.html 里字体导入控件是注释状态');

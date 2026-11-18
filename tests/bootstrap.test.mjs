@@ -125,9 +125,12 @@ test('本壳样式覆盖：绝对定位的整屏覆盖层恢复不透明（应�
       '.semi-button-primary:not(.semi-button-disabled){visibility:visible !important;}') >= 0,
     '必须有「授权页主按钮放行」的规则（无密码框 login-form 才命中）',
   );
-  // 桌面壁纸顶行的亮蓝线：裁掉壁纸顶部 1px
-  assert.ok(css.indexOf('#root .absolute.inset-0.z-0.object-contain{clip-path:inset(1px 0 0 0) !important;}') >= 0,
-    '必须有「裁掉壁纸顶部 1px」的规则');
+  // 桌面壁纸顶行的亮蓝线：不能用 clip-path 顶裁（会露出 body 渐变，纯色壁纸时变成一条线），
+  // 必须把壁纸层上移 1px 并加高 1px —— 顶行移到视口外，且不露底色。
+  assert.ok(css.indexOf('#root .absolute.inset-0.z-0.object-contain{top:-1px !important;bottom:auto !important;height:calc(100% + 1px) !important;}') >= 0,
+    '必须有「壁纸层上移 1px 并加高 1px」的规则');
+  assert.ok(!css.includes('clip-path:inset(1px 0 0 0)'),
+    '不得再用 clip-path 顶裁（会把页面底色露成一条线）');
 });
 
 // Dock 预留清除（T14c 修复轮 14～15）：与上面那张表**分开**，按自动隐藏开关装卸。
@@ -296,6 +299,7 @@ test('上游始终不注入时不会执行 mod.js', () => {
   assert.equal(w.__FNOS_MOD_EXECUTED__, undefined);
   assert.equal(w.__FNOS_MOD_FALLBACK_FAILED__, undefined);
   assert.equal(w.__FNOS_BOOTSTRAP__.modFallbackUsed, false);
+  assert.equal(doc._observerDisconnected, true, '非 fnOS 页面的观察器必须有界（超时断开）');
 });
 
 test('元素在装配时已存在则立即进入检查（不再观察）', () => {

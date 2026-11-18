@@ -12,7 +12,7 @@ import assert from 'node:assert/strict';
 import { readdirSync, readFileSync } from 'node:fs';
 import {
   adoptConfig, appItemsAnswer, appItemsFromReport, applyPatchFromPopup,
-  isTooLargeReport, pageCheckAnswer, reportSlots, state,
+  isTooLargeReport, pageCheckAnswer, reportSlots, sanitizePopupPatch, state,
 } from '../ui/settings/app.js';
 import * as bridge from '../ui/settings/bridge.js';
 import { PREFECT_ICON_PATH } from '../ui/settings/normalize.js';
@@ -252,6 +252,45 @@ test('F: 上游消息里的每个派生键都落进 patch（白名单），其�
   assert.deepEqual(applyPatchFromPopup({ type: 'FNOS_APPLY', evil: 1 }), {});
   assert.deepEqual(applyPatchFromPopup(null), {});
   assert.deepEqual(applyPatchFromPopup({ fontSettings: 'x', customCodeSettings: 7 }), {});
+});
+
+test('宿主桥补丁白名单：mods/local 放行，shell 只放行 dockAutoHide，其余键显式拒绝', () => {
+  assert.deepEqual(
+    sanitizePopupPatch({ mods: { brandColor: '#123456' } }),
+    { mods: { brandColor: '#123456' } },
+  );
+  assert.deepEqual(
+    sanitizePopupPatch({ local: { customJsCode: 'void 0' }, shell: { dockAutoHide: true } }),
+    { local: { customJsCode: 'void 0' }, shell: { dockAutoHide: true } },
+  );
+  // 宿主安全键 / 未知段 / 错误类型 / 非对象：全部拒绝（不静默丢弃）
+  for (const bad of [
+    { shell: { homeUrl: 'https://evil.example.com/' } },
+    { shell: { dockAutoHide: true, injectEnabled: false } },
+    { shell: { updateMirrorPrefix: 'https://evil.example.com/' } },
+    { shell: { dockAutoHide: 'yes' } },
+    { anyTopLevelKey: 1 },
+    null,
+    [],
+    'x',
+  ]) {
+    assert.throws(() => sanitizePopupPatch(bad), /不允许修改|必须是/,
+      `必须拒绝越权补丁：${JSON.stringify(bad)}`);
+  }
+});
+
+test('宿主桥只接受同源帧、回复用明确 origin；WA 就绪判定把 chromeReady 算进去', () => {
+  const app = readFileSync(new URL('../ui/settings/app.js', import.meta.url), 'utf8');
+  assert.ok(app.includes('if (event.origin !== origin) return;'),
+    '必须校验帧消息的 origin（跨源帧不得驱动宿主命令）');
+  assert.ok(app.includes('}, origin);'),
+    '回复必须发往明确 origin（不得再用 *）');
+  assert.ok(app.includes('const ready = !!siteToggle && !!version && chromeReady;'),
+    'ready 必须把 chromeReady 算进去（静态 HTML 元素不能证明脚本跑通）');
+  assert.ok(app.includes('installHostBridge(ipcReady)') && app.includes('if (ipcReady) window[BRIDGE_FLAG] = true;'),
+    '只有 IPC 真的可用时才立桥标志');
+  assert.ok(app.includes('reload_main: () => api.reloadMain(null)'),
+    'iframe 不得指定 reload_main 的导航目标（只允许重载当前地址）');
 });
 
 test('F: 列表过大的诊断被认出来并原样带给上游（不让它干等「未读取到应用」）', () => {

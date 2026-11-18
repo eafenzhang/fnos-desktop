@@ -87,6 +87,7 @@
   var reclaimed = [];    // 被中和的预留（{el, prop, prev}，prev = 原内联值，'' = 原本没有）
   var observer = null;   // MutationObserver：Dock 出现 / 被替换时重新接管
   var locateScheduled = false;
+  var locateTimer = null; // scheduleLocate 的待触发句柄（teardown 必须取消）
   var axis = 'x';        // Dock 贴边方向：'x'（左右缘）或 'y'（上下缘）
   var edgeMin = true;    // true = 贴在坐标最小的一侧（左/上）；false = 右/下
   var shown = false;     // 显隐意图（与 HIDDEN_CLASS 互斥）；接管默认 false = 平时是藏着的
@@ -487,6 +488,9 @@
   /** 重新找 Dock 并接管。已接管的元素不变；旧元素被换掉时把自己加的东西清干净。 */
   function locate() {
     locateScheduled = false;
+    // 关掉自动隐藏后，之前排队的 locate 不得再跑：否则它会重新接管 Dock 并按
+    // shown=false 落态，把 Dock 重新藏起来（指针处理器已停用，只能刷新恢复）。
+    if (!enabled) return;
     var found = findDock();
     if (found && found !== dock) {
       // fnOS 会重建 Dock 元素（悬浮等时机）：这里只释放旧元素的接管标记，
@@ -518,7 +522,10 @@
   function scheduleLocate() {
     if (locateScheduled) return;
     locateScheduled = true;
-    W.setTimeout(locate, LOCATE_DELAY_MS);
+    locateTimer = W.setTimeout(function () {
+      locateTimer = null;
+      locate();
+    }, LOCATE_DELAY_MS);
   }
 
   /** 无操作兜底：IDLE_MS 内没有任何指针事件就藏（iframe 吞事件的场景只有它能救）。 */
@@ -571,6 +578,8 @@
 
   function teardown() {
     if (observer) { observer.disconnect(); observer = null; }
+    if (locateTimer) { W.clearTimeout(locateTimer); locateTimer = null; }
+    locateScheduled = false;
     if (idleTimer) { W.clearTimeout(idleTimer); idleTimer = null; }
     if (displayTimer) { W.clearTimeout(displayTimer); displayTimer = null; }
     D.removeEventListener('pointermove', onPointerMove);

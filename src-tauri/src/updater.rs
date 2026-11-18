@@ -27,6 +27,7 @@ use crate::commands::save_window_geom;
 use crate::logfile::flog;
 use crate::paths::config_dir;
 use serde_json::Value;
+use std::io::Read;
 use tauri::{AppHandle, Runtime};
 
 /// 本壳的 GitHub 仓库（`owner/repo`）。
@@ -48,43 +49,58 @@ const DOWNLOAD_PATH_PREFIX: &str = "/releases/download/";
 const DOWNLOAD_CONNECT_TRIES: u32 = 2;
 const DOWNLOAD_RETRY_DELAY_MS: u64 = 1200;
 
-/// 镜像前缀的 host 校验：拒绝本机 / 环回 / 内网 / 链路本地 / 保留地址（字符串级判定——
-/// 这些 host 形态出现即拒绝），其余公网 host 交由用户自己选择与信任（HTTPS 保证传输）。
+/// 镜像前缀的 host 校验：拒绝本机 / 环回 / 内网 / 链路本地 / 保留地址。
+///
+/// 先把 host 当 IP 字面量解析（`url::Url::host_str()` 对 IPv6 保留方括号），再用
+/// `IpAddr` 的语义判定——字符串前缀判定漏掉了 IPv4-mapped IPv6（`::ffff:127.0.0.1`）
+/// 与 `*.localhost`（RFC 6761 全部解析到环回）。
 fn host_is_allowed_for_mirror(host: &str) -> bool {
-    let h = host.trim().trim_start_matches('[').trim_end_matches(']').to_ascii_lowercase();
-    if h.is_empty() || h == "localhost" || h.ends_with(".local") || h.ends_with(".arpa") {
+    let h = host
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    if h.is_empty()
+        || h == "localhost"
+        || h.ends_with(".localhost")
+        || h.ends_with(".local")
+        || h.ends_with(".arpa")
+    {
         return false;
     }
-    // IPv6 字面量（含冒号）才做地址段判定。**必须先判冒号**：`url::Url::host_str()` 返回
-    // 的域名可以是 `fc…` / `fd…` 开头（`fcdn.example.com`、`fdroid-mirror.org`），
-    // 旧判定 `starts_with("fc")` 会把这类**正常公网镜像域名**一并拒掉。
-    if h.contains(':') {
-        if h == "::1" || h == "::" || h.starts_with("fe80:") {
-            return false; // 环回 / 未指定 / 链路本地
-        }
-        // ULA 是 `fc00::/7` = 首字节 0xfc 或 0xfd
-        if h.starts_with("fc") || h.starts_with("fd") {
-            return false;
-        }
-    }
-    // IPv4 私有 / 环回 / 保留段按首段数字判定
-    let first = h.split('.').next().and_then(|s| s.parse::<u32>().ok());
-    if let Some(octet) = first {
-        // 0.*（本网络）、10.*、127.*、169.254.*、172.16-31.*、192.168.*、100.64-127.*（CGNAT）
-        let private = matches!(octet, 0 | 10 | 127)
-            || h.starts_with("169.254.")
-            || h.starts_with("192.168.")
-            || (h.starts_with("172.") && {
-                let second = h.split('.').nth(1).and_then(|s| s.parse::<u32>().ok());
-                matches!(second, Some(n) if (16..=31).contains(&n))
-            })
-            || (h.starts_with("100.") && {
-                let second = h.split('.').nth(1).and_then(|s| s.parse::<u32>().ok());
-                matches!(second, Some(n) if (64..=127).contains(&n))
-            });
-        if private {
-            return false;
-        }
+    if let Ok(ip) = h.parse::<std::net::IpAddr>() {
+        return match ip {
+            std::net::IpAddr::V4(v4) => {
+                let o = v4.octets();
+                let cgnat = o[0] == 100 && (64..=127).contains(&o[1]);
+                let this_network = o[0] == 0;
+                !(v4.is_loopback()
+                    || v4.is_private()
+                    || v4.is_link_local()
+                    || v4.is_unspecified()
+                    || v4.is_multicast()
+                    || v4.is_broadcast()
+                    || v4.is_documentation()
+                    || cgnat
+                    || this_network)
+            }
+            std::net::IpAddr::V6(v6) => {
+                // IPv4-mapped（::ffff:a.b.c.d）必须按内嵌的 IPv4 判定，否则
+                // [::ffff:127.0.0.1] / [::ffff:192.168.1.5] 会冒充公网地址。
+                if let Some(v4) = v6.to_ipv4_mapped() {
+                    return host_is_allowed_for_mirror(&v4.to_string());
+                }
+                let seg = v6.segments();
+                let unique_local = (seg[0] & 0xfe00) == 0xfc00; // fc00::/7
+                let link_local = (seg[0] & 0xffc0) == 0xfe80; // fe80::/10
+                !(v6.is_loopback()
+                    || v6.is_unspecified()
+                    || v6.is_multicast()
+                    || unique_local
+                    || link_local)
+            }
+        };
     }
     true
 }
@@ -128,6 +144,9 @@ const API_TIMEOUT_SECS: u64 = 10;
 const DOWNLOAD_TIMEOUT_SECS: u64 = 120;
 /// 下载结果的健全性下限（字节）：NSIS 安装包正常 ~3MB，明显小于它的当失败丢弃。
 const MIN_INSTALLER_BYTES: u64 = 1_000_000;
+/// 下载结果的硬上限（字节）：正常安装包 ~3MB，256 MiB 足以容纳任何合理增长，
+/// 同时能挡住「坏镜像返回无限流」把磁盘写满。Content-Length 与流式读取两道都查。
+const MAX_INSTALLER_BYTES: u64 = 256 * 1024 * 1024;
 
 pub fn current_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
@@ -199,6 +218,9 @@ pub fn validate_download_url(raw: &str) -> Result<String, String> {
 /// **它可能不存在**（GitHub 对 2024 年前上传的资产不回填 digest，本仓库早期的 release 就是
 /// 这种），所以类型是 `Option<String>`，由下载路径决定「没有 digest 时怎么办」——
 /// 见 [`download_installer`] 的保守策略。
+///
+/// **失败关闭**：资产带了 `digest` 字段但认不出来（别的算法 / 长度不对 / 非字符串）时
+/// 直接 `Err`，绝不退化成「没有 digest」——那会让一次格式漂移悄悄关掉校验。
 pub fn pick_installer_asset(release: &Value) -> Result<(String, String, Option<String>), String> {
     let assets = release
         .get("assets")
@@ -214,10 +236,7 @@ pub fn pick_installer_asset(release: &Value) -> Result<(String, String, Option<S
         if !(name.ends_with("x64-setup.exe") && !url.is_empty()) {
             continue;
         }
-        let digest = asset
-            .get("digest")
-            .and_then(|d| d.as_str())
-            .and_then(parse_sha256_digest);
+        let digest = asset_sha256(asset)?;
         if name.starts_with("fnOS_") {
             return Ok((url.to_string(), name.to_string(), digest));
         }
@@ -226,6 +245,23 @@ pub fn pick_installer_asset(release: &Value) -> Result<(String, String, Option<S
         }
     }
     fallback.ok_or_else(|| "发布页上没有找到 x64 安装包（*x64-setup.exe）".to_string())
+}
+
+/// 读取一个 release 资产的 digest：
+/// - 字段缺失 / `null` → `None`（老 release 的既有形态）；
+/// - 字段存在但无法识别（非字符串 / 非 `sha256:<64 hex>`）→ `Err`（失败关闭）。
+fn asset_sha256(asset: &Value) -> Result<Option<String>, String> {
+    match asset.get("digest") {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => {
+            let raw = value.as_str().ok_or_else(|| {
+                "release 资产的 digest 不是字符串，已拒绝（无法校验）".to_string()
+            })?;
+            parse_sha256_digest(raw)
+                .map(Some)
+                .ok_or_else(|| format!("release 资产的 digest 无法识别（{raw}），已拒绝（无法校验）"))
+        }
+    }
 }
 
 /// 解析 GitHub 的 `digest` 字段：只接受 `sha256:` + 64 位十六进制，其余（别的算法、
@@ -321,6 +357,8 @@ fn download_installer(
     // 连接超时单列 15s：os error 10060 这类连接失败必须快速返回，
     // 不然按总超时 120s 重试一次就是最长 4 分钟白等。
     let agent = ureq::AgentBuilder::new()
+        // 只允许 HTTPS：默认会跟随 3xx，若某次重定向被降级到 http，TLS 保护就静默消失了。
+        .https_only(true)
         .timeout_connect(std::time::Duration::from_secs(15))
         .timeout(std::time::Duration::from_secs(DOWNLOAD_TIMEOUT_SECS))
         .build();
@@ -333,6 +371,17 @@ fn download_installer(
             .call()
         {
             Ok(resp) => {
+                // 先看声明的长度：超上限的响应连临时文件都不该创建
+                if let Some(len) = resp
+                    .header("Content-Length")
+                    .and_then(|v| v.trim().parse::<u64>().ok())
+                {
+                    if len > MAX_INSTALLER_BYTES {
+                        return Err(format!(
+                            "安装包体积异常（声明 {len} 字节，超过上限 {MAX_INSTALLER_BYTES} 字节），已放弃下载"
+                        ));
+                    }
+                }
                 reader = Some(resp.into_reader());
                 break;
             }
@@ -352,15 +401,25 @@ fn download_installer(
     };
     let mut file = std::fs::File::create(&part)
         .map_err(|e| format!("写安装包失败：{e}"))?;
-    std::io::copy(&mut reader, &mut file).map_err(|e| {
+    // 上限兜底：Content-Length 可能缺失/撒谎，流式写入必须有硬上限，
+    // 否则一个坏镜像（或错误页）能把系统盘写满。
+    let copied = {
+        let mut limited = reader.by_ref().take(MAX_INSTALLER_BYTES + 1);
+        std::io::copy(&mut limited, &mut file)
+    };
+    if let Err(e) = copied {
+        drop(file);
         let _ = std::fs::remove_file(&part);
-        format!("下载中断：{e}")
-    })?;
-    let size = file
-        .metadata()
-        .map(|m| m.len())
-        .unwrap_or(0);
+        return Err(format!("下载中断：{e}"));
+    }
+    let size = copied.unwrap_or(0);
     drop(file);
+    if size > MAX_INSTALLER_BYTES {
+        let _ = std::fs::remove_file(&part);
+        return Err(format!(
+            "安装包超过体积上限（>{MAX_INSTALLER_BYTES} 字节），已丢弃"
+        ));
+    }
     if size < MIN_INSTALLER_BYTES {
         let _ = std::fs::remove_file(&part);
         return Err(format!("下载的安装包不完整（{size} 字节）"));
@@ -581,10 +640,17 @@ pub fn check_from_tray<R: Runtime>(app: AppHandle<R>) {
         }
     };
 
+    // 没有 digest 的老 release 只能按体积判定：这是真实的安全缺口，安装确认里必须
+    // 明确说出来（不能只在 app.log 里写一行用户永远看不到的字）。
+    let verify_note = if expected_sha256.is_some() {
+        ""
+    } else {
+        "⚠ 该 release 没有可用的 sha256 digest，安装包未做内容校验。\n\n"
+    };
     let choice = message_box(
         "fnOS 检查更新",
         &format!(
-            "发现新版本 {tag}（当前 v{current}），安装包已下载。\n\n点「确定」立即安装并自动重启；点「取消」下次再说。"
+            "发现新版本 {tag}（当前 v{current}），安装包已下载。\n\n{verify_note}点「确定」立即安装并自动重启；点「取消」下次再说。"
         ),
         MB_ICON_INFO | MB_OKCANCEL,
     );
@@ -701,6 +767,23 @@ mod tests {
         assert!(pick_installer_asset(&empty).is_err(), "没有资产要如实失败");
         let none = json!({ "tag_name": "v0.2.0" });
         assert!(pick_installer_asset(&none).is_err(), "缺 assets 字段要如实失败");
+
+        // digest 字段存在但认不出（别的算法 / 非字符串 / 空串）：必须失败关闭，
+        // 不得退化成「没有 digest」继续按体积放行。
+        for bad_digest in [json!("md5:abcdef"), json!(5), json!("")] {
+            let release = json!({
+                "tag_name": "v0.2.0",
+                "assets": [{
+                    "name": "fnOS_0.2.0_x64-setup.exe",
+                    "browser_download_url": "https://github.com/eafenzhang/fnos-desktop/releases/download/v0.2.0/fnOS_0.2.0_x64-setup.exe",
+                    "digest": bad_digest
+                }]
+            });
+            assert!(
+                pick_installer_asset(&release).is_err(),
+                "无法识别的 digest 必须拒绝（失败关闭）"
+            );
+        }
     }
 
     /// `digest` 只认 `sha256:` + 64 位十六进制。别的算法 / 长度不对 / 带杂字符一律当
@@ -872,10 +955,17 @@ mod tests {
             "https://100.64.0.1/",                             // CGNAT
             "https://169.254.0.1/",                            // 链路本地
             "https://[fd00::1]/",                              // ULA
+            "https://[::ffff:127.0.0.1]/",                     // IPv4-mapped 环回（旧判定漏网）
+            "https://[::ffff:c0a8:105]/",                      // IPv4-mapped 192.168.1.5
+            "https://foo.localhost/",                          // RFC 6761：*.localhost 全部是环回
             "not a url",
         ] {
             assert!(validate_mirror_prefix(bad).is_err(), "必须拒绝：{bad}");
         }
+        assert!(
+            validate_mirror_prefix("https://[2001:4860:4860::8888]/").is_ok(),
+            "公网 IPv6 字面量必须放行"
+        );
         // 拼接形态：前缀 + 完整原始 URL（ghproxy 系加速服务通用格式）
         let raw = format!(
             "https://{DOWNLOAD_HOST}/{APP_REPO_SLUG}{DOWNLOAD_PATH_PREFIX}v0.9.9/fnOS_0.9.9_x64-setup.exe"

@@ -10,8 +10,10 @@
 # 发版靠 `git tag && git push` 直接出包——测试红了也照样发。测试 job 失败会直接拦住
 # 后面的 build job（`needs: test`），发版流程因此有了一道真正的门。
 #
-# 发版流程：把 src-tauri/tauri.conf.json 与 src-tauri/Cargo.toml 的 version **一起**改成
-# 新版本 → commit → `git tag vX.Y.Z && git push origin master vX.Y.Z`。
+# 发版流程：把 src-tauri/tauri.conf.json、src-tauri/Cargo.toml 与 package.json 的 version
+# **一起**改成新版本 → commit → `git tag vX.Y.Z && git push origin master vX.Y.Z`。
+# tag 必须是严格三段数字（updater 只解析这种形状）；CI 会强制校验四者一致。
+# Release 先以 draft 创建，安装包资产校验通过（存在 + 带 sha256 digest）后才自动 publish。
 # 托盘「检查更新」读的就是这个 Release（api.github.com/.../releases/latest）。
 name: build-and-release
 
@@ -37,6 +39,8 @@ jobs:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -52,9 +56,16 @@ jobs:
 
       # Rust 单测：其中相当一部分是「读源码断言」式的跨语言锁（注入段序、授权面、
       # 常量一致性），它们不需要 WebView2 运行时，可以在 CI 里跑。
+      # `--locked`：不允许构建过程中静默解析出与提交的 Cargo.lock 不同的依赖。
       - name: Rust unit tests
         working-directory: src-tauri
-        run: cargo test --all-targets
+        run: cargo test --all-targets --locked
+
+      # clippy 先作为**告警**门禁（不 -D warnings）：既有基线有若干条风格告警，
+      # 这里至少保证 deny 级别的错误与明显回归在 CI 里能看见。
+      - name: Rust lint (clippy)
+        working-directory: src-tauri
+        run: cargo clippy --all-targets --locked
 
   build:
     needs: test
@@ -69,6 +80,28 @@ jobs:
         with:
           workspaces: src-tauri
 
+      # 发版一致性闸门：tag / Cargo.toml / tauri.conf.json / package.json 必须四者一致，
+      # 且 tag 必须是 updater 能解析的严格三段数字。否则装完还是旧版、永远提示更新。
+      - name: Verify version and tag
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          if ($tag -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+$') {
+            throw "tag 必须是 vX.Y.Z（updater 只认严格三段数字）：$tag"
+          }
+          $conf = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          $cargo = (Select-String -Path src-tauri/Cargo.toml -Pattern '^version = "([^"]+)"' | Select-Object -First 1).Matches.Groups[1].Value
+          $pkg = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          if ($cargo -ne $conf) { throw "Cargo.toml ($cargo) != tauri.conf.json ($conf)" }
+          if ($pkg -ne $conf) { throw "package.json ($pkg) != tauri.conf.json ($conf)" }
+          if ($tag -ne "v$conf") { throw "tag ($tag) != 版本 (v$conf)" }
+
+      # lockfile 一致性：构建开始前就失败，而不是让依赖解析悄悄漂移。
+      - name: Verify lockfile is up to date
+        working-directory: src-tauri
+        run: cargo metadata --locked --format-version 1 > $null
+
       - name: Build & release (tag) / Build only (branch)
         uses: tauri-apps/tauri-action@v0
         env:
@@ -78,9 +111,29 @@ jobs:
           tagName: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
           releaseName: 'fnOS Desktop ${{ github.ref_name }}'
           releaseBody: '下载 fnOS_*_x64-setup.exe 双击安装（per-user，不需要管理员）。本壳会通过托盘「检查更新」提示新版本。'
-          releaseDraft: false
+          # 先建 **draft**：上传/校验通过后才在下一步发布。否则上传失败会在
+          # /releases/latest 留下一个没有安装包的公开 release，所有用户检查更新都报错。
+          releaseDraft: true
           prerelease: false
           args: --bundles nsis
+
+      # 资产校验 + 发布：安装包必须存在且有 sha256 digest（updater 的完整性校验依据）。
+      # 任何一项不满足都保持 draft 并让 job 失败，绝不把未校验/不完整的 release 推给用户。
+      - name: Verify assets and publish release
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $release = gh api "repos/${{ github.repository }}/releases/tags/$tag" | ConvertFrom-Json
+          $installer = $release.assets | Where-Object { $_.name -like 'fnOS_*_x64-setup.exe' } | Select-Object -First 1
+          if (-not $installer) { throw "release 里没有 fnOS_*_x64-setup.exe 资产，保持 draft 不发布" }
+          if (-not $installer.digest -or -not $installer.digest.StartsWith('sha256:')) {
+            throw "安装包资产没有 sha256 digest；updater 会退化为体积校验，拒绝发布"
+          }
+          gh release edit $tag --draft=false
+          Write-Host "published $tag ($($installer.name), $($installer.digest))"
 
       - name: Upload installer artifact (branch builds)
         if: github.ref_type != 'tag'

@@ -52,52 +52,69 @@
    *
    * `main`（fnOS 桌面）**不渲染成普通标签**，而是合并成最左的「桌面」元素：
    * 品牌图标 + NAS 名称（修复轮 6，用户要求），点击回到桌面；外部应用标签随后。
+   *
+   * 用户要求（标签样式改造）：**首页标签永远固定在最左**，与宿主推送顺序无关；
+   * 重复的 `main` 条目只渲染一次，且永远不渲染关闭钮（main 不可关闭）。
    */
   function render(state) {
     var tabs = state && Array.isArray(state.tabs) ? state.tabs : [];
     var host = D.getElementById('tabs');
     if (!host) return;
     host.textContent = '';
+    var home = null;
+    var rest = [];
     tabs.forEach(function (tab) {
       if (tab.id === 'main') {
-        var name = nasName(tab.title);
-        var home = D.createElement('div');
-        home.className = 'home' + (tab.active ? ' active' : '');
-        home.dataset.tabId = 'main';
-        home.dataset.action = 'switch';
-        home.title = name;
-        var img = D.createElement('img');
-        img.src = 'icons/icon16.png';
-        img.alt = 'fnOS';
-        img.setAttribute('draggable', 'false');
-        home.appendChild(img);
-        var label = D.createElement('span');
-        label.className = 'home-name';
-        label.textContent = name;
-        home.appendChild(label);
-        host.appendChild(home);
+        if (!home) home = tab;
         return;
       }
-      var item = D.createElement('div');
-      item.className = 'tab' + (tab.active ? ' active' : '');
-      item.dataset.tabId = String(tab.id);
-      item.dataset.action = 'switch';
-      item.title = String(tab.title == null ? tab.id : tab.title);
-      var title = D.createElement('span');
-      title.className = 'tab-title';
-      title.textContent = String(tab.title == null ? tab.id : tab.title);
-      item.appendChild(title);
-      if (tab.canClose) {
-        var close = D.createElement('button');
-        close.className = 'tab-close';
-        close.dataset.action = 'close';
-        close.dataset.tabId = String(tab.id);
-        close.textContent = GLYPH_CLOSE;
-        close.title = '关闭标签页';
-        item.appendChild(close);
-      }
-      host.appendChild(item);
+      rest.push(tab);
     });
+    if (home) renderHome(host, home);
+    rest.forEach(function (tab) { renderTab(host, tab); });
+  }
+
+  /** 「桌面」元素：fnOS 品牌图标 + NAS 名称，固定最左、不可关闭。 */
+  function renderHome(host, tab) {
+    var name = nasName(tab.title);
+    var home = D.createElement('div');
+    home.className = 'home' + (tab.active ? ' active' : '');
+    home.dataset.tabId = 'main';
+    home.dataset.action = 'switch';
+    home.title = name;
+    var img = D.createElement('img');
+    img.src = 'icons/icon16.png';
+    img.alt = 'fnOS';
+    img.setAttribute('draggable', 'false');
+    home.appendChild(img);
+    var label = D.createElement('span');
+    label.className = 'home-name';
+    label.textContent = name;
+    home.appendChild(label);
+    host.appendChild(home);
+  }
+
+  /** 一个外部应用标签（固定 144px；关闭钮由 canClose 决定）。 */
+  function renderTab(host, tab) {
+    var item = D.createElement('div');
+    item.className = 'tab' + (tab.active ? ' active' : '');
+    item.dataset.tabId = String(tab.id);
+    item.dataset.action = 'switch';
+    item.title = String(tab.title == null ? tab.id : tab.title);
+    var title = D.createElement('span');
+    title.className = 'tab-title';
+    title.textContent = String(tab.title == null ? tab.id : tab.title);
+    item.appendChild(title);
+    if (tab.canClose) {
+      var close = D.createElement('button');
+      close.className = 'tab-close';
+      close.dataset.action = 'close';
+      close.dataset.tabId = String(tab.id);
+      close.textContent = GLYPH_CLOSE;
+      close.title = '关闭标签页';
+      item.appendChild(close);
+    }
+    host.appendChild(item);
   }
 
   /** maximize 按钮引用（供 __FNOS_WIN_MAX_SET__ 切换字形）。 */

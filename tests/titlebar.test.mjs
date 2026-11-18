@@ -93,6 +93,32 @@ test('渲染：main 合并为最左「桌面」元素（品牌图标 + NAS 名�
   assert.equal(doc.getElementById('tabs').children.length, 2);
 });
 
+test('用户参考图样式：平铺标签、激活蓝色、首页固定最左不可关、+ 前有 1px 分隔线', () => {
+  const { doc } = fakeTitlebar();
+  const w = loadTitlebar(doc);
+  // 故意把 main 排在中间，并给 main 也写 canClose=true：渲染必须纠正
+  w.__FNOS_TABS_SET__({
+    tabs: [
+      { id: 'tab-9', title: 'app', active: false, canClose: true },
+      { id: 'main', title: 'MiniNas - 飞牛 fnOS', active: false, canClose: true },
+      { id: 'tab-10', title: 'app2', active: true, canClose: true },
+    ],
+  });
+  const kids = doc.getElementById('tabs').children;
+  assert.equal(kids[0].dataset.tabId, 'main', '首页永远固定在最左（与推送顺序无关）');
+  assert.equal(kids.length, 3, 'main 只渲染一次，外部标签顺序保持');
+  assert.ok(!kids[0].children.some((c) => c.className === 'tab-close'),
+    '首页不可关闭（即使推送里写了 canClose=true）');
+  assert.ok(kids[2].className.includes('active'), '激活态照旧按宿主推送渲染');
+  // 样式：激活 = 蓝色文字、无胶囊底；+ 左侧有 1px 整高分隔线
+  assert.ok(TB_CSS.includes('--accent: #3773f5;'), '激活色 = 参考图蓝色');
+  assert.ok(/\.tab\.active \{ color: var\(--accent\); \}/.test(TB_CSS), '激活标签必须蓝色文字');
+  assert.ok(!/\.tab\.active \{[^}]*background/.test(TB_CSS), '激活标签不得有胶囊底');
+  assert.ok(TB_HTML.includes('class="bar-sep"'), 'HTML 必须有 + 左侧分隔线');
+  assert.ok(/\.bar-sep \{[^}]*width: 1px;[^}]*align-self: stretch;/.test(TB_CSS),
+    '分隔线必须 1px 整高');
+});
+
 test('nasName：剥「- 飞牛 fnOS」后缀；剥不出原样；空回退 fnOS', () => {
   const { doc } = fakeTitlebar();
   const w = loadTitlebar(doc);

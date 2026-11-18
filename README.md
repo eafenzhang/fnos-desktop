@@ -104,10 +104,16 @@ npm test                    # 前端契约测试（shim / bootstrap / dock / win
 
 发版流程：
 
-1. 把 `src-tauri/tauri.conf.json` 与 `src-tauri/Cargo.toml` 的 `version` **一起**改成新版本
-   （两者必须一致：前者决定安装包名，后者是托盘「检查更新」比对用的当前版本）；
-2. commit 后 `git tag vX.Y.Z && git push origin master vX.Y.Z`；
-3. CI 构建完成即发布，已装用户通过托盘「检查更新」自动升级。
+1. 把 `src-tauri/tauri.conf.json`、`src-tauri/Cargo.toml` 与 `package.json` 的 `version`
+   **一起**改成新版本（三者必须一致：conf 决定安装包名，Cargo 是托盘「检查更新」比对用的
+   当前版本，package.json 由契约测试钉住）；
+2. commit 后 `git tag vX.Y.Z && git push origin master vX.Y.Z`（tag 必须是严格 `vX.Y.Z`；
+   CI 会校验 tag 与三处版本一致，不一致直接失败）；
+3. CI 先建 **draft** Release，上传安装包并校验资产存在且带 `sha256:` digest 后才自动发布；
+   已装用户通过托盘「检查更新」自动升级。
+
+> 本地构建用 GNU 工具链（见上），GitHub Actions 的 `windows-latest` 用 MSVC 构建发布包；
+> 两者都能产出 NSIS 安装包，差异只在 host 工具链，不影响产物。
 
 ## 目录
 

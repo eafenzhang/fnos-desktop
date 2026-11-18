@@ -345,14 +345,63 @@ async function fetchPageSnapshot() {
 
 // ---------- 宿主桥（iframe 里的 chrome-shim → 本文件 → IPC） ----------
 
+/** iframe 补丁允许出现的顶层配置段。 */
+const POPUP_PATCH_TOP_KEYS = new Set(['mods', 'local', 'shell']);
+
+/**
+ * 把 iframe 发来的 `set_config` 补丁收窄到**上游界面真正需要的范围**。
+ *
+ * 命令白名单只限制「调哪条命令」，不限制参数内容：上游 popup 是本地资产，但一旦它被
+ * 导航到跨源页面（拖入 URL / 上游 UI 出一次 XSS），`set_config` 就能直接改
+ * `shell.homeUrl` / `injectEnabled` / `updateMirrorPrefix` 这类**宿主安全键**。
+ * 这里只放行 mods / local 两个业务段与 `shell.dockAutoHide`（上游注入的开关），
+ * 其它键显式报错（不静默丢弃，便于发现上游行为变化）。
+ */
+export function sanitizePopupPatch(patch) {
+  if (!patch || typeof patch !== 'object' || Array.isArray(patch)) {
+    throw new Error('配置补丁必须是对象');
+  }
+  for (const key of Object.keys(patch)) {
+    if (!POPUP_PATCH_TOP_KEYS.has(key)) {
+      throw new Error(`上游界面不允许修改配置项：${key}`);
+    }
+  }
+  const out = {};
+  for (const section of ['mods', 'local']) {
+    if (patch[section] === undefined) continue;
+    const value = patch[section];
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      throw new Error(`${section} 补丁必须是对象`);
+    }
+    out[section] = value;
+  }
+  if (patch.shell !== undefined) {
+    const shell = patch.shell;
+    if (!shell || typeof shell !== 'object' || Array.isArray(shell)) {
+      throw new Error('shell 补丁必须是对象');
+    }
+    for (const key of Object.keys(shell)) {
+      if (key !== 'dockAutoHide') {
+        throw new Error(`上游界面不允许修改 shell.${key}`);
+      }
+    }
+    if (typeof shell.dockAutoHide !== 'boolean') {
+      throw new Error('shell.dockAutoHide 必须是布尔值');
+    }
+    out.shell = { dockAutoHide: shell.dockAutoHide };
+  }
+  return out;
+}
+
 /**
  * iframe 允许调用的**命令白名单**。表外的一切命令名都会被拒绝（回 `ok:false` 的错误）——
  * iframe 是我们自己的 shim，但「它能调什么」不该由它自己决定。
  */
 const HOST_COMMANDS = {
   get_config: () => api.getConfig(),
-  set_config: (a) => api.setConfig(a.patch),
-  reload_main: (a) => api.reloadMain(a && a.url ? a.url : null),
+  set_config: (a) => api.setConfig(sanitizePopupPatch(a && a.patch)),
+  // 上游 shim 只以 `url: null`（重载当前地址）调用；不允许 iframe 指定导航目标。
+  reload_main: () => api.reloadMain(null),
   get_page_state: () => api.getPageState(),
   get_page_report: () => api.getPageReport(),
   get_local_store: () => api.getLocalStore(),
@@ -367,7 +416,7 @@ const HOST_COMMANDS = {
   },
   app_items: () => answerAppItems(),
   apply: async (a) => {
-    const patch = applyPatchFromPopup(a && a.message);
+    const patch = sanitizePopupPatch(applyPatchFromPopup(a && a.message));
     if (!Object.keys(patch).length) return {};
     const res = await api.setConfig(patch);
     adoptConfig(res.config);
@@ -379,19 +428,29 @@ const HOST_COMMANDS = {
   },
 };
 
-/** 安装宿主桥：把 iframe 的命令请求派发到白名单，并把结果回传。 */
-export function installHostBridge() {
+/**
+ * 安装宿主桥：把 iframe 的命令请求派发到白名单，并把结果回传。
+ *
+ * `ipcReady`：本次启动 `get_config` 是否真的成功。只有成功才立 `BRIDGE_FLAG`——
+ * shim 用这个标志判断「宿主通路可用」；IPC 不可用时宁可让它显示失败说明，也不要
+ * 立一个看似正常、实际每条命令都失败的标志。
+ */
+export function installHostBridge(ipcReady) {
   if (!domReady() || typeof window.addEventListener !== 'function') return;
-  window[BRIDGE_FLAG] = true;
+  if (ipcReady) window[BRIDGE_FLAG] = true;
   window[SNAPSHOT_KEY] = snapshot;
+  const origin = window.location.origin;
   window.addEventListener('message', (event) => {
+    // 只接受同源帧：上游页面是本地资产，origin 必须与设置窗一致。若帧被导航到跨源
+    // 文档，它拿到的只是「不是给它的」消息，且它的请求/数据不会被宿主处理。
+    if (event.origin !== origin) return;
     const frame = document.getElementById('upstreamFrame');
     if (!frame || event.source !== frame.contentWindow) return;
     const data = event.data;
     if (!data || typeof data !== 'object' || data[REQ] !== true) return;
     const reply = (ok, value, error) => {
       try {
-        frame.contentWindow.postMessage({ [REP]: true, id: data.id, ok, value, error }, '*');
+        frame.contentWindow.postMessage({ [REP]: true, id: data.id, ok, value, error }, origin);
       } catch (e) { /* 帧已经没了：这次调用按失败处理即可 */ }
     };
     const handler = Object.prototype.hasOwnProperty.call(HOST_COMMANDS, data.cmd)
@@ -495,7 +554,11 @@ export function probeUpstreamFrame() {
   const notice = doc.getElementById('fnosShellNotice');
   const chromeObj = win && win.chrome;
   const upstreamGroups = doc.querySelectorAll('#nav, #pane, .nav-item');
-  const ready = !!siteToggle && !!version;
+  const chromeReady = !!(chromeObj && chromeObj.storage && chromeObj.storage.sync && chromeObj.runtime);
+  // `#siteToggle` / `code.version` 是 popup.html 里的**静态元素**：脚本全挂掉它们也在。
+  // 必须把 chromeReady 也算进 ready，否则「chrome-shim 没跑起来 / popup.js 首行抛错」
+  // 会被误报为渲染成功，失败说明反而被隐藏。
+  const ready = !!siteToggle && !!version && chromeReady;
   return {
     mounted: true,
     sameOrigin: true,
@@ -506,7 +569,7 @@ export function probeUpstreamFrame() {
     siteToggle: !!siteToggle,
     appListEmptyText: appList ? String(appList.textContent).trim().slice(0, 80) : null,
     appListItemCount: appList ? appList.querySelectorAll('.launchpad-app-item').length : 0,
-    chromeReady: !!(chromeObj && chromeObj.storage && chromeObj.storage.sync && chromeObj.runtime),
+    chromeReady,
     retiredGroupUiPresent: upstreamGroups.length > 0,
     notice: notice ? String(notice.textContent).replace(/\s+/g, ' ').slice(0, 500) : null,
   };
@@ -587,13 +650,17 @@ export async function refresh() {
  * 导出以便单测；无 DOM 时模块加载不会自动执行（见文件末尾）。
  */
 export async function boot() {
+  let ipcReady = false;
   try {
     adoptConfig(await api.getConfig());
+    ipcReady = true; // 一次真实 IPC 成功 = 宿主通路可用（不再另加 ping 命令）
   } catch (e) {
-    // 读不到配置也要把桥和帧装起来：chrome-shim 对空快照有明确的兜底与失败说明
+    // 读不到配置也要把帧装起来：chrome-shim 对空快照有明确的兜底与失败说明。
+    // 但**不立** BRIDGE_FLAG——让 shim 走「宿主桥不可用」的失败显示，而不是一个
+    // 看似就绪、每条命令都失败的界面。
   }
   await fetchPageSnapshot();
-  installHostBridge();
+  installHostBridge(ipcReady);
   mountUpstreamFrame();
   // 运行期证据口（UIA / WebView2 CDP 都读它）：帧内自检 + 当前快照，用于证明
   // 「渲染出来的是上游 UI，不是本壳退休掉的分组 UI」。

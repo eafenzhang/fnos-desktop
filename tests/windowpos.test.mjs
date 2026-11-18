@@ -141,6 +141,20 @@ function setArea(ctx, w, h) {
   ctx.win.drain(); // rAF 那一趟 + 补正那一趟
 }
 
+test('窗口从 DOM 移除后立即释放逐窗口观察器与 tracked 引用（不等到 resize）', () => {
+  const el = fakeEl({ isWindow: true, w: 1100, h: 640 });
+  const ctx = fakeCtx({ windows: [el] });
+  const w = load(ctx);
+  assert.equal(w.__FNOS_WINDOWPOS_STATE__().tracked, 1, '初始扫描必须接管已有窗口');
+  const perWindow = ctx.doc._mos.find((m) => m.target === el);
+  assert.ok(perWindow, '窗口必须有逐窗口属性观察器');
+
+  el.isConnected = false; // 从 DOM 移除（移除不会产生它自己的属性变更）
+  fireDoc(ctx, [{ addedNodes: [], removedNodes: [el] }]);
+  assert.equal(w.__FNOS_WINDOWPOS_STATE__().tracked, 0, '移除后必须清掉 tracked');
+  assert.equal(perWindow.disconnected, true, '逐窗口观察器必须断开');
+});
+
 test('落位是**同步**的：观察回调返回时窗口已经在正中（不推进任何定时器）', () => {
   const ctx = fakeCtx();
   load(ctx);
