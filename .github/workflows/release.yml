@@ -126,7 +126,9 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $tag = "${{ github.ref_name }}"
-          $release = gh api "repos/${{ github.repository }}/releases/tags/$tag" | ConvertFrom-Json
+          # 注意：不能用 `/releases/tags/{tag}` —— 该端点对 **draft** release 返回 404
+          # （实测 v0.3.14 发布时踩到）。`gh release view` 能按 tag 读到 draft。
+          $release = gh release view "$tag" --json assets | ConvertFrom-Json
           $installer = $release.assets | Where-Object { $_.name -like 'fnOS_*_x64-setup.exe' } | Select-Object -First 1
           if (-not $installer) { throw "release 里没有 fnOS_*_x64-setup.exe 资产，保持 draft 不发布" }
           if (-not $installer.digest -or -not $installer.digest.StartsWith('sha256:')) {
