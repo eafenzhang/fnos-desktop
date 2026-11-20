@@ -1,15 +1,17 @@
 //! 托盘图标 + 菜单（spec §7）。
 //!
-//! **T14c 修复轮 21 起的菜单是 5 个动作项 + 1 条分隔线**，全部是无状态的瞬时动作：
+//! **T14g 起的菜单是 4 个动作项 + 1 条分隔线**，全部是无状态的瞬时动作：
 //!
 //! ```text
 //! 显示窗口     → 显示 + 前置主窗口（最小化则先还原；不再是显示/隐藏开关）
 //! 重新加载     → 以当前配置重建主窗口
 //! 系统设置     → 打开设置窗
-//! 检查更新     → 查 GitHub Releases（crate::updater），有新版可去发布页下载
 //! ──────────
 //! 退出         → 退出
 //! ```
+//!
+//! 「检查更新」按用户要求**移进设置页**（设置 → 更新：检查、实时下载进度、安装重启）：
+//! 托盘菜单只保留基础动作，更新这种带过程反馈的操作放在能看到进度的窗口里做。
 //!
 //! 于是 `sync_menus` 这条「把配置推给菜单」的通路**整体消失**了：勾选项「注入 mods」
 //! 移出托盘（该开关只在设置窗，经 `set_config` 生效），「打开 NAS」连同它的 `nasUrl`
@@ -43,10 +45,9 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     // 任何 IPC 授权，重试入口必须由宿主提供——这里是其中之一（另一个是设置窗状态条的「重试」）。
     let reload = MenuItem::with_id(app, "reload", "重新加载", true, None::<&str>)?;
     let settings = MenuItem::with_id(app, "settings", "系统设置", true, None::<&str>)?;
-    let check_update = MenuItem::with_id(app, "check-update", "检查更新", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
     let sep = PredefinedMenuItem::separator(app)?;
-    let menu = Menu::with_items(app, &[&show, &reload, &settings, &check_update, &sep, &quit])?;
+    let menu = Menu::with_items(app, &[&show, &reload, &settings, &sep, &quit])?;
 
     TrayIconBuilder::with_id(TRAY_ID)
         .icon(icon()?)
@@ -57,14 +58,6 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
             "show" => show_main(app),
             "reload" => crate::commands::reload_main_window(app),
             "settings" => crate::commands::open_settings(app),
-            "check-update" => {
-                // HTTP（ureq）与 MessageBoxW 都是**阻塞**调用，绝不能在托盘事件回调里
-                // 直接跑（会卡住托盘与整条事件循环）——丢进阻塞线程池，跑完即退。
-                let app = app.clone();
-                tauri::async_runtime::spawn_blocking(move || {
-                    crate::updater::check_from_tray(app);
-                });
-            }
             "quit" => {
                 crate::commands::save_window_geom(app);
                 crate::commands::restore_taskbar(); // 全屏中退出时不能让任务栏一直消失
@@ -131,28 +124,28 @@ pub fn apply_window_geom<R: Runtime>(w: &tauri::Window<R>, cfg: &Config) {
 
 #[cfg(test)]
 mod tests {
-    /// 「检查更新」菜单项（修复轮 21）必须真实接进菜单与事件分支，且走阻塞线程池。
+    /// T14g（用户要求）：「检查更新」从托盘菜单**移进设置页**——托盘只保留基础动作，
+    /// 更新这种带过程反馈的操作放在能看到实时下载进度的设置窗里。
+    ///
+    /// 这条锁同时防两件事：托盘菜单里重新冒出「检查更新」，以及设置页那条通路被误删。
     #[test]
-    fn tray_menu_wires_check_update_through_spawn_blocking() {
+    fn tray_menu_has_no_check_update_entry() {
         let src = include_str!("tray.rs");
         let code_end = src.find("#[cfg(test)]").expect("测试模块存在");
         let code = &src[..code_end];
         assert!(
-            code.contains("MenuItem::with_id(app, \"check-update\", \"检查更新\""),
-            "菜单里必须有「检查更新」项"
+            !code.contains("\"check-update\"") && !code.contains("\"检查更新\""),
+            "托盘菜单不得再有「检查更新」项（已移进设置页；文档注释里说明原因不算）"
         );
         assert!(
-            code.contains("\"check-update\" =>"),
-            "事件分支必须处理 check-update"
+            code.contains("&show, &reload, &settings, &sep, &quit"),
+            "托盘菜单只保留四个动作项：显示窗口 / 重新加载 / 系统设置 / 退出"
         );
+        // 设置页那条通路必须存在（否则「移进设置页」就成了单纯删除）
+        let settings_rs = include_str!("commands.rs");
         assert!(
-            code.contains("spawn_blocking(move || {") && code.contains("check_from_tray(app)"),
-            "检查更新必须跑在阻塞线程池（HTTP + MessageBox 都是阻塞调用，不得卡托盘）"
-        );
-        // 菜单组装的项列表里也要有它（防「建了 MenuItem 忘了挂进菜单」）
-        assert!(
-            code.contains("&show, &reload, &settings, &check_update, &sep, &quit"),
-            "检查更新必须挂进托盘菜单（位于系统设置与分隔线之间）"
+            settings_rs.contains("pub fn start_update_check") && settings_rs.contains("pub fn get_update_state"),
+            "设置页的更新命令（start_update_check / get_update_state）必须存在"
         );
     }
 

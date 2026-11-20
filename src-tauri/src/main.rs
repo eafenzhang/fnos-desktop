@@ -52,6 +52,13 @@ fn main() {
             // T14a：托盘菜单只剩 4 个无状态动作项（显示窗口 / 重新加载 / 系统设置 / 退出），
             // 没有勾选态也没有置灰态，原先「把配置推给菜单」的 `sync_menus` 通路随之删除
             // ——不再存在「菜单状态与 config.json 不一致」这一类缺陷。
+            //
+            // 仅调试构建：`FNOS_OPEN_SETTINGS=1` 时启动即打开设置窗，便于用 WebView2 CDP
+            // 对设置页做自动化验证（发布版没有这段——`debug_assertions` 在 release 下为假）。
+            #[cfg(debug_assertions)]
+            if std::env::var("FNOS_OPEN_SETTINGS").as_deref() == Ok("1") {
+                commands::open_settings(app.handle());
+            }
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -129,6 +136,13 @@ fn main() {
             commands::get_local_store,
             commands::set_local_store,
             commands::request_app_items,
+            // T14g（用户要求：检查更新移进设置页 + 实时下载进度）：三条只授设置窗。
+            // - get_update_state：轮询读状态（只读，无副作用）；
+            // - start_update_check：开一轮检查/下载（重入闸门 + spawn_blocking）；
+            // - install_update：安装状态里已下载好的包（路径由宿主写入并二次校验）。
+            commands::get_update_state,
+            commands::start_update_check,
+            commands::install_update,
             // T14d：标签页栏（titlebar Webview）专用的三个命令。
             commands::tab_new,
             commands::tab_switch,

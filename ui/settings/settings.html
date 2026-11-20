@@ -6,26 +6,403 @@
 <link rel="stylesheet" href="settings.css">
 </head>
 <body>
-<div class="shell">
-  <section class="upstream" aria-label="上游设置界面">
-    <!--
-      Task 14b：设置窗的**主界面**是上游原样的 popup UI。
-      `popup.html` 与 vendored 副本逐字节相同，只多插入一行
-      `<script src="./chrome-shim.js"></script>`（见 tools/vendor-mods.ps1 与 NOTICE 的
-      包装性改动第 7 条）：chrome.* 兼容层必须在上游 popup.js 之前定义 window.chrome。
-      装进 iframe 的理由有两条：① 上游 UI 的字节一个都不改（它自带 body 尺寸与整套样式）；
-      ② 它的样式因此不可能与窗外的东西互相打架。
-      帧在拿到配置快照之后才创建（见 app.js::mountUpstreamFrame）：上游在脚本开头就同步读
-      `chrome.runtime.getManifest().version`，所以快照必须先就位。
-      T14c 修复轮 3：按用户要求，设置窗**只保留上游界面**——状态条、外壳开关（注入总开关
-      / nasUrl）与关于/合规页全部删除；「自动隐藏 Dock」由 chrome-shim 以上游自己的行样式
-      注入到上游界面里（siteToggle 行之后）。
-    -->
-    <div id="upstreamHost" class="frame-host" data-state="loading">
-      <p class="frame-note" id="upstreamNote">正在读取配置…</p>
-    </div>
-  </section>
+<!--
+  T14g（用户要求：参考图重做设置页）：本壳自己的深色设置界面——左侧分页导航 +
+  右侧设置卡片。上游扩展的设置项**全部在本页**（T14g 修复轮 3：上游设置窗口退役）：
+  外观 / 字体、桌面 / 完美图标逐项、高级 / 自定义代码与登录壁纸都在这里。
+
+  控件与配置键的对应写在各自的 `data-patch` 上（`<段>.<键>`），由 `settings-page.js`
+  统一读写；所有写入都经 `set_config`（显示的值 = 生效的值）。
+  本页只经 `get_config` / `set_config` 与宿主交互。
+-->
+<div class="app">
+  <aside class="sidebar">
+    <!-- T14g 修复轮 2（用户反馈「重复了」）：窗口标题已经写着「fnOS 设置」，
+         页内不再重复品牌块——侧边栏直接从分页导航开始（与参考图一致）。 -->
+    <nav class="nav" id="nav" aria-label="设置分页">
+      <button class="nav-item active" data-section="general" aria-current="page">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M4 7h10M18 7h2M4 17h4M12 17h8"/><circle cx="16" cy="7" r="2"/><circle cx="10" cy="17" r="2"/></svg>
+        通用
+      </button>
+      <button class="nav-item" data-section="appearance">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><circle cx="12" cy="12" r="8"/><path d="M12 4a8 8 0 0 1 0 16z" fill="currentColor" stroke="none" opacity=".35"/></svg>
+        外观
+      </button>
+      <button class="nav-item" data-section="desktop">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><rect x="4" y="4" width="7" height="7" rx="1.6"/><rect x="13" y="4" width="7" height="7" rx="1.6"/><rect x="4" y="13" width="7" height="7" rx="1.6"/><rect x="13" y="13" width="7" height="7" rx="1.6"/></svg>
+        桌面
+      </button>
+      <button class="nav-item" data-section="update">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M20 12a8 8 0 1 1-2.34-5.66"/><path d="M20 4v4h-4"/></svg>
+        更新
+      </button>
+      <button class="nav-item" data-section="advanced">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M14.5 6.5a3.5 3.5 0 0 0-4.6 4.6L5 16v3h3l4.9-4.9a3.5 3.5 0 0 0 4.6-4.6l-2.3 2.3-1.9-1.9z"/></svg>
+        高级
+      </button>
+      <button class="nav-item" data-section="about">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><circle cx="12" cy="12" r="8"/><path d="M12 11v5M12 8h.01"/></svg>
+        关于
+      </button>
+    </nav>
+    <div class="sidebar-foot" id="toast" role="status" aria-live="polite"></div>
+  </aside>
+
+  <main class="content">
+    <!-- ================= 通用 ================= -->
+    <section class="panel active" data-panel="general" aria-label="通用">
+      <div class="panel-head"><h1>通用</h1><button class="btn" data-action="open-config-dir">打开配置目录</button></div>
+      <div class="card">
+        <div class="row">
+          <div class="row-main">
+            <div class="row-title">关闭窗口时收到托盘</div>
+            <div class="row-desc">关闭主窗口只是收进托盘，程序继续在后台运行；退出请用托盘菜单。</div>
+          </div>
+          <div class="row-control"><button class="switch" role="switch" aria-checked="false" data-patch="shell.closeToTray" data-kind="switch" aria-label="关闭窗口时收到托盘"></button></div>
+        </div>
+        <div class="row">
+          <div class="row-main">
+            <div class="row-title">注入界面美化</div>
+            <div class="row-desc">关闭后页面保持 fnOS 原生样式（修改后主窗口会重建以生效）。</div>
+          </div>
+          <div class="row-control"><button class="switch" role="switch" aria-checked="false" data-patch="shell.injectEnabled" data-kind="switch" aria-label="注入界面美化"></button></div>
+        </div>
+        <div class="row">
+          <div class="row-main">
+            <div class="row-title">登录保活</div>
+            <div class="row-desc">按此间隔在同源上续期一次登录态；0 = 关闭。</div>
+          </div>
+          <div class="row-control">
+            <input class="input num" type="number" min="0" max="1440" step="1" data-patch="shell.keepAliveMinutes" data-kind="number" aria-label="登录保活间隔（分钟）">
+            <span class="unit">分钟</span>
+          </div>
+        </div>
+        <div class="row">
+          <div class="row-main">
+            <div class="row-title">桌面地址</div>
+            <div class="row-desc">留空则从官网门户（fnos.net）进入；填 NAS 地址可直达桌面。</div>
+          </div>
+          <div class="row-control"><input class="input text" type="text" spellcheck="false" placeholder="https://…" data-patch="shell.nasUrl" data-kind="text" aria-label="桌面地址"></div>
+        </div>
+        <div class="row">
+          <div class="row-main">
+            <div class="row-title">自动识别 fnOS 页面</div>
+            <div class="row-desc">在疑似 fnOS WebUI 的页面上自动注入（关闭后只认白名单与飞牛域名族）。</div>
+          </div>
+          <div class="row-control"><button class="switch" role="switch" aria-checked="false" data-patch="mods.autoEnableSuspectedFnOS" data-kind="switch" aria-label="自动识别 fnOS 页面"></button></div>
+        </div>
+        <div class="row">
+          <div class="row-main">
+            <div class="row-title">为当前站点注入</div>
+            <div class="row-desc" id="siteOriginDesc">当前站点：—</div>
+          </div>
+          <div class="row-control"><button class="switch" role="switch" aria-checked="false" id="siteToggle" data-kind="site-toggle" aria-label="为当前站点注入"></button></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================= 外观 ================= -->
+    <section class="panel" data-panel="appearance" aria-label="外观">
+      <div class="panel-head"><h1>外观</h1></div>
+      <div class="card">
+        <div class="row">
+          <div class="row-main">
+            <div class="row-title">主题色</div>
+            <div class="row-desc">未读标记、徽标和品牌标志的强调色。</div>
+          </div>
+          <div class="row-control">
+            <div class="swatches" data-patch="mods.brandColor" data-kind="color" role="group" aria-label="主题色">
+              <button class="swatch" data-value="#0066ff" style="--c:#0066ff" aria-label="默认蓝"></button>
+              <button class="swatch" data-value="#4d6bfe" style="--c:#4d6bfe" aria-label="靛蓝"></button>
+              <button class="swatch" data-value="#3a3d45" style="--c:#3a3d45" aria-label="石墨"></button>
+              <button class="swatch" data-value="#e5484d" style="--c:#e5484d" aria-label="红"></button>
+              <button class="swatch" data-value="#e05c9a" style="--c:#e05c9a" aria-label="粉"></button>
+              <button class="swatch" data-value="#f5a524" style="--c:#f5a524" aria-label="橙"></button>
+              <button class="swatch" data-value="#22c55e" style="--c:#22c55e" aria-label="绿"></button>
+              <input class="swatch-custom" type="color" value="#0066ff" aria-label="自定义主题色">
+            </div>
+          </div>
+        </div>
+        <div class="row">
+          <div class="row-main">
+            <div class="row-title">标题栏样式</div>
+            <div class="row-desc">桌面内应用窗口的标题栏形态。</div>
+          </div>
+          <div class="row-control">
+            <div class="segmented" data-patch="mods.titlebarStyle" data-kind="segmented" role="group" aria-label="标题栏样式">
+              <button data-value="windows">Windows</button>
+              <button data-value="mac">macOS</button>
+            </div>
+          </div>
+        </div>
+        <div class="row">
+          <div class="row-main">
+            <div class="row-title">启动台样式</div>
+            <div class="row-desc">应用启动台的呈现方式。</div>
+          </div>
+          <div class="row-control">
+            <div class="segmented" data-patch="mods.launchpadStyle" data-kind="segmented" role="group" aria-label="启动台样式">
+              <button data-value="classic">经典</button>
+              <button data-value="spotlight">聚光灯</button>
+            </div>
+          </div>
+        </div>
+        <div class="row">
+          <div class="row-main">
+            <div class="row-title">窗口动画模糊</div>
+            <div class="row-desc">打开/关闭窗口时的模糊过渡；低配机器可关闭。</div>
+          </div>
+          <div class="row-control"><button class="switch" role="switch" aria-checked="false" data-patch="mods.windowAnimationBlurEnabled" data-kind="switch" aria-label="窗口动画模糊"></button></div>
+        </div>
+        <div class="row">
+          <div class="row-main">
+            <div class="row-title">基础预设</div>
+            <div class="row-desc">上游 mod 的基础外观预设（关闭后保留其余已选项）。</div>
+          </div>
+          <div class="row-control"><button class="switch" role="switch" aria-checked="false" data-patch="mods.basePresetEnabled" data-kind="switch" aria-label="基础预设"></button></div>
+        </div>
+        <div class="row">
+          <div class="row-main">
+            <div class="row-title">字体覆盖</div>
+            <div class="row-desc">用自定义字体替换页面字体；关闭时保留 fnOS 默认字体。</div>
+          </div>
+          <div class="row-control"><button class="switch" role="switch" aria-checked="false" data-patch="mods.fontOverrideEnabled" data-kind="switch" aria-label="字体覆盖"></button></div>
+        </div>
+        <div class="row">
+          <div class="row-main">
+            <div class="row-title">正文字体</div>
+            <div class="row-desc">本机已安装的字体名，例如 Noto Sans SC；留空用默认。</div>
+          </div>
+          <div class="row-control"><input class="input text" type="text" spellcheck="false" data-patch="mods.fontFamily" data-kind="text" aria-label="正文字体"></div>
+        </div>
+        <div class="row">
+          <div class="row-main">
+            <div class="row-title">字体地址</div>
+            <div class="row-desc">可选：在线字体文件 URL（.woff2 / .ttf）；与「正文字体」二选一。</div>
+          </div>
+          <div class="row-control"><input class="input text" type="text" spellcheck="false" placeholder="https://…/font.woff2" data-patch="mods.fontUrl" data-kind="text" aria-label="字体地址"></div>
+        </div>
+        <div class="row">
+          <div class="row-main">
+            <div class="row-title">等宽字体</div>
+            <div class="row-desc">代码 / 终端区域的字体；留空用默认。</div>
+          </div>
+          <div class="row-control"><input class="input text" type="text" spellcheck="false" data-patch="mods.fontMonospaceFamily" data-kind="text" aria-label="等宽字体"></div>
+        </div>
+        <div class="row">
+          <div class="row-main">
+            <div class="row-title">字重</div>
+            <div class="row-desc">自定义字体的粗细；默认沿用页面原值。</div>
+          </div>
+          <div class="row-control">
+            <div class="segmented" data-patch="mods.fontWeight" data-kind="segmented" role="group" aria-label="字重">
+              <button data-value="">默认</button>
+              <button data-value="450">450</button>
+              <button data-value="normal">normal</button>
+              <button data-value="600">600</button>
+            </div>
+          </div>
+        </div>
+        <div class="row">
+          <div class="row-main">
+            <div class="row-title">OpenType 特性</div>
+            <div class="row-desc">例如 “liga” 1、“tnum”；留空用默认。</div>
+          </div>
+          <div class="row-control"><input class="input text" type="text" spellcheck="false" data-patch="mods.fontFeatureSettings" data-kind="text" aria-label="OpenType 特性"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================= 桌面 ================= -->
+    <section class="panel" data-panel="desktop" aria-label="桌面">
+      <div class="panel-head"><h1>桌面</h1></div>
+      <div class="card">
+        <div class="row">
+          <div class="row-main">
+            <div class="row-title">Dock 自动隐藏</div>
+            <div class="row-desc">平时滑出屏幕，指针顶到边缘时唤出；并把 Dock 让出的宽度还给桌面。</div>
+          </div>
+          <div class="row-control"><button class="switch" role="switch" aria-checked="false" data-patch="shell.dockAutoHide" data-kind="switch" aria-label="Dock 自动隐藏"></button></div>
+        </div>
+        <div class="row">
+          <div class="row-main">
+            <div class="row-title">桌面图标布局</div>
+            <div class="row-desc">按网格排列桌面图标，并按列数自适应。</div>
+          </div>
+          <div class="row-control"><button class="switch" role="switch" aria-checked="false" data-patch="mods.desktopIconLayoutEnabled" data-kind="switch" aria-label="桌面图标布局"></button></div>
+        </div>
+        <div class="row">
+          <div class="row-main">
+            <div class="row-title">每列图标数</div>
+            <div class="row-desc">4–16；仅在桌面图标布局打开时生效。</div>
+          </div>
+          <div class="row-control">
+            <input class="input num" type="number" min="4" max="16" step="1" data-patch="mods.desktopIconPerColumn" data-kind="number" aria-label="每列图标数">
+          </div>
+        </div>
+        <div class="row">
+          <div class="row-main">
+            <div class="row-title">图标布局模式</div>
+            <div class="row-desc">自适应按窗口尺寸自动排列；固定按每列数量排。</div>
+          </div>
+          <div class="row-control">
+            <div class="segmented" data-patch="mods.desktopIconLayoutMode" data-kind="segmented" role="group" aria-label="图标布局模式">
+              <button data-value="adaptive">自适应</button>
+              <button data-value="fixed">固定</button>
+            </div>
+          </div>
+        </div>
+        <div class="row">
+          <div class="row-main">
+            <div class="row-title">完美图标</div>
+            <div class="row-desc">把启动台图标统一成同一套形状；具体哪些应用在下面逐项选择（修改后主窗口会重建）。</div>
+          </div>
+          <div class="row-control"><button class="switch" role="switch" aria-checked="false" data-patch="mods.launchpadIconScaleEnabled" data-kind="switch" aria-label="完美图标"></button></div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="row">
+          <div class="row-main">
+            <div class="row-title">完美图标 · 逐项</div>
+            <div class="row-desc" id="iconItemsHint">从主窗口页面读取启动台应用列表（需要先进一次桌面 / 启动台）。</div>
+          </div>
+          <div class="row-control"><button class="btn" id="iconItemsRefresh">读取应用列表</button></div>
+        </div>
+        <div id="iconItemsList" class="items-list" aria-label="启动台应用列表"></div>
+      </div>
+    </section>
+
+    <!-- ================= 更新 ================= -->
+    <section class="panel" data-panel="update" aria-label="更新">
+      <div class="panel-head"><h1>更新</h1></div>
+      <div class="card">
+        <div class="row">
+          <div class="row-main">
+            <div class="row-title">当前版本</div>
+            <div class="row-desc" id="updateCurrentDesc">—</div>
+          </div>
+          <div class="row-control"><span class="pill" id="updateCurrent">v—</span></div>
+        </div>
+        <div class="row row-stack">
+          <div class="row-main">
+            <div class="row-title">检查更新</div>
+            <div class="row-desc" id="updateMessage">从 GitHub Releases 检查新版本；有新版本会自动下载。</div>
+            <div class="progress" id="updateProgress" hidden>
+              <div class="progress-bar"><span id="updateProgressFill"></span></div>
+              <div class="progress-meta"><span id="updateProgressText">0%</span><span id="updateProgressSpeed"></span></div>
+            </div>
+          </div>
+          <div class="row-control">
+            <button class="btn primary" id="updateCheck">检查更新</button>
+            <button class="btn primary" id="updateInstall" hidden>立即安装并重启</button>
+          </div>
+        </div>
+        <div class="row">
+          <div class="row-main">
+            <div class="row-title">下载加速镜像</div>
+            <div class="row-desc">直连 GitHub 不稳定时填写（形如 https://mirror.example.com/ ，前缀 + 原始地址）。</div>
+          </div>
+          <div class="row-control"><input class="input text" type="text" spellcheck="false" placeholder="https://…" data-patch="shell.updateMirrorPrefix" data-kind="text" aria-label="下载加速镜像"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================= 高级 ================= -->
+    <section class="panel" data-panel="advanced" aria-label="高级">
+      <div class="panel-head"><h1>高级</h1></div>
+      <div class="card">
+        <div class="row">
+          <div class="row-main">
+            <div class="row-title">自定义代码</div>
+            <div class="row-desc">额外的 CSS / JS（注入到主窗口页面；只影响本机，出问题可清空）。</div>
+          </div>
+          <div class="row-control"><button class="switch" role="switch" aria-checked="false" data-patch="mods.customCodeEnabled" data-kind="switch" aria-label="自定义代码"></button></div>
+        </div>
+        <div class="row row-stack">
+          <div class="row-main">
+            <div class="row-title">自定义 CSS</div>
+            <textarea class="input code" rows="5" spellcheck="false" data-patch="local.customCssCode" data-kind="textarea" aria-label="自定义 CSS"></textarea>
+          </div>
+        </div>
+        <div class="row row-stack">
+          <div class="row-main">
+            <div class="row-title">自定义 JS</div>
+            <textarea class="input code" rows="5" spellcheck="false" data-patch="local.customJsCode" data-kind="textarea" aria-label="自定义 JS"></textarea>
+          </div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="row">
+          <div class="row-main">
+            <div class="row-title">登录壁纸</div>
+            <div class="row-desc" id="wallpaperName">未设置</div>
+          </div>
+          <div class="row-control">
+            <button class="btn" id="wallpaperPick">选择图片…</button>
+            <button class="btn" id="wallpaperClear">清除</button>
+            <input type="file" id="wallpaperFile" accept=".png,.jpg,.jpeg,.webp" hidden>
+          </div>
+        </div>
+        <div class="row">
+          <div class="row-main">
+            <div class="row-title">锁屏默认用户名</div>
+            <div class="row-desc">登录/锁屏页预填的用户名；留空不预填。</div>
+          </div>
+          <div class="row-control"><input class="input text" type="text" spellcheck="false" data-patch="mods.lockscreenDefaultUsername" data-kind="text" aria-label="锁屏默认用户名"></div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="row">
+          <div class="row-main">
+            <div class="row-title">配置文件</div>
+            <div class="row-desc mono" id="configPath">—</div>
+          </div>
+          <div class="row-control"><button class="btn" data-action="open-config-dir">打开配置目录</button></div>
+        </div>
+        <div class="row">
+          <div class="row-main">
+            <div class="row-title">恢复默认</div>
+            <div class="row-desc">把所有设置恢复为默认值（窗口位置保留）。点一次进入确认，再点一次执行。</div>
+          </div>
+          <div class="row-control"><button class="btn danger" id="resetAll">恢复默认</button></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================= 关于 ================= -->
+    <section class="panel" data-panel="about" aria-label="关于">
+      <div class="panel-head"><h1>关于</h1></div>
+      <div class="card">
+        <div class="row">
+          <div class="row-main">
+            <div class="row-title">fnOS 桌面壳</div>
+            <div class="row-desc">第三方桌面壳，<strong>非官方</strong>产品，与飞牛（fnOS）官方无任何关联。</div>
+          </div>
+          <div class="row-control"><span class="pill" id="aboutVersion">v—</span></div>
+        </div>
+        <div class="row">
+          <div class="row-main">
+            <div class="row-title">界面美化资源</div>
+            <div class="row-desc" id="aboutMods">—</div>
+          </div>
+          <div class="row-control"><button class="btn" data-action="open-repo">上游仓库</button></div>
+        </div>
+        <div class="row">
+          <div class="row-main">
+            <div class="row-title">许可</div>
+            <div class="row-desc mono" id="aboutLicense">—</div>
+          </div>
+        </div>
+        <div class="row">
+          <div class="row-main">
+            <div class="row-title">来源声明</div>
+            <div class="row-desc mono" id="aboutNotice">—</div>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
 </div>
-<script type="module" src="app.js"></script>
+<script type="module" src="settings-page.js"></script>
 </body>
 </html>

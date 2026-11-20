@@ -25,6 +25,9 @@ pub const MAX_WALLPAPER_BYTES: usize = config::MAX_WALLPAPER_BYTES;
 
 const SHIM_JS: &str = include_str!("../inject/shim.js");
 const BOOTSTRAP_JS: &str = include_str!("../inject/bootstrap.js");
+/// 软件渲染降级（T14g）：只在确认是软件光栅时，把上游最贵的合成效果降下来。
+/// 有 GPU 加速的机器上**一个字节都不改**（见 `inject/perf.js` 的实测数据）。
+const PERF_JS: &str = include_str!("../inject/perf.js");
 const DOCK_JS: &str = include_str!("../inject/dock.js");
 const KEEPALIVE_JS: &str = include_str!("../inject/keepalive.js");
 /// 桌面内窗口默认居中（T14c 修复轮 15）：fnOS 自己的应用窗口是桌面文档里的 DOM 元素，
@@ -543,6 +546,7 @@ pub fn build_init_script_with(cfg: &Config, wallpaper: Option<WallpaperAsset>) -
          window.__FNOS_SHELL__ = {payload};\n\
          {shim}\n\
          {boot}\n\
+         {perf}\n\
          {dock}\n\
          {keepalive}\n\
          {windowpos}\n\
@@ -554,6 +558,7 @@ pub fn build_init_script_with(cfg: &Config, wallpaper: Option<WallpaperAsset>) -
             .expect("payload is a serde Value and always serializes"),
         shim = SHIM_JS,
         boot = BOOTSTRAP_JS,
+        perf = PERF_JS,
         dock = DOCK_JS,
         keepalive = KEEPALIVE_JS,
         windowpos = WINDOWPOS_JS,
@@ -570,29 +575,6 @@ pub fn build_init_script_with(cfg: &Config, wallpaper: Option<WallpaperAsset>) -
 /// 标签快捷键依赖 `keys.js`（只写 `document.title`），必须在所有标签可用，所以留在核心档。
 pub fn build_core_script() -> String {
     format!("/* fnOS Desktop Shell core v{SHELL_VERSION} */\n{KEYS_JS}\n")
-}
-
-/// 给**原生弹窗**的完整载荷加一道运行时 origin 闸门。
-///
-/// 为什么需要：`initialization_script` 是**按 webview** 注册的，对弹窗里的**每一次文档**
-/// 都会执行；而 `create_popup_window` 的 `same_site` 只能说明「这个弹窗是从 fnOS 页面开出来的」
-/// （opener 同源，或请求地址本身同源），不能说明**最终文档**还是 fnOS。登录弹窗的典型形态是
-/// `about:blank` 起步、再由 opener 导航到 `platform.deepseek.com` 这类第三方地址——没有这道
-/// 闸门，整份 mods / dock / keepalive / shim 会在第三方登录页上执行：安装本壳样式、向第三方
-/// origin 发保活、用 `document.title` 发上报（标题栏里出现 `FNOSREPORT:…`）。
-///
-/// 闸门要求：文档是 http(s)，且 **origin 与 fnOS 桌面完全相等**。`about:blank` 的 origin
-/// 继承自 opener（会等于 fnOS），但协议不是 http(s)，所以**故意不在 about:blank 上执行**；
-/// 等它导航到真正的 fnOS 文档时再执行。这样 fnOS 自己的 `/signin` 弹窗（无论直接打开还是
-/// about:blank 转过去）仍然拿到完整载荷，第三方页面则一个字节都不执行。
-///
-/// 脚本正文原样包在函数里：载荷本身由多个 IIFE + 一次 `window.__FNOS_SHELL__` 赋值组成，
-/// 不依赖顶层 `var`/函数声明的全局可见性（见 `inject/*.js` 的写法）。
-pub fn wrap_popup_script(origin: &str, script: &str) -> String {
-    if origin.is_empty() {
-        return String::new();
-    }
-    wrap_origin_script(&[origin.to_string()], script)
 }
 
 /// 给「页面加载完成后补注入」的载荷加一道幂等闸门。
@@ -612,12 +594,73 @@ pub fn guard_late_script(script: &str) -> String {
     format!("(function(){{if(typeof window.__FNOS_SHELL__!=='undefined')return;{script}\n}})();")
 }
 
+/// 飞牛 FN Connect 的**域名族**——与上游签名判定（`content-script.js` 的
+/// `hasFnOSSignature`，正则 `(\.fnnas\.cn)$|(\.fnos\.net)$|(\.5ddd\.com)$|(\.fynas\.net)$`）
+/// 同一份清单。
+///
+/// ## 为什么运行时闸门必须认这一族（T14f 修复轮 1——用户实测「换了台 Win10 电脑装完注入
+/// 不生效，还是原来的样式」）
+///
+/// 闸门原先只放行**配置里出现过**的 origin（`homeUrl` / `nasUrl` / 解析出的主地址）。
+/// 而全新安装的配置里 `nasUrl` 是空的、`homeUrl` 是官网门户 `https://fnos.net/`：
+/// 用户从门户经 FN Connect 进到自己的桌面（`https://<设备 id>.fnos.net/`）之后，
+/// **这一篇文档以及之后每一篇文档都被闸门整份挡掉**——`__FNOS_SHELL__` 都不存在，
+/// mods / dock / shim 一个字节都不执行，页面保持原生样式。桌面真实地址本来就无法预知
+/// （FN Connect 的设备域名由服务端分配，本壳的设置窗也没有 NAS 地址输入框），
+/// 所以放行判据只能落在**域名族**上，而不能是配置里的字面量。
+///
+/// 安全边界不变：这些域名都是飞牛自有的（第三方注册不到 `*.fnos.net`），而且这正是上游
+/// mod 自己用来「自动注入」的同一份清单——闸门不会比它保护的载荷更宽松。
+pub const FNOS_FAMILY_DOMAINS: [&str; 4] = ["fnnas.cn", "fnos.net", "5ddd.com", "fynas.net"];
+
+/// `host` 是否属于 [`FNOS_FAMILY_DOMAINS`] 的**子域**（`ea121314.fnos.net` 是；
+/// 裸域 `fnos.net` 不是——上游签名正则也要求前导点，官网根域按设计不注入；
+/// `evilfnos.net` / `fnos.net.evil.com` 都不是）。
+///
+/// 与闸门 JS 里的域名族正则同源（[`fnos_family_regex`]），两处判据必须一致：
+/// 宿主侧 [`crate::commands`] 的「可信 origin」与页面侧的闸门放行的是同一批文档。
+pub fn is_fnos_family_host(host: &str) -> bool {
+    let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    FNOS_FAMILY_DOMAINS.iter().any(|domain| {
+        host.len() > domain.len() + 1
+            && host.ends_with(domain)
+            && host.as_bytes()[host.len() - domain.len() - 1] == b'.'
+    })
+}
+
+/// 闸门 JS 里那段域名族正则（由 [`FNOS_FAMILY_DOMAINS`] 生成，清单只有一处）。
+fn fnos_family_regex() -> String {
+    let alternatives = FNOS_FAMILY_DOMAINS
+        .iter()
+        .map(|domain| domain.replace('.', "\\."))
+        .collect::<Vec<_>>()
+        .join("|");
+    format!("/\\.({alternatives})$/i")
+}
+
 /// 给完整载荷加一道**多 origin**运行时闸门（主页面 / 完整档标签 / 弹窗共用）。
 ///
 /// `initialization_script` 对 webview 里的每一篇文档都执行，而主页面/tab 会在同一
 /// Webview 内导航。没有这道闸门，主标签一旦跳到第三方站点，`__FNOS_SHELL__`、shim、
-/// dock/windowpos/keepalive 仍会在该站点执行。允许的 origin 由配置的 homeUrl / nasUrl /
-/// 桌面地址组成（例如 fnos.net 入口跳到 NAS 桌面时两处都要放行）。
+/// dock/windowpos/keepalive 仍会在该站点执行。放行两类文档：
+///
+/// 1. **配置里出现过的 origin**（`homeUrl` / `nasUrl` / 用户白名单 / 解析出的主地址）；
+/// 2. **飞牛域名族的子域**（[`FNOS_FAMILY_DOMAINS`]）——FN Connect 的设备域名无法预先配置，
+///    少了这一条，全新安装的机器进到桌面后整份载荷都不执行（见该常量的文档）。
+///
+/// **原生弹窗走的是同一个闸门**（原先那个「只收一个 origin」的 `wrap_popup_script` 已合并
+/// 到这里）：`initialization_script` 是按 webview 注册的，对弹窗里每一次文档都执行，而弹窗
+/// 的注册判据（宿主侧）只能说明「它是从 fnOS 页面开出来的」，说明不了**最终文档**还是 fnOS。
+/// 登录弹窗的典型形态是 `about:blank` 起步、再由 opener 导航到 `platform.deepseek.com`
+/// 这类第三方地址——没有闸门，整份 mods / dock / keepalive / shim 会在第三方登录页上执行
+/// （装本壳样式、向第三方 origin 发保活、用 `document.title` 发 `FNOSREPORT:…`）。
+///
+/// `about:blank` 的 origin 继承自 opener（会等于 fnOS），但协议不是 http(s)，
+/// 所以**故意不在 about:blank 上执行**；等它导航到真正的 fnOS 文档时再执行，
+/// 于是 fnOS 自己的 `/signin` 弹窗（无论直接打开还是 about:blank 转过去）照旧拿到完整载荷。
+///
+/// 脚本正文原样包在函数里：载荷本身由多个 IIFE + 一次 `window.__FNOS_SHELL__` 赋值组成，
+/// 不依赖顶层 `var`/函数声明的全局可见性（见 `inject/*.js` 的写法）。
 pub fn wrap_origin_script(origins: &[String], script: &str) -> String {
     if origins.is_empty() || script.is_empty() {
         return String::new();
@@ -625,10 +668,12 @@ pub fn wrap_origin_script(origins: &[String], script: &str) -> String {
     // origin 来自 `url::Url::origin().ascii_serialization()`，这里仍走 JSON 转义：
     // 闸门是安全边界，不能因为调用方将来传入别的东西就产生字符串/代码注入。
     let origins_json = serde_json::to_string(origins).expect("origin 列表序列化不会失败");
+    let family_regex = fnos_family_regex();
     format!(
         "(function(){{try{{var p=location.protocol;\
          if(p!=='http:'&&p!=='https:')return;\
-         if({origins_json}.indexOf(location.origin)<0)return;}}catch(e){{return;}}\n\
+         if({origins_json}.indexOf(location.origin)<0\
+         &&!{family_regex}.test((location.hostname||'').toLowerCase()))return;}}catch(e){{return;}}\n\
          {script}\n}})();\n"
     )
 }
@@ -673,6 +718,8 @@ mod tests {
         let i_cfg = s.find("window.__FNOS_SHELL__ = ").expect("config section");
         let i_shim = s.find("fnos-desktop-shell").expect("shim section");
         let i_boot = s.find("__FNOS_BOOTSTRAP__").expect("bootstrap section");
+        // 软件渲染降级段（T14g）用它的根 class 名（别处都不出现）
+        let i_perf = s.find("fnos-software-render").expect("perf section");
         // dock 段的锚点用它的 class 名：shim 对 `__FNOS_APPLY_SHELL__` 的**引用**在 shim
         // 段里就出现了，不能当 dock 段的锚点（否则 dock 挪到上游之后本测试仍绿）。
         let i_dock = s.find("fnos-shell-dock-autohide").expect("dock section");
@@ -690,20 +737,22 @@ mod tests {
         assert!(
             i_cfg < i_shim
                 && i_shim < i_boot
-                && i_boot < i_dock
+                && i_boot < i_perf
+                && i_perf < i_dock
                 && i_dock < i_keep
                 && i_keep < i_pos
                 && i_pos < i_keys
                 && i_keys < i_cs,
-            "段落顺序必须是 配置→shim→bootstrap→dock→keepalive→windowpos→keys→上游"
+            "段落顺序必须是 配置→shim→bootstrap→perf→dock→keepalive→windowpos→keys→上游"
         );
     }
 
-    /// 弹窗载荷必须带 origin 闸门：about:blank / 第三方登录页不得执行整份脚本。
+    /// 闸门本身（弹窗与主页面共用）：非 http(s) 与第三方文档不得执行整份脚本。
     #[test]
-    fn popup_script_is_gated_to_the_desktop_origin() {
+    fn gate_rejects_non_http_and_third_party_documents() {
         let payload = script(&Config::default());
-        let wrapped = wrap_popup_script("https://nas.example.com", &payload);
+        let origins = vec!["https://nas.example.com".to_string()];
+        let wrapped = wrap_origin_script(&origins, &payload);
         assert!(
             wrapped.starts_with("(function(){try{var p=location.protocol;"),
             "闸门必须先检查协议"
@@ -716,12 +765,16 @@ mod tests {
             wrapped.contains("[\"https://nas.example.com\"].indexOf(location.origin)<0"),
             "origin 必须逐字比对（JSON 转义后的数组）"
         );
+        assert!(
+            wrapped.contains(".indexOf(location.origin)<0&&!"),
+            "配置 origin 与域名族是「或」的关系（少一个 `!` 就变成全放行/全挡）"
+        );
         assert!(wrapped.contains("return;"), "不匹配的文档必须提前返回");
         assert!(wrapped.contains(&payload), "闸门内必须原样保留完整载荷");
         assert!(wrapped.trim_end().ends_with("})();"), "载荷必须包在函数作用域里");
-        assert!(wrap_popup_script("", &payload).is_empty(), "空 origin 不得生成脚本");
+        assert!(wrap_origin_script(&[], &payload).is_empty(), "空 origin 列表不得生成脚本");
         assert!(
-            wrap_popup_script("https://nas.example.com", "").is_empty(),
+            wrap_origin_script(&origins, "").is_empty(),
             "空载荷不得生成脚本"
         );
     }
@@ -730,7 +783,7 @@ mod tests {
     /// 文档被装第二遍（dock / windowpos 会重复挂观察器）。
     #[test]
     fn late_injection_skips_documents_that_already_ran_the_payload() {
-        let gated = wrap_popup_script("https://nas.example.com", "PAYLOAD_BODY");
+        let gated = wrap_origin_script(&["https://nas.example.com".to_string()], "PAYLOAD_BODY");
         let late = guard_late_script(&gated);
         let guard_at = late.find("typeof window.__FNOS_SHELL__!=='undefined'").expect("幂等判据");
         let gate_at = late.find("location.origin").expect("origin 闸门");
@@ -758,6 +811,70 @@ mod tests {
         assert!(
             wrap_origin_script(&[], &payload).is_empty(),
             "空 origin 列表不得生成脚本"
+        );
+    }
+
+    /// T14f 修复轮 1（用户实测「换了台 Win10 电脑装完注入不生效，还是原来的样式」）：
+    /// 闸门必须放行**飞牛域名族**，否则全新安装的机器（`nasUrl` 为空、`homeUrl` 是官网门户）
+    /// 在自己的 FN Connect 桌面上一个字节都注入不进去。
+    ///
+    /// 锁三层，缺一层这个回归就能静默复活：
+    /// ① 纯函数的域名族判据（含「裸域不算」「像但不是」的负例）；
+    /// ② 生成的闸门 JS 里必须真的有那段正则，且由 [`FNOS_FAMILY_DOMAINS`] 生成（清单只有一处）；
+    /// ③ 判据是「配置 origin **或** 域名族」，不是二选一。
+    #[test]
+    fn origin_gate_allows_the_fnos_domain_family() {
+        for host in [
+            "ea121314.fnos.net",
+            "a.b.fnos.net",
+            "wechat-on-cloud-main.ea121314.fnos.net",
+            "abc.5ddd.com",
+            "abc.fnnas.cn",
+            "abc.fynas.net",
+            "EA121314.FNOS.NET",
+            "ea121314.fnos.net.",
+        ] {
+            assert!(is_fnos_family_host(host), "域名族子域必须放行：{host}");
+        }
+        for host in [
+            "fnos.net", // 裸域：上游签名正则要求前导点，官网根域按设计不注入
+            "5ddd.com",
+            ".fnos.net",
+            "evilfnos.net",
+            "notfnos.net",
+            "fnos.net.evil.com",
+            "fnos.net.cn",
+            "192.168.1.10",
+            "localhost",
+            "",
+        ] {
+            assert!(!is_fnos_family_host(host), "不得放行：{host}");
+        }
+
+        let payload = script(&Config::default());
+        let wrapped = wrap_origin_script(&["https://fnos.net".to_string()], &payload);
+        assert!(
+            wrapped.contains(&fnos_family_regex()),
+            "闸门必须带上由常量生成的域名族正则：{}",
+            fnos_family_regex()
+        );
+        for domain in FNOS_FAMILY_DOMAINS {
+            assert!(
+                wrapped.contains(&domain.replace('.', "\\.")),
+                "{domain} 必须出现在闸门正则里"
+            );
+        }
+        assert!(
+            wrapped.contains("(location.hostname||'').toLowerCase()"),
+            "域名族按 hostname 判，且大小写不敏感"
+        );
+        // 配置 origin 与域名族是「或」：两边的文档都要能执行完整载荷（逐字锁判据形状）
+        assert!(
+            wrapped.contains(&format!(
+                "[\"https://fnos.net\"].indexOf(location.origin)<0&&!{}.test((location.hostname||'').toLowerCase()))return;",
+                fnos_family_regex()
+            )),
+            "闸门判据形如「origin 在清单里 **或** hostname 属于域名族」：{wrapped}"
         );
     }
 
@@ -1035,6 +1152,7 @@ mod tests {
         for (name, section) in [
             ("shim", SHIM_JS),
             ("bootstrap", BOOTSTRAP_JS),
+            ("perf", PERF_JS),
             ("dock", DOCK_JS),
             ("keepalive", KEEPALIVE_JS),
             ("windowpos", WINDOWPOS_JS),

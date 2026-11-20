@@ -1,11 +1,11 @@
-// 跨语言契约锁（Task 13b fix round 1）。
+// 跨语言契约锁（Task 13b fix round 1；T14g 修复轮 3 更新）。
 //
 // 背景：本壳有两处「同一个事实被写在两种语言里」的地方，T13b 的评审各点了一条：
-//   1. `MAX_WALLPAPER_BYTES` —— Rust（`config.rs` 是唯一的数值来源，`injector.rs` 只是别名）
-//      与设置窗 JS（`ui/settings/app.js` 的早退副本）。JS 的那一份没有任何东西钉着 Rust 的，
-//      改一边忘另一边就会出现「界面说超限、宿主照收」或反过来。
-//   2. 「应用项列表」通道的 type 集合 —— `report.rs`（分流判据）、`app.js`（逐项 UI 认哪个
-//      type）、`shim.js`（哪条应答值得瘦身/上报）三处。Minor 4 的成因正是两侧不一致：
+//   1. `MAX_WALLPAPER_BYTES` —— Rust（`config.rs` 是唯一的数值来源，`injector.rs` 只是别名）。
+//      T14g 修复轮 3 起设置页自己做壁纸导入，但它**不再复制**这个上限（宿主 `import_wallpaper`
+//      是唯一闸门），所以这里钉住的是「只有一个来源」这件事本身。
+//   2. 「应用项列表」通道的 type 集合 —— `report.rs`（分流判据）、`page-items.js`（逐项 UI
+//      认哪个 type）、`shim.js`（哪条应答值得瘦身/上报）三处。Minor 4 的成因正是两侧不一致：
 //      宿主只认 ITEMS，而 UI 认 ITEMS + TITLES，于是 titles 那条应答会被塞进状态槽。
 //
 // 这些锁**解析源码文本**而不是调用函数：Rust 常量在测试进程里拿不到，而「读源码」恰好是
@@ -57,11 +57,9 @@ test('版本号三处一致：package.json / tauri.conf.json / Cargo.toml', () =
 const CONFIG_RS = read('../src-tauri/src/config.rs');
 const INJECTOR_RS = read('../src-tauri/src/injector.rs');
 const REPORT_RS = read('../src-tauri/src/report.rs');
-const APP_JS = read('../ui/settings/app.js');
+const PAGE_ITEMS_JS = read('../ui/settings/page-items.js');
 const SHIM_JS = read('../src-tauri/inject/shim.js');
-// Task 14b：壁纸导入的界面搬到了**设置窗的 chrome.* 兼容层**里（上游 popup 提供文件控件，
-// shim 负责把 data URL 交给宿主命令），所以那份「JS 副本」的上限也在那里。
-const CHROME_SHIM_JS = read('../ui/settings/chrome-shim.js');
+const SETTINGS_PAGE_JS = read('../ui/settings/settings-page.js');
 
 /** 上游 `content-script.js:2853-2855` 同一个分支里的两个请求类型（这份清单是事实来源）。 */
 const APP_ITEM_TYPES = [
@@ -85,7 +83,7 @@ function rustConstList(src, listRaw) {
     .map((name) => rustStrConst(src, name));
 }
 
-test('跨语言：壁纸大小上限（config.rs 的常量 == chrome-shim.js 的源文本）', () => {
+test('壁纸大小上限只有一个来源：config.rs 常量，injector 别用别名，设置页不复制数值', () => {
   const m = CONFIG_RS.match(/pub const MAX_WALLPAPER_BYTES: usize = ([^;]+);/);
   assert.ok(m, 'config.rs 必须有 `pub const MAX_WALLPAPER_BYTES: usize = …;`');
   const expr = m[1].trim().replace(/_/g, '');
@@ -93,18 +91,17 @@ test('跨语言：壁纸大小上限（config.rs 的常量 == chrome-shim.js 的
   assert.match(expr, /^[0-9*\s]+$/, `只接受字面量乘法表达式，实为 ${expr}`);
   const rustValue = Function(`"use strict";return (${expr});`)();
   assert.equal(rustValue, 8 * 1024 * 1024, 'Rust 常量本身必须是 8 MiB');
-  // JS 侧那一份（`ui/settings/chrome-shim.js`）是**经典脚本**，不能 import（它一加载就要
-  // 定义 window.chrome），所以这里解析源码文本——与 Rust 常量那份用同一种手法。
-  const js = CHROME_SHIM_JS.match(/const MAX_WALLPAPER_BYTES = ([^;]+);/);
-  assert.ok(js, 'chrome-shim.js 必须有 `const MAX_WALLPAPER_BYTES = …;`（壁纸早退闸门）');
-  const jsValue = Function(`"use strict";return (${js[1].trim()});`)();
-  assert.equal(jsValue, rustValue,
-    'chrome-shim.js 的 MAX_WALLPAPER_BYTES 必须与 config.rs 逐位相等（改一边忘另一边 = 界面与宿主互相矛盾）');
   // injector.rs 不许再写一个独立的数值：它只能是 config 常量的别名（同一份事实只有一个来源）
   assert.match(
     INJECTOR_RS,
     /pub const MAX_WALLPAPER_BYTES: usize = config::MAX_WALLPAPER_BYTES;/,
     'injector.rs 的上限必须是 config::MAX_WALLPAPER_BYTES 的别名，不得复制字面量'
+  );
+  // T14g 修复轮 3：设置页自己导入壁纸，但闸门只在宿主（`import_wallpaper` 的
+  // `store_wallpaper`）。设置页#import 若再写一份上限，就会出现「界面说超限、宿主照收」。
+  assert.ok(
+    !SETTINGS_PAGE_JS.includes('MAX_WALLPAPER_BYTES'),
+    '设置页不得复制壁纸上限（唯一来源是 config.rs / store_wallpaper）'
   );
 });
 
@@ -124,8 +121,8 @@ test('跨语言：应用项通道的 type 集合（report.rs == app.js == shim.j
   );
   assert.deepEqual([items, titles].sort(), [...APP_ITEM_TYPES].sort());
 
-  // ---- app.js：设置窗认哪些 type（逐项 UI 的数据来源）
-  const jsArr = APP_JS.match(/const APP_ITEM_REPORT_TYPES = \[([^\]]+)\];/);
+  // ---- page-items.js：设置页认哪些 type（逐项 UI 的数据来源）
+  const jsArr = PAGE_ITEMS_JS.match(/const APP_ITEM_REPORT_TYPES = \[([^\]]+)\];/);
   assert.ok(jsArr, 'app.js 必须有 `const APP_ITEM_REPORT_TYPES = […];`');
   const jsList = [...jsArr[1].matchAll(/'([^']+)'/g)].map((m) => m[1]);
   assert.deepEqual(

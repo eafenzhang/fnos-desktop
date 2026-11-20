@@ -110,3 +110,24 @@ export function setLocalStore(patch) { return invoke('set_local_store', { patch 
  * 再叫一次。宿主 eval 的是本壳注入的那一行固定代码，不接受任何参数文本（不是注入面）。
  */
 export function requestAppItems() { return invoke('request_app_items'); }
+
+// ---------- 检查更新（T14g：设置页 → 更新） ----------
+//
+// 三条命令都只授设置窗（`capabilities/default.json`）。状态由宿主写在内存里：
+// `get_update_state` 只读轮询，`start_update_check` 开一轮检查/下载（重入闸门 +
+// 阻塞线程池），`install_update` 安装**状态里**已下载好的包（设置页传不进任何路径）。
+
+/**
+ * 打开**上游完整设置**（T14g 修复轮 1：从设置页分拆出来的独立窗口，`upstream.html`）。
+ *
+ * 上游那套 popup UI 体量大（2000+ 行脚本 + 整套样式），放在设置页里会让打开变慢；
+ * 独立窗口按需创建、关掉即销毁，设置页本身不受影响。命令只授设置窗，remote-deny 里拒绝。
+ */
+export function openUpstreamSettings() { return invoke('open_upstream_settings'); }
+
+/** 读更新状态（设置页按 `UPDATE_POLL_MS` 轮询，渲染实时下载进度）。 */
+export function getUpdateState() { return invoke('get_update_state'); }
+/** 开始检查更新（已在跑时直接返回当前状态，不并发下载）。 */
+export function startUpdateCheck() { return invoke('start_update_check'); }
+/** 安装已下载好的更新包并重启（`ready` 阶段之外会被宿主拒绝）。 */
+export function installUpdate() { return invoke('install_update'); }

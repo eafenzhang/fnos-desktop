@@ -210,6 +210,11 @@ pub struct AppState {
     pub last_maximized: AtomicU8,
     /// 标题日志的上次落盘时刻（Unix 毫秒；见 [`TITLE_LOG_INTERVAL_MS`]）。
     pub last_title_log: AtomicU64,
+    /// 检查更新的对外状态（T14g：设置页 → 更新）。
+    ///
+    /// 托盘菜单不再承载更新；一次「检查 → 下载（带进度）→ 就绪 → 安装」的每一步都写
+    /// 这里，设置页轮询 `get_update_state` 渲染。状态只在内存里，重启回到 idle。
+    pub update: Mutex<crate::updater::UpdateStatus>,
 }
 
 /// 主窗口的标签页状态（见 [`AppState::tabs`]）。
@@ -353,11 +358,16 @@ fn sane_probe_detail(raw: &str) -> String {
 /// 探针 `detail` 进日志/UI 前的码点上限（= 注入脚本 `LOAD_PROBE_JS` 的 `slice(0,160)`）。
 const PROBE_DETAIL_MAX_CHARS: usize = 160;
 
-/// origin 的 host 是否属于飞牛（`fnos.net` 或 `*.fnos.net`）。
+/// origin 的 host 是否属于飞牛（裸域 `fnos.net`，以及 [`injector::FNOS_FAMILY_DOMAINS`]
+/// 里任一域名的子域）。
 ///
 /// 上游的签名正则要求前导点（`(\.fnos\.net)$`，`content-script.js:2746-2779`），所以
 /// **根域官网永远不注入**；这里判「是不是飞牛的域名」，注入与否由 [`is_recognized`] 与
 /// 上游判定分层处理（状态条据此区分「官网」与「WebUI」两种说法）。
+///
+/// 域名族（`fnnas.cn` / `5ddd.com` / `fynas.net`）与 `*.fnos.net` 同等对待：它们是同一套
+/// FN Connect 入口的不同域名，上游按这张表自动注入，[`origin_allowed_by_gate`] 也按这张表
+/// 放行——三处同源，状态条不会与实际情况打架。
 fn is_fnos_net_origin(origin: &str) -> bool {
     let Ok(url) = tauri::Url::parse(origin) else {
         return false;
@@ -366,7 +376,7 @@ fn is_fnos_net_origin(origin: &str) -> bool {
         return false;
     };
     let host = host.to_ascii_lowercase();
-    host == "fnos.net" || host.ends_with(".fnos.net")
+    host == "fnos.net" || injector::is_fnos_family_host(&host)
 }
 
 /// 是否就是**官网根域**（`https://fnos.net`）：它与 `*.fnos.net` 的 WebUI 是两种状态。
@@ -1156,13 +1166,13 @@ fn same_origin(a: &tauri::Url, b: &tauri::Url) -> bool {
 /// 让新窗口复用 opener 的 WebView2 环境（同一个 user-data 目录 / cookie / storage），
 /// 登录状态与标签页共享。
 ///
-/// **注入是带运行时闸门的**：`same_site` 只决定要不要注册载荷（判据同时看**目标地址**
+/// **注入是带运行时闸门的**：`fnos_site` 只决定要不要注册载荷（判据同时看**目标地址**
 /// 与 **opener 当前地址**——fnOS 桌面开出的 `about:blank` 弹窗之后可能被 opener 导航到
-/// 任意站点，注册必须跟着走）；载荷本身在每次文档创建时检查 `location`，只有落在 fnOS
-/// 桌面 origin 的 http(s) 文档才执行。这样 fnOS 自己的 `/signin` 授权页（「授权按钮
+/// 任意站点，注册必须跟着走）；载荷本身在每次文档创建时检查 `location`，只有落在闸门
+/// 放行集合的 http(s) 文档才执行。这样 fnOS 自己的 `/signin` 授权页（「授权按钮
 /// 可见性」等 CSS 修正）仍然拿到完整载荷，而第三方登录页（GitHub / Google / DeepSeek
-/// Platform）即使通过了 `same_site` 也不会执行 mods/shim，更不会把 `FNOSREPORT:…`
-/// 写进原生标题栏。见 [`injector::wrap_popup_script`]。
+/// Platform）即使通过了 `fnos_site` 也不会执行 mods/shim，更不会把 `FNOSREPORT:…`
+/// 写进原生标题栏。见 [`injector::wrap_origin_script`]。
 fn create_popup_window<R: Runtime>(
     app: &AppHandle<R>,
     opener_label: &str,
@@ -1176,14 +1186,19 @@ fn create_popup_window<R: Runtime>(
     let label = format!("popup-{n}");
     let has_position = features.position().is_some();
     let cfg = current(app);
-    let main_url = resolve_main_url(&cfg, None);
-    let desktop_origin = main_url.origin().ascii_serialization();
-    let same_site = same_origin(&main_url, url)
-        || app
-            .get_webview(opener_label)
-            .and_then(|wv| wv.url().ok())
-            .map(|opener_url| same_origin(&main_url, &opener_url))
-            .unwrap_or(false);
+    let allowed_origins = shell_origins(&cfg);
+    // 要不要**注册**载荷：目标地址或 opener 当前地址落在闸门放行集合里。
+    //
+    // 旧判据是「与主地址同源」，在全新安装的机器上会漏：主地址那时是官网门户
+    // `https://fnos.net/`，而桌面的 `/signin` 授权弹窗开在 `https://<设备>.fnos.net/`，
+    // 不同源 → 连载荷都不注册，登录页的 mods CSS 修正整批失效。判据换成「闸门是否放行」
+    // 之后，与运行时闸门（同一份 `shell_origins` + 域名族）完全对齐：注册面可能更宽，
+    // 但每个文档执行与否仍由闸门按 `location` 逐篇决定，第三方登录页依旧一个字节不执行。
+    let opener_url = app.get_webview(opener_label).and_then(|wv| wv.url().ok());
+    let fnos_site = origin_allowed_by_gate(&allowed_origins, url)
+        || opener_url
+            .as_ref()
+            .is_some_and(|u| origin_allowed_by_gate(&allowed_origins, u));
     let mut builder = WebviewWindowBuilder::new(
         app,
         &label,
@@ -1204,14 +1219,16 @@ fn create_popup_window<R: Runtime>(
     if !has_position {
         builder = builder.center();
     }
-    if same_site {
+    if fnos_site {
         let script = init_script_cached(app, &cfg);
         if !script.is_empty() {
             // `initialization_script` 按 webview 注册，对弹窗里**每一次文档**都会执行。
-            // `same_site` 只说明弹窗是从 fnOS 页面开出来的，不能说明最终文档还是 fnOS；
+            // `fnos_site` 只说明弹窗是从 fnOS 页面开出来的，不能说明最终文档还是 fnOS；
             // 载荷本身必须再过一道运行时 origin 闸门——about:blank 与第三方登录页
-            // （如 platform.deepseek.com）不执行 mods/shim。见 injector::wrap_popup_script。
-            let gated = injector::wrap_popup_script(&desktop_origin, &script);
+            // （如 platform.deepseek.com）不执行 mods/shim。见 injector::wrap_origin_script。
+            // 闸门的 origin 清单与注册判据同一份（`shell_origins`；域名族由闸门 JS 自己认）：
+            // 旧实现只发主地址那一个 origin，登录弹窗导航到 FN Connect 设备域名时同样会被挡。
+            let gated = injector::wrap_origin_script(&allowed_origins, &script);
             if !gated.is_empty() {
                 // T14f：WebView2 的 SetNewWindow 导航可能快于初始化脚本注册，直接
                 // `window.open('/signin')` 的弹窗首个文档会整份漏掉（实测连
@@ -1219,14 +1236,17 @@ fn create_popup_window<R: Runtime>(
                 // 页面加载完成后再补一次；载荷已执行过的文档由 `guard_late_script`
                 // 里的 `__FNOS_SHELL__` 判据跳过，不会重复装 dock / windowpos。
                 let late = injector::guard_late_script(&gated);
-                let trusted_origin = desktop_origin.clone();
+                // 补注入的准入与闸门同一判据（这里用宿主侧的同义函数）：旧实现只认
+                // 「主地址的 origin」，全新安装的机器上桌面的 `/signin` 弹窗补注入会被
+                // 它挡掉。
+                let gate_origins = allowed_origins.clone();
                 builder = builder
                     .initialization_script(gated)
                     .on_page_load(move |window, payload| {
                         if payload.event() != PageLoadEvent::Finished {
                             return;
                         }
-                        if payload.url().origin().ascii_serialization() != trusted_origin {
+                        if !origin_allowed_by_gate(&gate_origins, payload.url()) {
                             return;
                         }
                         if let Err(e) = window.eval(&late) {
@@ -1251,10 +1271,18 @@ fn is_desktop_or_auth_page(desktop: &tauri::Url, url: &tauri::Url) -> bool {
         || is_auth_like_url(url)
 }
 
-/// 允许完整载荷 / 控制通道的 fnOS origin：桌面地址 + 配置里的 homeUrl / nasUrl。
+/// 闸门放行清单里**来自配置**的那部分 origin：桌面地址 + homeUrl / nasUrl +
+/// 上游白名单（`mods.enabledOrigins`）。
 ///
 /// homeUrl 是官网入口（默认 https://fnos.net/），nasUrl 是真实桌面；FN Connect 登录后
-/// 主 Webview 可能从前者跳到后者，所以两处都要放行。第三方 origin 不在列表里。
+/// 主 Webview 可能从前者跳到后者，所以两处都要放行。
+///
+/// `enabledOrigins` 必须在这里：它是上游自己「这个站点要注入」的白名单，`is_recognized`
+/// 与上游的 `isWhitelisted` 都认它——闸门不认就会出现「用户加了白名单、状态条说已识别、
+/// 但页面一个字节都没注入」这种自相矛盾的状态。
+///
+/// 光有这份清单**不够**：全新安装时 nasUrl 为空，FN Connect 的设备域名不可能出现在配置里，
+/// 所以放行判据还要加上飞牛域名族——见 [`origin_allowed_by_gate`]。
 fn shell_origins(cfg: &Config) -> Vec<String> {
     let mut out = Vec::new();
     let mut add = |url: &tauri::Url| {
@@ -1269,12 +1297,32 @@ fn shell_origins(cfg: &Config) -> Vec<String> {
             add(&url);
         }
     }
+    for raw in &cfg.mods.enabled_origins {
+        if let Ok(url) = tauri::Url::parse(raw) {
+            add(&url);
+        }
+    }
     out
 }
 
+/// 宿主侧的**放行判据**，与页面侧闸门（`injector::wrap_origin_script`）逐条同义：
+/// ① origin 在 [`shell_origins`] 里，或 ② host 属于飞牛域名族。
+///
+/// 两处必须一致：宿主认定「可信」的页面，正是闸门放行的那批文档。分叉会造出两种最难查的
+/// 状态——「注入真的生效了、状态条却说是未检测到」与「状态条说已识别、页面却是原生样式」
+/// （后者正是用户报的「换了台电脑装完注入不生效」）。
+fn origin_allowed_by_gate(origins: &[String], url: &tauri::Url) -> bool {
+    if origins
+        .iter()
+        .any(|allowed| allowed == &url.origin().ascii_serialization())
+    {
+        return true;
+    }
+    url.host_str().is_some_and(injector::is_fnos_family_host)
+}
+
 fn is_trusted_shell_url(cfg: &Config, url: &tauri::Url) -> bool {
-    let origin = url.origin().ascii_serialization();
-    shell_origins(cfg).iter().any(|allowed| allowed == &origin)
+    origin_allowed_by_gate(&shell_origins(cfg), url)
 }
 
 /// 这个 webview 当前文档是否有资格拿完整 mods 配置（main / 桌面根页面 / 登录授权页）。
@@ -3343,17 +3391,54 @@ pub fn open_settings<R: Runtime>(app: &AppHandle<R>) {
         WebviewUrl::App("settings.html".into()),
     )
     .title("fnOS 设置")
-    // T14c 修复轮 22：窗口尺寸**精确等于**上游 popup 自身写死的 body 尺寸
-    // （popup.html:44-51 的 372×522）——此前 400×550 + 12px 外壳内边距，四周多出一圈
-    // 与弹窗主题不同色的死边（「套娃框」感）。
-    .inner_size(372.0, 522.0)
-    // T14c 修复轮 22：打开设置窗时默认**屏幕居中**（此前跟随 OS 默认级联位置）。
+    // T14g（用户要求：参考图重做设置页）：设置页是本壳自己的深色界面（左侧分页导航 +
+    // 右侧设置卡片），不再是被上游 popup 写死的 372×522，所以窗口按分页布局定尺寸。
+    .inner_size(980.0, 680.0)
+    .min_inner_size(820.0, 560.0)
+    .resizable(true)
+    // 深色页面配深色原生标题栏（Windows 10 1809+ / 11 生效；不支持的版本回落到系统默认）。
+    .theme(Some(tauri::Theme::Dark))
     .center()
     .build()
     {
         Ok(_) => {}
         Err(e) => flog!("[fnos] 设置窗创建失败: {e}"),
     }
+}
+
+// ---------- 设置页 → 更新（T14g） ----------
+
+/// 读更新状态（设置页轮询；只读，无副作用）。
+#[tauri::command]
+pub fn get_update_state<R: Runtime>(app: AppHandle<R>) -> crate::updater::UpdateStatus {
+    crate::updater::status(&app)
+}
+
+/// 开始一次检查更新（有重入闸门：已在跑时直接返回当前状态，不并发下载）。
+///
+/// HTTP 是阻塞调用，必须丢进阻塞线程池——命令本身立即返回，设置页靠轮询看进度。
+#[tauri::command]
+pub fn start_update_check<R: Runtime>(app: AppHandle<R>) -> crate::updater::UpdateStatus {
+    let before = crate::updater::status(&app);
+    if !before.is_running() {
+        let app_for_check = app.clone();
+        tauri::async_runtime::spawn_blocking(move || crate::updater::run_check(app_for_check));
+    }
+    crate::updater::status(&app)
+}
+
+/// 安装已下载好的更新包并重启（阻塞调用同样进线程池）。
+///
+/// 只接受状态里由宿主自己写入、且落在配置目录 `updates/` 下的安装包（见
+/// `updater::installer_path_is_trusted`）——设置页传不进来任何路径。
+#[tauri::command]
+pub fn install_update<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
+    if crate::updater::status(&app).phase != crate::updater::phase::READY {
+        return Err("还没有可安装的更新包，请先检查更新".to_string());
+    }
+    let app_for_install = app.clone();
+    tauri::async_runtime::spawn_blocking(move || crate::updater::install_ready(app_for_install));
+    Ok(())
 }
 
 /// 挂载托管状态并落盘（首启调用一次）。
@@ -3399,6 +3484,7 @@ pub fn save_and_install_state<R: Runtime>(
         last_key_at: AtomicU64::new(0),
         last_maximized: AtomicU8::new(0),
         last_title_log: AtomicU64::new(0),
+        update: Mutex::new(crate::updater::UpdateStatus::default()),
     });
 }
 
@@ -3672,6 +3758,72 @@ mod tests {
         assert!(!is_fnos_net_origin("http://127.0.0.1:8793"));
         assert!(!is_fnos_net_origin("not an origin"));
         assert!(!is_fnos_net_origin("chrome-error://chromewebdata/"));
+        // 域名族的另外三个（同一套 FN Connect 入口的不同域名，上游按同一张表自动注入）
+        assert!(is_fnos_net_origin("https://abc.5ddd.com"));
+        assert!(is_fnos_net_origin("https://abc.fnnas.cn"));
+        assert!(is_fnos_net_origin("https://abc.fynas.net"));
+    }
+
+    /// T14f 修复轮 1（用户实测「换了台 Win10 电脑装完注入不生效，还是原来的样式」）。
+    ///
+    /// 复现路径就是这条测试：全新安装的配置 `nasUrl` 为空、`homeUrl` 是官网门户，
+    /// 用户经 FN Connect 进到自己的桌面（`https://<设备 id>.fnos.net/`）。放行判据里
+    /// 少了域名族，那一篇文档以及之后每一篇文档都会被闸门整份挡掉。
+    ///
+    /// 三个来源一起锁：**域名族**（无法预先配置）、**配置过的 origin**（homeUrl / nasUrl）、
+    /// **上游白名单**（`mods.enabledOrigins`——`is_recognized` 认它，闸门也必须认，
+    /// 否则「加了白名单却什么都没注入」）。
+    #[test]
+    fn gate_allows_the_fnos_domain_family_and_every_configured_origin() {
+        let url = |s: &str| s.parse::<tauri::Url>().expect("测试 URL 合法");
+        let fresh = crate::config::Config::default();
+        assert!(fresh.shell.nas_url.is_empty(), "全新安装的 nasUrl 必须为空");
+        let origins = shell_origins(&fresh);
+
+        // ① 域名族：FN Connect 的设备域名（含设备下的应用子域）
+        assert!(origin_allowed_by_gate(&origins, &url("https://ea121314.fnos.net/")));
+        assert!(origin_allowed_by_gate(
+            &origins,
+            &url("https://wechat-on-cloud-main.ea121314.fnos.net/")
+        ));
+        assert!(origin_allowed_by_gate(&origins, &url("https://abc.5ddd.com/")));
+        assert!(origin_allowed_by_gate(&origins, &url("https://abc.fnnas.cn/")));
+        assert!(origin_allowed_by_gate(&origins, &url("https://abc.fynas.net/")));
+        // ② 默认 homeUrl（官网门户）仍在清单里：主窗口第一站就是它
+        assert!(origin_allowed_by_gate(&origins, &url("https://fnos.net/")));
+        // 第三方一律不放行（闸门要挡的就是它们）
+        for bad in [
+            "https://platform.deepseek.com/",
+            "https://github.com/login",
+            "https://evil-fnos.net/",
+            "https://fnos.net.evil.com/",
+            "http://127.0.0.1:8793/",
+        ] {
+            assert!(!origin_allowed_by_gate(&origins, &url(bad)), "不得放行：{bad}");
+        }
+
+        // ③ 配置过的 origin：nasUrl 指向的局域网 / 自建地址（本机既有用户的形态）
+        let mut with_nas = fresh.clone();
+        with_nas.shell.nas_url = "http://192.168.1.10:5666/webui/".into();
+        let origins = shell_origins(&with_nas);
+        assert!(origin_allowed_by_gate(
+            &origins,
+            &url("http://192.168.1.10:5666/desktop")
+        ));
+        assert!(!origin_allowed_by_gate(
+            &origins,
+            &url("http://192.168.1.10:5667/desktop")
+        ));
+
+        // ④ 上游白名单（用户手写的「这个站点要注入」）
+        let mut whitelisted = fresh.clone();
+        whitelisted.mods.enabled_origins = vec!["http://nas.local:8000".into()];
+        let origins = shell_origins(&whitelisted);
+        assert!(origin_allowed_by_gate(&origins, &url("http://nas.local:8000/x")));
+
+        // 宿主侧「可信」判据走的是同一个函数：状态条、控制标题、配置推送与闸门同源
+        assert!(is_trusted_shell_url(&fresh, &url("https://ea121314.fnos.net/")));
+        assert!(!is_trusted_shell_url(&fresh, &url("https://github.com/login")));
     }
 
     /// 「官网根域」与「WebUI 子域」是两种状态：前者按设计不注入，后者才可能是 WebUI。
@@ -3864,71 +4016,33 @@ mod tests {
         }
     }
 
-    /// R30 的 **JS 镜像**必须与 Rust 规则同步（fix round 1 / Important 2）。
+    /// R30 的 JS 镜像必须与 Rust 规则同步（T14g 修复轮 3：镜像随设置页搬到 `page-items.js`）。
     ///
-    /// 同一条 `prefect_icon/*.png` 规则写在**两个**地方：`ui/settings/normalize.js` 的
-    /// `PREFECT_ICON_PATH` 与 Rust 归一化时的判定（`config.rs::is_valid_prefect_icon_path`
-    /// ← `Config::normalize` 的 `retain`）。任何一个落后于另一个都是**静默丢配置**：
-    /// fix round 1 之前 JS 用的是全小写正则，于是 `prefect_icon/Emby.png`
-    /// （磁盘上真实存在的 `panIndex.png` 这类名字）会在设置窗那一侧先被丢掉，Rust 的放宽
-    /// 规则永远见不到它。
+    /// 同一条 `prefect_icon/*.png` 规则写在两处：`ui/settings/page-items.js` 的
+    /// `PREFECT_ICON_PATH_RE` 与 `config.rs::is_valid_prefect_icon_path`。前者决定设置页能
+    /// 写进 `launchpadIconRedrawMap` 的路径，后者是 `Config::normalize` 落盘前的判定；
+    /// 任何一侧落后都是**静默丢配置**（R30 修的就是 JS 那侧少了大小写不敏感）。
     ///
-    /// T14b fix round 1：JS 侧的**生产消费者**已经没有了（退休的 `schema.js` 是最后一个调用
-    /// `isPrefectIconPath` / `normalizeModsEntry` 的地方，两个函数连同 `normalizeMods` 一起
-    /// 按评审意见删除）。常量与它的大小写语义**保留**，因为它仍是「同一份事实被写在两种语言
-    /// 里」的那份镜像，而 `ui/settings/chrome-shim.js::getURL` 现在也依赖同一条大小写不敏感语义
-    /// （内嵌资产表大小写敏感，两个名字都要解析到同一份字节）；锁法照旧：逐字锁正则文本 +
-    /// 读 `tests/normalize.test.mjs` 的输入表逐行核对。
-    ///
-    /// 用与 `report_prefix_and_shim_agree` 同一手法做两件事：
-    /// ① 逐字锁住 JS 的正则文本（**必须带 `i`**——那正是 R30 要修的那一处）；
-    /// ② 读 `tests/normalize.test.mjs` 的**输入表**，逐行断言 20 条与
-    ///    `config.rs::tests::redraw_map_regex_is_case_insensitive_only` 同形、同序、同期望
-    ///    （`config.rs` 不在本轮改动范围内，所以「两侧同步」的机械锁落在这里）。
+    /// 行为表在 JS 侧（`tests/page-items.test.mjs` 的 ok/bad 两组），这里锁的是「镜像仍然
+    /// 存在且形状与 Rust 相同」——逐字锁正则文本（必须带 `i`）。
     #[test]
     fn prefect_icon_rule_mirror_stays_in_step() {
-        let js = include_str!("../../ui/settings/normalize.js");
+        let js = include_str!("../../ui/settings/page-items.js");
         assert!(
-            js.contains("PREFECT_ICON_PATH = /^prefect_icon\\/[a-z0-9-]+\\.png$/i;"),
+            js.contains("const PREFECT_ICON_PATH_RE = /^prefect_icon\\/[a-z0-9-]+\\.png$/i;"),
             "JS 镜像的正则必须与 Rust 规则同形且带 `i`（大小写不敏感，R30）"
         );
-        // 镜像不得只有常量而无人核对：那张输入表（本函数下半段逐行锁着）就是它的实测判据。
-        let shim = include_str!("../../ui/settings/chrome-shim.js");
         assert!(
-            shim.contains("canonicalAssetPath(raw)") && shim.contains("raw.toLowerCase()"),
-            "chrome-shim 的 getURL 必须把路径折成小写（与页面侧 shim / 本条镜像同一条语义）"
+            js.contains("export function isPrefectIconPath"),
+            "镜像必须是对外可用的判据（设置页写入前会走它）"
         );
-        let table = include_str!("../../tests/normalize.test.mjs");
-        // 与 config.rs 那份用例**逐行相同**的输入表（顺序也相同）。
-        let rows: [(&str, bool); 20] = [
-            ("prefect_icon/emby.png", true),
-            ("prefect_icon/home-assistant.png", true),
-            ("prefect_icon/a1-b2.png", true),
-            ("prefect_icon/Emby.png", true),
-            ("prefect_icon/emby.PNG", true),
-            ("PREFECT_ICON/emby.PnG", true),
-            ("Prefect_Icon/Home-Assistant.PNG", true),
-            ("../x", false),
-            ("prefect_icon/a.png.png", false),
-            ("prefect_icon/", false),
-            ("prefect_icon/sub/dir.png", false),
-            ("other/emby.png", false),
-            ("prefect_icon\\\\emby.png", false),
-            ("prefect_icon/em by.png", false),
-            ("prefect_icon/.png", false),
-            ("prefect_icon/emby.png ", false),
-            (" prefect_icon/emby.png", false),
-            ("prefect_icon/图标.png", false),
-            ("图标", false),
-            ("prefect_icon/图的.png", false),
-        ];
-        for (v, want) in rows {
-            let needle = format!("row('{v}', {want},");
-            assert!(
-                table.contains(&needle),
-                "tests/normalize.test.mjs 的输入表缺少/改动了这一行（两侧必须同步）：{needle}"
-            );
-        }
+        // 行为表（大小写、路径穿越、非 ASCII）在 JS 测试里逐行驱动同一个函数；
+        // Rust 侧的那张表在 `config.rs::tests::redraw_map_regex_is_case_insensitive_only`。
+        let table = include_str!("../../tests/page-items.test.mjs");
+        assert!(
+            table.contains("isPrefectIconPath(ok)") && table.contains("isPrefectIconPath(bad)"),
+            "tests/page-items.test.mjs 必须继续逐行驱动两份清单（否则镜像没人核对）"
+        );
     }
 
     // ---------- Task 13b：登录壁纸导入 ----------
@@ -4102,7 +4216,7 @@ mod tests {
     /// 这里把它固化成一个每次 `cargo test` 都会跑的机械锁。
     #[test]
     fn every_ipc_command_is_registered_in_all_four_places() {
-        const CMDS: [&str; 12] = [
+        const CMDS: [&str; 15] = [
             "get_config",
             "set_config",
             "reload_main",
@@ -4115,6 +4229,10 @@ mod tests {
             "get_local_store",
             "set_local_store",
             "request_app_items",
+            // T14g：设置页 → 更新（检查 / 轮询进度 / 安装）
+            "get_update_state",
+            "start_update_check",
+            "install_update",
         ];
         let build = include_str!("../build.rs");
         let main_rs = include_str!("main.rs");
@@ -4740,12 +4858,17 @@ mod tests {
             "弹窗标题必须过滤控制前缀（FNOSREPORT/FNOSPROBE/FNOSCHUNK/FNOSKEY 不是页面标题）"
         );
         assert!(
-            popup.contains("injector::wrap_popup_script"),
+            popup.contains("injector::wrap_origin_script"),
             "弹窗载荷必须带运行时 origin 闸门（about:blank / 第三方文档不得执行 mods/shim）"
         );
         assert!(
-            popup.contains("initialization_script") && popup.contains("same_site"),
-            "只有与 fnOS 同源的弹窗才注入初始化脚本（第三方登录页不该被 mods 覆盖）"
+            popup.contains("initialization_script") && popup.contains("fnos_site"),
+            "只有落在闸门放行集合的弹窗才注册初始化脚本（第三方登录页不该被 mods 覆盖）"
+        );
+        assert!(
+            popup.contains("origin_allowed_by_gate"),
+            "弹窗的注册判据与运行时闸门必须是同一份判据（全新安装的机器上主地址是官网门户，\
+             桌面的 /signin 弹窗与它不同源，按「同源」注册会连载荷都不装）"
         );
         assert!(
             popup.contains("on_page_load")
@@ -4986,7 +5109,8 @@ mod tests {
     }
 
     /// 同源判据只比较 scheme/host/默认端口：fnOS 主页面开出的 `/signin` 弹窗要命中，
-    /// 第三方登录页（GitHub / Google）不能命中——否则会把 fnOS 的 mods CSS 注进去。
+    /// 第三方登录页（GitHub / Google）不能命中。（它仍决定**标签页**的注入档位；
+    /// 弹窗的注册判据见下一条——那里不能用「与主地址同源」。）
     #[test]
     fn popup_injection_is_limited_to_the_fnos_origin() {
         let url = |s: &str| s.parse::<tauri::Url>().expect("测试 URL 合法");
@@ -4996,6 +5120,36 @@ mod tests {
         assert!(!same_origin(&main, &url("https://github.com/login")));
         assert!(!same_origin(&main, &url("http://ea121314.fnos.net/")));
         assert!(!same_origin(&main, &url("https://ea121314.fnos.net:8443/")));
+    }
+
+    /// 弹窗的**注册**判据不能是「与主地址同源」：全新安装的机器上主地址是官网门户
+    /// `https://fnos.net/`，而桌面的 `/signin` 授权弹窗开在 `https://<设备>.fnos.net/`，
+    /// 不同源 ⇒ 连载荷都不注册，登录页的 mods CSS 修正整批失效（T14f 修复轮 1）。
+    ///
+    /// 换用闸门判据后：飞牛域名族与配置过的 origin 都注册；第三方一律不注册。
+    #[test]
+    fn popup_payload_registration_follows_the_gate() {
+        let url = |s: &str| s.parse::<tauri::Url>().expect("测试 URL 合法");
+        let fresh = Config::default(); // 全新安装：nasUrl 空、homeUrl = 官网门户
+        let allowed = shell_origins(&fresh);
+        // 弹窗目标：桌面的授权页（与主地址不同源，但域名族放行）
+        assert!(origin_allowed_by_gate(
+            &allowed,
+            &url("https://ea121314.fnos.net/signin?client_id=smoke")
+        ));
+        // opener 当前地址同样算数（about:blank 起步、之后再导航的弹窗）
+        assert!(origin_allowed_by_gate(
+            &allowed,
+            &url("https://ea121314.fnos.net/")
+        ));
+        // 第三方登录页：目标与 opener 都不在放行集合里
+        for bad in [
+            "https://github.com/login",
+            "https://accounts.google.com/o/oauth2/v2/auth",
+            "https://platform.deepseek.com/",
+        ] {
+            assert!(!origin_allowed_by_gate(&allowed, &url(bad)), "{bad}");
+        }
     }
 
     /// 弹窗限速：10 秒窗口内最多 5 个；窗口滑动后自动放行，旧记录被清理。

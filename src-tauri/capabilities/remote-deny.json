@@ -18,6 +18,9 @@
     "deny-import-wallpaper",
     "deny-get-local-store",
     "deny-set-local-store",
-    "deny-request-app-items"
+    "deny-request-app-items",
+    "deny-get-update-state",
+    "deny-start-update-check",
+    "deny-install-update"
   ]
 }

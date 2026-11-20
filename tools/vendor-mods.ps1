@@ -43,16 +43,11 @@
 
 .PARAMETER SettingsDir
   Settings-window asset root (tauri.conf.json frontendDist). Defaults to
-  <repo>\ui\settings. After vendoring, this script derives the settings-window
-  copies of the upstream popup UI from the vendored bytes:
-
-  * popup.js / prefect_icon/*.png / prefect_icon/icon-map.json / icons/*.png are
-    byte-identical copies (chrome.runtime.getURL must return a real, synchronous
-    URL served by the asset protocol, and fetch()/img[src] need real files);
-  * popup.html differs by exactly ONE inserted line
-    (`<script src="./chrome-shim.js"></script>` before the popup.js tag). The
-    insertion is verified at byte level: removing it must reproduce the vendored
-    file byte for byte.
+  <repo>\ui\settings. After vendoring, this script derives the settings-window assets from the vendored
+  bytes: icons/*.png are byte-identical copies (the custom titlebar renders
+  icons/icon16.png). The upstream popup UI is no longer shipped: T14g moved every
+  upstream setting into this project's own settings page, so no popup.html /
+  popup.js / prefect_icon copy is derived any more.
 
 .PARAMETER Commit
   Pinned upstream commit (recorded in NOTICE and used as the pin for -Fetch).
@@ -97,10 +92,8 @@ $settingsDst = [System.IO.Path]::GetFullPath($SettingsDir)
 # icon (include_bytes!). Vendoring them keeps that provenance inside NOTICE
 # instead of leaving the shipped icon with no recorded origin.
 #
-# popup.html / popup.js were added in T14b: the settings window now HOSTS the
-# upstream popup UI instead of our retired hand-written group UI, so the two
-# files are vendored verbatim here first and then derived into ui/settings (see
-# the "settings-window copies" section below).
+# popup.html / popup.js stay in the vendored snapshot for provenance, but are no longer
+# shipped as a UI (T14g: the settings page is first-party now).
 $fixed = @(
   'LICENSE', 'content-script.js', 'mod.js', 'popup.html', 'popup.js', 'basic_mod.css',
   'windows_titlebar_mod.css', 'mac_titlebar_mod.css',
@@ -231,18 +224,11 @@ $lines.Add('     icon: `cargo tauri icon` is run on the 128 px source to produce
 $lines.Add('     (multi-size) and src-tauri/icons/icon.png, and icons/icon32.png is embedded with')
 $lines.Add('     include_bytes! as the tray icon. No upstream pixel is altered; tool-generated sizes above')
 $lines.Add('     128 px are upscales of that same 128 px source (the largest size upstream ships).')
-$lines.Add('  7. T14b: the settings window hosts the upstream popup UI (popup.html + popup.js) instead of')
-$lines.Add('     this project''s own hand-written settings groups. ui/settings/popup.js and every PNG it')
-$lines.Add('     can name (prefect_icon/*.png, icons/*.png) are byte-identical copies; ui/settings/popup.html')
-$lines.Add('     differs from the vendored popup.html by exactly ONE inserted line,')
-$lines.Add('     `<script src="./chrome-shim.js"></script>` placed immediately before the popup.js script')
-$lines.Add('     tag, because a chrome.* compatibility layer must define window.chrome before the popup')
-$lines.Add('     runs. That shim (ui/settings/chrome-shim.js) is this project''s own code: it reimplements')
-$lines.Add('     chrome.storage.{sync,local} / chrome.tabs.* / chrome.runtime.* / chrome.action.* on top of')
-$lines.Add('     the host application (get_config / set_config / get_page_state / get_page_report / the')
-$lines.Add('     settings-only local store), neutralises the upstream update check (no network requests;')
-$lines.Add('     this application pins the vendored commit) and refuses local font-file import, which this')
-$lines.Add('     project does not implement (upstream popup.js itself is unmodified).')
+$lines.Add('  7. T14b hosted the upstream popup UI in this project''s settings window. T14g removed that')
+$lines.Add('     page in favour of a first-party settings page: every upstream setting is now implemented')
+$lines.Add('     by this project''s own UI (ui/settings/settings-page.js) against the same config keys, and')
+$lines.Add('     the vendored popup.html / popup.js in this snapshot are no longer shipped as a UI. The')
+$lines.Add('     upstream content-script and stylesheets below are still injected verbatim.')
 $lines.Add('')
 $lines.Add('File SHA-256:')
 
@@ -273,19 +259,12 @@ $utf8NoBom  = New-Object System.Text.UTF8Encoding($false)
 
 Write-Host "vendored $($entries.Count) files into $dst"
 
-# --- settings-window copies (T14b) -----------------------------------------
-# The settings window now HOSTS the upstream popup UI, and chrome.runtime.getURL()
-# has to stay synchronous (it feeds <img src> and fetch), so every file the popup
-# can name must exist as a real asset under the frontendDist root (ui/settings).
-# These copies are derived from the VENDORED bytes -- never from the .ref snapshot
-# -- so "what ships" is provably "what NOTICE hashes".
-$shimTag   = '  <script src="./chrome-shim.js"></script>'
-$popupTag  = '  <script src="popup.js"></script>'
-# Latin-1 (code page 28591) is a bijective byte<->char mapping, so String.IndexOf
-# on the Latin-1 view gives a BYTE offset. IndexOf over the decoded UTF-8 text
-# would not: popup.html contains Chinese text before the tag.
-$latin1 = [System.Text.Encoding]::GetEncoding(28591)
-
+# --- settings assets (T14g 修复轮 3) ----------------------------------------
+# The upstream settings page is gone, so nothing is copied from popup.html / popup.js
+# or prefect_icon/ any more. The only UI asset this project still ships from the
+# vendored snapshot is icons/*.png (the custom titlebar renders icons/icon16.png).
+# Copies are derived from the VENDORED bytes -- never from the .ref snapshot -- so
+# "what ships" is provably "what NOTICE hashes".
 function Assert-SameBytes {
   param([byte[]]$Left, [byte[]]$Right, [string]$What)
   if ($Left.Length -ne $Right.Length) { $script:derivedFailures.Add("${What}: length $($Left.Length) != $($Right.Length)"); return }
@@ -295,84 +274,16 @@ function Assert-SameBytes {
 }
 
 $derivedFailures = New-Object System.Collections.Generic.List[string]
-if (-not (Test-Path -LiteralPath $settingsDst)) { New-Item -ItemType Directory -Force -Path $settingsDst | Out-Null }
-
-# our own chrome.* compatibility layer must exist: the derived popup.html loads it
-if (-not (Test-Path -LiteralPath (Join-Path $settingsDst 'chrome-shim.js') -PathType Leaf)) {
-  $derivedFailures.Add('ui/settings/chrome-shim.js is missing (the derived popup.html loads it before popup.js)')
-}
-
-# 1) popup.js: byte-identical
-$srcPopupJs = Join-Path $dst 'popup.js'
-$outPopupJs = Join-Path $settingsDst 'popup.js'
-Copy-Item -LiteralPath $srcPopupJs -Destination $outPopupJs -Force
-Assert-SameBytes ([System.IO.File]::ReadAllBytes($srcPopupJs)) ([System.IO.File]::ReadAllBytes($outPopupJs)) 'ui/settings/popup.js must be byte-identical to the vendored popup.js'
-
-# 2) popup.html: exactly ONE inserted line before the popup.js tag
-$htmlBytes  = [System.IO.File]::ReadAllBytes((Join-Path $dst 'popup.html'))
-$latin1Text = $latin1.GetString($htmlBytes)
-$tagStr     = $latin1.GetString([System.Text.Encoding]::UTF8.GetBytes($popupTag))
-$at         = $latin1Text.IndexOf($tagStr)
-$atLast     = $latin1Text.LastIndexOf($tagStr)
-if ($at -lt 0 -or $at -ne $atLast) {
-  $derivedFailures.Add("vendored popup.html must contain the popup.js tag exactly once (indices $at / $atLast)")
-} else {
-  $insertBytes = [System.Text.Encoding]::UTF8.GetBytes($shimTag + "`n")
-  $out = New-Object byte[] ($htmlBytes.Length + $insertBytes.Length)
-  [System.Array]::Copy($htmlBytes, 0, $out, 0, $at)
-  [System.Array]::Copy($insertBytes, 0, $out, $at, $insertBytes.Length)
-  [System.Array]::Copy($htmlBytes, $at, $out, $at + $insertBytes.Length, $htmlBytes.Length - $at)
-  $outPopupHtml = Join-Path $settingsDst 'popup.html'
-  [System.IO.File]::WriteAllBytes($outPopupHtml, $out)
-
-  # read back and prove the ONLY difference is that one inserted line
-  $read = [System.IO.File]::ReadAllBytes($outPopupHtml)
-  if ($read.Length -ne $htmlBytes.Length + $insertBytes.Length) {
-    $derivedFailures.Add('ui/settings/popup.html length is not vendored+inserted')
-  } else {
-    if ($at -gt 0) {
-      $head = New-Object byte[] $at
-      [System.Array]::Copy($read, 0, $head, 0, $at)
-      $wantHead = New-Object byte[] $at
-      [System.Array]::Copy($htmlBytes, 0, $wantHead, 0, $at)
-      Assert-SameBytes $head $wantHead 'ui/settings/popup.html head must equal the vendored bytes'
-    }
-    $mid = New-Object byte[] $insertBytes.Length
-    [System.Array]::Copy($read, $at, $mid, 0, $insertBytes.Length)
-    Assert-SameBytes $mid $insertBytes 'ui/settings/popup.html must carry exactly the shim script tag'
-    $tailLen = $read.Length - $at - $insertBytes.Length
-    $tail = New-Object byte[] $tailLen
-    [System.Array]::Copy($read, $at + $insertBytes.Length, $tail, 0, $tailLen)
-    $wantTail = New-Object byte[] ($htmlBytes.Length - $at)
-    [System.Array]::Copy($htmlBytes, $at, $wantTail, 0, $htmlBytes.Length - $at)
-    Assert-SameBytes $tail $wantTail 'ui/settings/popup.html tail must equal the vendored bytes (only one line may differ)'
-    # the shim tag must precede the popup.js tag
-    $shimIdx = $latin1.GetString($read).IndexOf($latin1.GetString($insertBytes))
-    if ($shimIdx -lt 0 -or $shimIdx -ge ($at + $insertBytes.Length)) {
-      $derivedFailures.Add("the shim script tag must come BEFORE the popup.js tag (shim at $shimIdx, popup.js at $($at + $insertBytes.Length))")
-    }
-  }
-}
-
-# 3) PNG assets the popup can name: prefect_icon/*.png (+ icon-map.json) and icons/*.png
-foreach ($sub in @('prefect_icon', 'icons')) {
-  $outDir = Join-Path $settingsDst $sub
-  if (Test-Path -LiteralPath $outDir) { Remove-Item -Recurse -Force -LiteralPath $outDir }
-  New-Item -ItemType Directory -Force -Path $outDir | Out-Null
-}
-$settingsIconFiles = New-Object System.Collections.Generic.List[string]
-foreach ($n in $pngNames) { [void]$settingsIconFiles.Add("prefect_icon/$n") }
-[void]$settingsIconFiles.Add('prefect_icon/icon-map.json')
-foreach ($n in @('icon16.png', 'icon32.png', 'icon48.png', 'icon128.png')) { [void]$settingsIconFiles.Add("icons/$n") }
-foreach ($f in $settingsIconFiles) {
-  $from = Join-Path $dst ($f -replace '/', '\')
-  $to   = Join-Path $settingsDst ($f -replace '/', '\')
-  if (-not (Test-Path -LiteralPath $from -PathType Leaf)) { $derivedFailures.Add("missing vendored asset for the settings copy: $f"); continue }
+$settingsIconDir = Join-Path $settingsDst 'icons'
+if (-not (Test-Path -LiteralPath $settingsIconDir)) { New-Item -ItemType Directory -Force -Path $settingsIconDir | Out-Null }
+foreach ($n in @('icon16.png', 'icon32.png', 'icon48.png', 'icon128.png')) {
+  $from = Join-Path $dst "icons/$n"
+  $to   = Join-Path $settingsIconDir $n
+  if (-not (Test-Path -LiteralPath $from -PathType Leaf)) { $derivedFailures.Add("missing vendored asset for the settings copy: icons/$n"); continue }
   Copy-Item -LiteralPath $from -Destination $to -Force
-  Assert-SameBytes ([System.IO.File]::ReadAllBytes($from)) ([System.IO.File]::ReadAllBytes($to)) "ui/settings/$f must be byte-identical to the vendored copy"
+  Assert-SameBytes ([System.IO.File]::ReadAllBytes($from)) ([System.IO.File]::ReadAllBytes($to)) "ui/settings/icons/$n must be byte-identical to the vendored copy"
 }
-Write-Host ("settings copies: popup.html + popup.js + {0} assets -> {1}" -f $settingsIconFiles.Count, $settingsDst)
-
+Write-Host ("settings assets: icons only -> {0}" -f $settingsDst)
 # --- self-check -------------------------------------------------------------
 $failures = New-Object System.Collections.Generic.List[string]
 foreach ($f in $derivedFailures) { $failures.Add($f) }

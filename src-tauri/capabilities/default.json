@@ -16,6 +16,9 @@
     "allow-import-wallpaper",
     "allow-get-local-store",
     "allow-set-local-store",
-    "allow-request-app-items"
+    "allow-request-app-items",
+    "allow-get-update-state",
+    "allow-start-update-check",
+    "allow-install-update"
   ]
 }

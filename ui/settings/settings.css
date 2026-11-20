@@ -1,49 +1,220 @@
-/* 设置窗样式（spec §8.1，Task 14b 起；T14c 修复轮 3 起**只保留上游界面**）。
+/* 设置窗样式（T14g，用户要求：参考图重做设置页）。
  *
- * T14c 修复轮 22（「优化排版、统一风格」）：
- * - 窗口内尺寸精确等于上游 popup 自己写死的 372×522（popup.html:44-51），外壳的
- *   12px 内边距与 400×550 窗口一并取消——不再有四周那圈死边；
- * - 外层背景跟随弹窗**自己的**主题变量（popup.html:19-42 的 `--card-bg`：深色 #171717 /
- *   浅色 #fff，随 `prefers-color-scheme`），外层与 iframe 永远同色，视觉上是**一张面**；
- * - .frame-host 不再有边框 / 圆角 / 自己的底色（那正是「套娃框」的来源）。
- * 上游界面本身一个字节都不动（装在 iframe 里，样式也不可能互相打架）。
+ * 参考图的视觉语言：深色底（#0e0f11）、左侧一列分页导航、右侧设置卡片
+ * （#16171a + 1px 边框 + 行间 1px 分隔）、每行「标题 + 说明」在左、控件在右，
+ * 开关/分段控件/进度条用同一个强调色。
  *
- * 零依赖、零构建链。 */
+ * 纪律：
+ * - **不引入任何高开销效果**（没有 backdrop-filter / 大阴影）：设置页「有点卡」的
+ *   根因是上游 popup 整套 UI 在打开时立刻跑（T14g 改为「高级」分页懒加载），
+ *   样式层不再叠加额外成本。
+ * - 颜色集中在这几个变量里；页面只有深色一套（与参考图一致）。
+ * - 零依赖、零构建链。
+ */
 * { box-sizing: border-box; }
+
+:root {
+  --bg: #0e0f11;
+  --sidebar: #131418;
+  --card: #16171a;
+  --card-border: #24262b;
+  --row-border: #202227;
+  --text: #e8e9ec;
+  --muted: #9a9ca4;
+  --faint: #6f727a;
+  --hover: #1e2025;
+  --active: #24262c;
+  --accent: #4d6bfe;
+  --danger: #e5484d;
+  --mono: "Cascadia Mono", "Consolas", "Microsoft YaHei UI", monospace;
+}
+
 html, body { height: 100%; }
 body {
-  margin: 0; display: flex;
-  color-scheme: light dark;
-  /* 与 popup.html 的 body 背景（--card-bg）逐值一致：深色 #171717、浅色 #fff */
-  background: #fff;
-  font: 14px/1.6 "Microsoft YaHei", system-ui, sans-serif;
-}
-@media (prefers-color-scheme: dark) {
-  body { background: #171717; }
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 13px/1.55 "Segoe UI", "Microsoft YaHei UI", system-ui, sans-serif;
+  overflow: hidden;
+  user-select: none;
 }
 
-/* 唯一的一块：上游界面，撑满窗口（窗口尺寸就是按它定的）。 */
-.shell { flex: 1 1 auto; display: flex; align-items: stretch; justify-content: stretch; }
-.upstream { flex: 1 1 auto; display: flex; flex-direction: column; }
+.app { display: flex; height: 100%; }
 
-/* iframe 的宿主：上游 popup 的 body 是 372×522（popup.html:44-51），窗口内尺寸与它
-   精确一致，无边框无底色（背景由 body 与 iframe 同色承接）。
-   四种态（fix round 1 / Minor 2）：
-     loading  —— 还没挂帧：显示占位说明（「正在读取配置…」）；占位与帧不并排（否则会挤在一起）
-     mounted  —— 帧已挂上、还没判定：隐藏占位，把位置让给帧
-     ready    —— 帧内确实有上游自己的节点（#siteToggle + code.version）
-     failed   —— 有界窗口内没等到就绪：占位说明**必须可见**（旧实现永远停在会隐藏它的 ready 态，
-                 于是「上游界面没渲染出来」这句话一次都没人能看见） */
-.frame-host {
-  width: 372px; height: 522px; flex: 0 0 auto;
-  display: flex; align-items: center; justify-content: center; overflow: hidden;
+/* ---------------- 侧边栏 ---------------- */
+
+.sidebar {
+  width: 208px; flex: none;
+  background: var(--sidebar);
+  border-right: 1px solid #1b1d21;
+  display: flex; flex-direction: column;
+  padding: 14px 10px 10px;
+  overflow-y: auto;
 }
-.frame-host[data-state="ready"] { display: block; }
-.frame-host[data-state="mounted"] { display: block; }
-.frame-host iframe { width: 372px; height: 522px; border: 0; display: block; }
-.frame-note { margin: 0; padding: 16px; font-size: 12px; text-align: center; opacity: 0.72; }
-.frame-host[data-state="ready"] .frame-note { display: none; }
-.frame-host[data-state="mounted"] .frame-note { display: none; }
-.frame-host[data-state="failed"] .frame-note {
-  padding: 24px 16px; color: #ff9a94; text-align: left; line-height: 1.7; opacity: 1;
+
+
+.nav { display: flex; flex-direction: column; gap: 2px; }
+.nav-item {
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 10px; border: 0; border-radius: 8px;
+  background: none; color: var(--muted);
+  font: inherit; font-size: 13px; text-align: left; cursor: pointer;
 }
+.nav-item svg { width: 16px; height: 16px; flex: none; opacity: .95; }
+.nav-item:hover { background: var(--hover); color: var(--text); }
+.nav-item.active { background: var(--active); color: #fff; }
+.nav-item:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+.sidebar-foot {
+  margin-top: auto; padding: 10px;
+  font-size: 11px; line-height: 1.5; color: var(--muted);
+  min-height: 18px; word-break: break-word;
+}
+.sidebar-foot.error { color: #ff8a8d; }
+
+/* ---------------- 内容区 ---------------- */
+
+.content { flex: 1; min-width: 0; overflow-y: auto; padding: 20px 26px 40px; }
+.panel { display: none; max-width: 820px; }
+.panel.active { display: block; }
+
+.panel-head { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin: 2px 0 14px; }
+h1 { margin: 0; font-size: 17px; font-weight: 600; letter-spacing: .2px; }
+
+.card {
+  background: var(--card);
+  border: 1px solid var(--card-border);
+  border-radius: 10px;
+  overflow: hidden;
+  margin-bottom: 14px;
+}
+
+.row {
+  display: flex; align-items: center; gap: 20px;
+  padding: 13px 16px;
+  border-bottom: 1px solid var(--row-border);
+}
+.row:last-child { border-bottom: 0; }
+.row-stack { align-items: flex-start; }
+.row-main { flex: 1; min-width: 0; }
+.row-title { font-size: 13px; }
+.row-desc { font-size: 12px; color: var(--muted); margin-top: 2px; }
+.row-desc.mono { font-family: var(--mono); font-size: 11px; word-break: break-all; user-select: text; }
+.row-control { display: flex; align-items: center; gap: 8px; flex: none; }
+
+/* ---------------- 控件 ---------------- */
+
+.switch {
+  width: 38px; height: 22px; flex: none;
+  border: 0; border-radius: 11px; padding: 0;
+  background: #2b2d33; cursor: pointer; position: relative;
+  transition: background .16s ease;
+}
+.switch::after {
+  content: ""; position: absolute; top: 2px; left: 2px;
+  width: 18px; height: 18px; border-radius: 50%;
+  background: #fff; transition: transform .16s ease;
+}
+.switch[aria-checked="true"] { background: var(--accent); }
+.switch[aria-checked="true"]::after { transform: translateX(16px); }
+.switch:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+.segmented {
+  display: inline-flex; gap: 2px; padding: 2px;
+  background: #101114; border: 1px solid var(--card-border); border-radius: 8px;
+}
+.segmented button {
+  border: 0; background: none; color: var(--muted);
+  font: inherit; font-size: 12px; padding: 5px 14px; border-radius: 6px; cursor: pointer;
+}
+.segmented button:hover { color: var(--text); }
+.segmented button.on { background: #26272b; color: #fff; }
+
+.input {
+  background: #101114; border: 1px solid var(--card-border); border-radius: 8px;
+  color: var(--text); font: inherit; font-size: 12px;
+  padding: 6px 10px; outline: none;
+}
+.input:focus { border-color: #3f4fae; }
+.input.num { width: 76px; text-align: right; }
+.input.text { width: 320px; }
+.unit { font-size: 12px; color: var(--muted); }
+
+.btn {
+  border: 1px solid #2a2d33; background: #1c1e23; color: var(--text);
+  font: inherit; font-size: 12px; padding: 7px 14px; border-radius: 8px; cursor: pointer;
+  white-space: nowrap;
+}
+.btn:hover { background: #23262c; }
+.btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.btn.primary:hover { filter: brightness(1.07); }
+.btn.danger { border-color: #4a2b2d; color: #ff9b9e; background: #241a1b; }
+.btn.danger.armed { background: var(--danger); border-color: var(--danger); color: #fff; }
+.btn:disabled { opacity: .45; cursor: default; filter: none; }
+
+.pill {
+  display: inline-block; padding: 3px 9px; border-radius: 999px;
+  background: #1e2025; border: 1px solid #2a2d33;
+  font-size: 11px; color: var(--muted); white-space: nowrap;
+}
+
+.swatches { display: flex; align-items: center; gap: 8px; }
+.swatch {
+  width: 20px; height: 20px; border-radius: 50%; padding: 0;
+  background: var(--c); border: 2px solid transparent; cursor: pointer;
+}
+.swatch:hover { transform: scale(1.08); }
+.swatch.on { border-color: #fff; box-shadow: 0 0 0 2px rgba(255, 255, 255, .18); }
+.swatch-custom {
+  width: 24px; height: 24px; padding: 0; border: 1px solid var(--card-border);
+  border-radius: 6px; background: none; cursor: pointer;
+}
+
+/* ---------------- 更新进度 ---------------- */
+
+.progress { margin-top: 10px; max-width: 460px; }
+.progress-bar { height: 6px; border-radius: 3px; background: #101114; overflow: hidden; }
+.progress-bar span {
+  display: block; height: 100%; width: 0;
+  background: var(--accent); border-radius: 3px;
+  transition: width .2s linear;
+}
+.progress-meta {
+  display: flex; justify-content: space-between; gap: 12px;
+  margin-top: 5px; font-size: 11px; color: var(--faint);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---------------- 自定义代码 / 逐项列表（T14g 修复轮 3） ---------------- */
+
+.input.code {
+  width: 100%;
+  min-height: 96px;
+  resize: vertical;
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.5;
+  user-select: text;
+}
+
+.items-list { max-height: 340px; overflow-y: auto; border-top: 1px solid var(--row-border); }
+.item-row {
+  display: flex; align-items: center; gap: 14px;
+  padding: 9px 16px; border-bottom: 1px solid var(--row-border);
+}
+.item-row:last-child { border-bottom: 0; }
+.item-title {
+  flex: 1; min-width: 0;
+  font-size: 12px; color: var(--text);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.item-key { font-size: 10px; color: var(--faint); margin-top: 1px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.item-controls { display: flex; align-items: center; gap: 12px; flex: none; }
+.check { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); cursor: pointer; }
+.check input { accent-color: var(--accent); margin: 0; }
+.select-sm {
+  background: #101114; border: 1px solid var(--card-border); border-radius: 6px;
+  color: var(--text); font: inherit; font-size: 11px; padding: 4px 6px; max-width: 150px;
+}
+.items-empty { padding: 14px 16px; font-size: 12px; color: var(--faint); }

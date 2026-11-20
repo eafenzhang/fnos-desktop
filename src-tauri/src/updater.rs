@@ -1,17 +1,17 @@
-//! 检查更新（T14c 修复轮 21）：托盘「检查更新」菜单项的实现。
+//! 检查更新（T14g：**设置页 → 更新**；托盘菜单只保留基础动作）。
 //!
-//! 流程（用户要求：**自动下载更新**，不是打开页面）：
+//! 流程（用户要求：设置页里**实时看到下载进度**）：
 //!   1. 请求 GitHub Releases 的 `latest`（api.github.com），取 `tag_name` 与当前版本
 //!      （`env!("CARGO_PKG_VERSION")`）比较；
 //!   2. 有新版本 → 从 release 的 assets 里挑出 NSIS 安装包（`*x64-setup.exe`），
 //!      **自动下载**到配置目录的 `updates/` 下（已下载过同名文件就复用）；
-//!   3. 弹原生消息框询问是否立即安装——「确定」则静默安装（NSIS `/S`）并让安装器
-//!      装完自动重启应用（`/R`）；安装器自己会先结束正在运行的旧进程（tauri 的
-//!      NSIS 模板在静默模式下会 kill 正在运行的应用，文件锁不构成问题）；
-//!   4. 已是最新 / 网络失败 / 响应不认识 → 原生消息框如实告知，绝不静默。
+//!      下载循环每 ~120ms 把「已下载 / 总大小 / 速度」写进 [`UpdateStatus`]，
+//!      设置页轮询 `get_update_state` 渲染进度条——没有事件总线、没有新增 IPC 面；
+//!   3. 下载完成 → 设置页出现「立即安装并重启」，确认后静默安装（NSIS `/S` + `/R`）；
+//!   4. 已是最新 / 网络失败 / 响应不认识 → 状态里如实写明，设置页直接显示。
 //!
 //! 本壳**不做**应用内替换升级（那是 tauri-plugin-updater 的签名校验 + 更新清单体系）：
-//! NSIS 安装包走 GitHub Releases 已经闭环，托盘要的是「检查 → 下载 → 装好重启」这条链。
+//! NSIS 安装包走 GitHub Releases 已经闭环，设置页要的是「检查 → 进度 → 装好重启」这条链。
 //!
 //! 请求安全边界（本模块发起的每一个 URL）：
 //!   - API 地址是编译期常量（api.github.com），不来自任何响应；
@@ -20,15 +20,16 @@
 //!     `/releases/download/`——localhost / 环回 / 私有 / 保留地址与任何其它 host
 //!     一律拒绝，文件名另行白名单清洗（防路径穿越）。
 //!
-//! 线程：HTTP（ureq 阻塞）与 MessageBoxW（阻塞直到点击）都由托盘事件回调里的
-//! `spawn_blocking` 调进阻塞线程池——绝不能卡住托盘。
+//! 线程：HTTP（ureq 阻塞）由命令里的 `spawn_blocking` 调进阻塞线程池——绝不能卡住
+//! 主线程或托盘事件循环。
 
-use crate::commands::save_window_geom;
+use crate::commands::{save_window_geom, AppState};
 use crate::logfile::flog;
 use crate::paths::config_dir;
+use serde::Serialize;
 use serde_json::Value;
-use std::io::Read;
-use tauri::{AppHandle, Runtime};
+use std::io::{Read, Write};
+use tauri::{AppHandle, Manager, Runtime};
 
 /// 本壳的 GitHub 仓库（`owner/repo`）。
 ///
@@ -152,6 +153,95 @@ pub fn current_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
+/// 检查更新的阶段。设置页（`ui/settings/settings-page.js`）按同一组字符串映射文案与控件，
+/// 两处必须逐字一致（有前端契约测试锁定）。
+pub mod phase {
+    pub const IDLE: &str = "idle";
+    pub const CHECKING: &str = "checking";
+    pub const UP_TO_DATE: &str = "upToDate";
+    pub const DOWNLOADING: &str = "downloading";
+    pub const READY: &str = "ready";
+    pub const INSTALLING: &str = "installing";
+    pub const ERROR: &str = "error";
+}
+
+/// 检查更新的**完整对外状态**（`get_update_state` 的返回体）。
+///
+/// 设置页每 ~300ms 轮询一次；一次检查/下载的每一次进展都写在这里，所以「实时进度」
+/// 不需要事件总线——也就没有新增 IPC 面（设置页本来就只读这一个命令）。
+///
+/// `downloaded` / `total` 是**字节**（`total` 可能缺失：服务器没给 Content-Length），
+/// `bytesPerSec` 是最近一个采样窗口的速度（只在 downloading 阶段有意义）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateStatus {
+    /// 见 [`phase`]。
+    pub phase: &'static str,
+    /// 当前版本（`CARGO_PKG_VERSION`）。
+    pub current: &'static str,
+    /// 线上最新 tag（拿到 release 之后才有）。
+    pub latest: Option<String>,
+    /// 给用户看的一行话：检查失败原因 / 「已是最新」/「已下载」等。
+    pub message: String,
+    pub downloaded: u64,
+    pub total: Option<u64>,
+    pub bytes_per_sec: Option<u64>,
+    /// `ready` 之后是安装包的绝对路径（`install_update` 只认这个值）。
+    pub installer: Option<String>,
+    /// 该 release 是否带 sha256 digest（没有 digest 的安装包只能做体积校验，
+    /// 设置页必须在安装按钮旁如实标注）。
+    pub has_digest: bool,
+}
+
+impl Default for UpdateStatus {
+    fn default() -> Self {
+        Self {
+            phase: phase::IDLE,
+            current: current_version(),
+            latest: None,
+            message: String::new(),
+            downloaded: 0,
+            total: None,
+            bytes_per_sec: None,
+            installer: None,
+            has_digest: false,
+        }
+    }
+}
+
+impl UpdateStatus {
+    /// 正在检查 / 下载 / 安装（设置页据此决定按钮置灰与是否继续轮询）。
+    pub fn is_running(&self) -> bool {
+        matches!(
+            self.phase,
+            phase::CHECKING | phase::DOWNLOADING | phase::INSTALLING
+        )
+    }
+}
+
+/// 读当前更新状态（命令与内部共用）。
+pub fn status<R: Runtime>(app: &AppHandle<R>) -> UpdateStatus {
+    app.state::<AppState>().update.lock().unwrap().clone()
+}
+
+/// 就地改状态（没有托管状态时静默跳过——启动早期的调用不该 panic）。
+fn edit_status<R: Runtime>(app: &AppHandle<R>, f: impl FnOnce(&mut UpdateStatus)) {
+    if let Some(state) = app.try_state::<AppState>() {
+        f(&mut state.update.lock().unwrap());
+    }
+}
+
+/// 进入失败态并写一行日志（设置页直接显示 `message`）。
+fn fail<R: Runtime>(app: &AppHandle<R>, message: impl Into<String>) {
+    let message = message.into();
+    flog!("[fnos] 更新失败：{message}");
+    edit_status(app, |s| {
+        s.phase = phase::ERROR;
+        s.message = message;
+        s.bytes_per_sec = None;
+    });
+}
+
 /// 把 release 的 tag 解析成版本三元组：`v0.2.1` / `0.2.1` / `V1.2.3` → `(1,2,3)`。
 ///
 /// 只认「可选 v 前缀 + 三段纯数字」——其它形状（`v1.2` / `v1.2.3.4` / `v1.2.x` /
@@ -217,7 +307,7 @@ pub fn validate_download_url(raw: &str) -> Result<String, String> {
 /// 第三个返回值是 GitHub Releases API 的 `assets[].digest`（`sha256:<hex>`）里的 hex 部分。
 /// **它可能不存在**（GitHub 对 2024 年前上传的资产不回填 digest，本仓库早期的 release 就是
 /// 这种），所以类型是 `Option<String>`，由下载路径决定「没有 digest 时怎么办」——
-/// 见 [`download_installer`] 的保守策略。
+/// 见 [`download_installer_with_progress`] 的保守策略。
 ///
 /// **失败关闭**：资产带了 `digest` 字段但认不出来（别的算法 / 长度不对 / 非字符串）时
 /// 直接 `Err`，绝不退化成「没有 digest」——那会让一次格式漂移悄悄关掉校验。
@@ -329,14 +419,53 @@ fn fetch_latest_release() -> Result<Value, String> {
 /// 这条捷径是危险的：`updates/` 里一个被替换过或半截的同名 exe 会被直接拿去静默安装。
 /// 现在复用前必须过 [`installer_looks_complete`]——**有 digest 时严格比对 sha256**，
 /// 不匹配就删掉重下。
-fn download_installer(
+/// 把 `reader` 分块写进 `writer`，**每块回调一次进度**；超过 `max_bytes` 立即失败。
+///
+/// 抽成独立函数是为了让「进度单调递增、最后一次是完整大小、超限即停」成为可单测的事实
+/// ——HTTP 层本身不可单测（`https_only(true)` + 真实证书），分块循环是这里唯一有分支的逻辑。
+fn copy_with_progress(
+    reader: &mut dyn Read,
+    writer: &mut dyn Write,
+    max_bytes: u64,
+    declared_len: Option<u64>,
+    progress: &mut dyn FnMut(u64, Option<u64>),
+) -> Result<u64, String> {
+    let mut size: u64 = 0;
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                size = size.saturating_add(n as u64);
+                if size > max_bytes {
+                    return Err(format!("安装包超过体积上限（>{max_bytes} 字节），已丢弃"));
+                }
+                writer
+                    .write_all(&buf[..n])
+                    .map_err(|e| format!("下载中断：{e}"))?;
+                progress(size, declared_len);
+            }
+            Err(e) => return Err(format!("下载中断：{e}")),
+        }
+    }
+    Ok(size)
+}
+
+/// 带进度回调的下载实现：`progress(已下载字节, 声明的总字节)`。
+///
+/// 回调在**下载线程**里被同步调用（节流由调用方做），只做「写状态」这种廉价动作。
+///
+/// 目标目录是**参数**（生产走 `config_dir()/updates`）：单测可以直接用临时目录，
+/// 不碰真实配置目录。
+fn download_installer_with_progress(
+    dir: &std::path::Path,
     download_url: &str,
     file_name: &str,
     mirror_prefix: &str,
     expected_sha256: Option<&str>,
+    progress: &mut dyn FnMut(u64, Option<u64>),
 ) -> Result<std::path::PathBuf, String> {
-    let dir = config_dir().join("updates");
-    std::fs::create_dir_all(&dir).map_err(|e| format!("创建更新目录失败：{e}"))?;
+    std::fs::create_dir_all(dir).map_err(|e| format!("创建更新目录失败：{e}"))?;
     let dest = dir.join(file_name);
     // P1-6：`.part` 名带进程 id。两次「检查更新」并发时（快速连点托盘菜单）它们各写各的
     // 临时文件，不会互相截断；最后两个线程都 rename 到同一个 dest，内容同源同哈希，
@@ -364,6 +493,7 @@ fn download_installer(
         .build();
     let mut last_err: Option<String> = None;
     let mut reader = None;
+    let mut declared_len: Option<u64> = None;
     for attempt in 1..=DOWNLOAD_CONNECT_TRIES {
         match agent
             .get(&target)
@@ -381,6 +511,7 @@ fn download_installer(
                             "安装包体积异常（声明 {len} 字节，超过上限 {MAX_INSTALLER_BYTES} 字节），已放弃下载"
                         ));
                     }
+                    declared_len = Some(len);
                 }
                 reader = Some(resp.into_reader());
                 break;
@@ -403,27 +534,29 @@ fn download_installer(
         .map_err(|e| format!("写安装包失败：{e}"))?;
     // 上限兜底：Content-Length 可能缺失/撒谎，流式写入必须有硬上限，
     // 否则一个坏镜像（或错误页）能把系统盘写满。
-    let copied = {
-        let mut limited = reader.by_ref().take(MAX_INSTALLER_BYTES + 1);
-        std::io::copy(&mut limited, &mut file)
-    };
-    if let Err(e) = copied {
-        drop(file);
-        let _ = std::fs::remove_file(&part);
-        return Err(format!("下载中断：{e}"));
-    }
-    let size = copied.unwrap_or(0);
+    //
+    // 手写分块循环（而不是 `io::copy`）是为了**每块都能报进度**：设置页的进度条
+    // 直接读这里写下的字节数。块大小 64 KiB——每秒几百次回调，节流在调用方。
+    let copied = copy_with_progress(
+        reader.as_mut(),
+        &mut file,
+        MAX_INSTALLER_BYTES,
+        declared_len,
+        progress,
+    );
     drop(file);
-    if size > MAX_INSTALLER_BYTES {
-        let _ = std::fs::remove_file(&part);
-        return Err(format!(
-            "安装包超过体积上限（>{MAX_INSTALLER_BYTES} 字节），已丢弃"
-        ));
-    }
+    let size = match copied {
+        Ok(size) => size,
+        Err(e) => {
+            let _ = std::fs::remove_file(&part);
+            return Err(e);
+        }
+    };
     if size < MIN_INSTALLER_BYTES {
         let _ = std::fs::remove_file(&part);
         return Err(format!("下载的安装包不完整（{size} 字节）"));
     }
+    progress(size, declared_len.or(Some(size)));
     // P1-5：下载完成后的**内容**校验。配了镜像前缀时，GitHub 的 HTTPS 不再是唯一来源，
     // 所以「大小够」不代表「内容对」——必须拿 release API 给的 digest 比对；没有 digest
     // 的老 release 退回体积判定（并在日志里如实标出来，免得把「没校验」当成「校验通过」）。
@@ -534,10 +667,10 @@ fn start_install<R: Runtime>(app: &AppHandle<R>, installer: &std::path::Path) ->
 
 /// 「检查更新」的重入闸门（P1-6）。
 ///
-/// 托盘菜单项没有置灰能力（T14a 之后菜单全是无状态动作项），所以用户完全可能在第一次
-/// 下载（最长 120 秒）期间再点一次。两次并发下载各写各的 `.part` 本身已经安全（见
-/// [`download_installer`] 的进程 id 后缀），但**两个原生 MessageBox 叠在一起**会让用户
-/// 分不清哪个是哪个，而且会白下一遍。用一次 CAS 直接告诉后来者「正在检查」。
+/// 设置页的「检查更新」按钮在状态进入 checking/downloading 后会置灰，但轮询有间隔、
+/// 用户也可能连点；第一次下载最长 120 秒。两次并发下载各写各的 `.part` 本身已经安全
+/// （见下载实现的进程 id 后缀），但并发两轮会让状态互相覆盖、还白下一遍。用一次 CAS
+/// 让后来者直接复用当前这一轮的状态（`start_update_check` 返回的就是它）。
 static UPDATE_CHECK_RUNNING: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -565,27 +698,29 @@ impl Drop for UpdateCheckGuard {
     }
 }
 
-/// 托盘「检查更新」的入口（**阻塞**函数；托盘侧用 `spawn_blocking` 调用）。
-pub fn check_from_tray<R: Runtime>(app: AppHandle<R>) {
+/// 设置页「检查更新」的入口（**阻塞**函数；命令侧用 `spawn_blocking` 调用）。
+///
+/// 全程只写 [`UpdateStatus`]：没有消息框、没有弹窗——设置页轮询状态自己渲染。
+pub fn run_check<R: Runtime>(app: AppHandle<R>) {
     let Some(_guard) = UpdateCheckGuard::acquire() else {
-        message_box(
-            "fnOS 检查更新",
-            "正在检查 / 下载更新，请稍候；这次重复的点击已忽略。",
-            MB_ICON_INFO,
-        );
-        return;
+        return; // 已在跑：设置页读到的就是那一轮的状态
     };
+    edit_status(&app, |s| {
+        *s = UpdateStatus {
+            phase: phase::CHECKING,
+            message: "正在检查更新…".into(),
+            ..UpdateStatus::default()
+        };
+    });
     let current = current_version();
     let mirror_prefix = crate::commands::current(&app).shell.update_mirror_prefix;
     let release = match fetch_latest_release() {
         Ok(r) => r,
         Err(e) => {
-            message_box(
-                "fnOS 检查更新",
-                &format!("检查更新失败：{e}\n\n请确认本机可以访问 github.com。"),
-                MB_ICON_WARNING,
+            return fail(
+                &app,
+                format!("检查更新失败：{e}。请确认本机可以访问 github.com。"),
             );
-            return;
         }
     };
     let tag = release
@@ -593,128 +728,132 @@ pub fn check_from_tray<R: Runtime>(app: AppHandle<R>) {
         .and_then(|t| t.as_str())
         .unwrap_or("")
         .to_string();
+    edit_status(&app, |s| s.latest = Some(tag.clone()));
     // 两条「无法识别」先各自如实报告（比一句笼统的「没有更新」有用得多），
     // 真正的比较只走 `is_newer` 这一处——两处口径分叉正是这类版本判断最容易出的错。
     if parse_tag_version(&tag).is_none() {
-        message_box(
-            "fnOS 检查更新",
-            &format!("线上版本号无法识别（tag：{tag}）。"),
-            MB_ICON_WARNING,
-        );
-        return;
+        return fail(&app, format!("线上版本号无法识别（tag：{tag}）。"));
     }
     if parse_tag_version(current).is_none() {
-        message_box(
-            "fnOS 检查更新",
-            &format!("当前版本号无法识别（{current}）。"),
-            MB_ICON_WARNING,
-        );
-        return;
+        return fail(&app, format!("当前版本号无法识别（{current}）。"));
     }
     if !is_newer(&tag, current) {
-        message_box(
-            "fnOS 检查更新",
-            &format!("已是最新版本（v{current}）。"),
-            MB_ICON_INFO,
-        );
+        edit_status(&app, |s| {
+            s.phase = phase::UP_TO_DATE;
+            s.message = format!("已是最新版本（v{current}）。");
+        });
         return;
     }
 
-    // 有新版本：自动下载（文件已存在且校验通过则复用），然后询问是否立即安装。
     let (download_url, file_name, expected_sha256) = match pick_installer_asset(&release) {
         Ok((url, name, digest)) if safe_asset_name(&name) => (url, name, digest),
         Ok((_, name, _)) => {
-            message_box(
-                "fnOS 检查更新",
-                &format!("资产文件名不可用（{name}），已放弃下载。"),
-                MB_ICON_WARNING,
-            );
-            return;
+            return fail(&app, format!("资产文件名不可用（{name}），已放弃下载。"));
         }
-        Err(e) => {
-            message_box("fnOS 检查更新", &e.to_string(), MB_ICON_WARNING);
-            return;
-        }
+        Err(e) => return fail(&app, e),
     };
     let validated = match validate_download_url(&download_url) {
         Ok(u) => u,
-        Err(e) => {
-            message_box("fnOS 检查更新", &e.to_string(), MB_ICON_WARNING);
-            return;
-        }
+        Err(e) => return fail(&app, e),
     };
-    let installer = match download_installer(
+    edit_status(&app, |s| {
+        s.phase = phase::DOWNLOADING;
+        s.message = format!("正在下载 {tag}…");
+        s.downloaded = 0;
+        s.total = None;
+        s.bytes_per_sec = None;
+        s.has_digest = expected_sha256.is_some();
+    });
+
+    // 进度节流：每 120ms（以及最后一包）写一次状态。64 KiB 一块，慢网络下也够细腻；
+    // 不节流的话每秒几百次 Mutex 争用纯属浪费。
+    let mut last_report = std::time::Instant::now();
+    let mut last_bytes: u64 = 0;
+    let app_for_progress = app.clone();
+    let updates_dir = config_dir().join("updates");
+    let result = download_installer_with_progress(
+        &updates_dir,
         &validated,
         &file_name,
         &mirror_prefix,
         expected_sha256.as_deref(),
-    ) {
-        Ok(p) => p,
-        Err(e) => {
-            message_box("fnOS 检查更新", &e.to_string(), MB_ICON_WARNING);
-            return;
-        }
-    };
-
-    // 没有 digest 的老 release 只能按体积判定：这是真实的安全缺口，安装确认里必须
-    // 明确说出来（不能只在 app.log 里写一行用户永远看不到的字）。
-    let verify_note = if expected_sha256.is_some() {
-        ""
-    } else {
-        "⚠ 该 release 没有可用的 sha256 digest，安装包未做内容校验。\n\n"
-    };
-    let choice = message_box(
-        "fnOS 检查更新",
-        &format!(
-            "发现新版本 {tag}（当前 v{current}），安装包已下载。\n\n{verify_note}点「确定」立即安装并自动重启；点「取消」下次再说。"
-        ),
-        MB_ICON_INFO | MB_OKCANCEL,
+        &mut |done, total| {
+            let now = std::time::Instant::now();
+            if now.duration_since(last_report).as_millis() < 120 && Some(done) != total {
+                return;
+            }
+            let dt = now.duration_since(last_report).as_secs_f64().max(0.001);
+            let speed = (done.saturating_sub(last_bytes) as f64 / dt) as u64;
+            last_report = now;
+            last_bytes = done;
+            edit_status(&app_for_progress, |s| {
+                s.phase = phase::DOWNLOADING;
+                s.downloaded = done;
+                s.total = total;
+                s.bytes_per_sec = Some(speed);
+            });
+        },
     );
-    if choice == ID_OK {
-        if let Err(e) = start_install(&app, &installer) {
-            message_box("fnOS 检查更新", &e.to_string(), MB_ICON_WARNING);
-        }
+    match result {
+        Ok(path) => edit_status(&app, |s| {
+            s.phase = phase::READY;
+            s.downloaded = s.total.unwrap_or(s.downloaded);
+            s.bytes_per_sec = None;
+            s.installer = Some(path.display().to_string());
+            // 没有 digest 的老 release 只能按体积判定：这是真实的安全缺口，安装按钮旁
+            // 必须明确写出来（不能只在 app.log 里留一行用户永远看不到的字）。
+            s.message = if s.has_digest {
+                format!("新版本 {tag} 已下载（sha256 已校验）。")
+            } else {
+                format!("新版本 {tag} 已下载（该 release 没有 digest，只做了体积校验）。")
+            };
+        }),
+        Err(e) => fail(&app, e),
     }
 }
 
-// ---------- 原生 MessageBox（Windows）与跨平台桩 ----------
+/// 安装包路径的准入：必须是 `config_dir()/updates/` 下的普通文件。
+///
+/// `installer` 由宿主自己写进状态，但设置页也会读到它；安装前再校验一次，让
+/// 「谁把状态改坏了」不可能变成「执行任意 exe」。
+pub fn installer_path_is_trusted(path: &std::path::Path) -> bool {
+    let Ok(dir) = config_dir().join("updates").canonicalize() else {
+        return false;
+    };
+    let Ok(file) = path.canonicalize() else {
+        return false;
+    };
+    file.starts_with(&dir) && file.is_file()
+}
 
-const MB_ICON_INFO: u32 = 0x40; // MB_ICONINFORMATION
-const MB_ICON_WARNING: u32 = 0x30; // MB_ICONWARNING
-const MB_OKCANCEL: u32 = 0x1;
-const ID_OK: i32 = 1;
+/// 设置页「立即安装并重启」的入口（阻塞；命令侧 `spawn_blocking`）。
+pub fn install_ready<R: Runtime>(app: AppHandle<R>) {
+    let (phase_now, installer) = {
+        let s = status(&app);
+        (s.phase, s.installer.clone())
+    };
+    if phase_now != phase::READY {
+        return fail(&app, "还没有可安装的更新包，请先检查更新。");
+    }
+    let Some(installer) = installer else {
+        return fail(&app, "更新包路径缺失，请重新检查更新。");
+    };
+    let path = std::path::PathBuf::from(&installer);
+    if !installer_path_is_trusted(&path) {
+        return fail(&app, "更新包路径不在配置目录的 updates/ 下，已拒绝安装。");
+    }
+    edit_status(&app, |s| {
+        s.phase = phase::INSTALLING;
+        s.message = "正在安装并重启…".into();
+    });
+    if let Err(e) = start_install(&app, &path) {
+        fail(&app, e);
+    }
+}
 
 /// 子进程不闪控制台窗口（taskkill / 安装器 spawn 共用）。
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-
-/// 弹一个原生消息框（阻塞直到用户关闭；`MB_TOPMOST` 保证不被主窗口压在底下）。
-/// 返回被点击的按钮 ID（`MB_OKCANCEL` 时用于区分确定/取消）。
-#[cfg(windows)]
-fn message_box(title: &str, text: &str, flags: u32) -> i32 {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_OK, MB_TOPMOST};
-    let mut wide_title: Vec<u16> = title.encode_utf16().collect();
-    wide_title.push(0);
-    let mut wide_text: Vec<u16> = text.encode_utf16().collect();
-    wide_text.push(0);
-    // 空 HWND = 桌面消息框；本壳的窗口不作为父窗（托盘动作没有“所属窗口”的语义）
-    unsafe {
-        MessageBoxW(
-            std::ptr::null_mut(),
-            wide_text.as_ptr(),
-            wide_title.as_ptr(),
-            flags | MB_OK | MB_TOPMOST,
-        )
-    }
-}
-
-/// 非 Windows 的编译桩（本壳只在 Windows 上跑，留着它是为了让 `cargo check` 在
-/// 任何平台都不需要条件编译整个模块）。
-#[cfg(not(windows))]
-fn message_box(title: &str, text: &str, _flags: u32) -> i32 {
-    crate::logfile::emit(&format!("[fnos] {title}: {text}"));
-    1
-}
 
 #[cfg(test)]
 mod tests {
@@ -803,6 +942,106 @@ mod tests {
     }
 
     /// `digest` 只认 `sha256:` + 64 位十六进制。别的算法 / 长度不对 / 带杂字符一律当
+    /// T14g：设置页按这组阶段字符串渲染文案与控件，两处必须逐字一致
+    /// （前端 `tests/settings-page.test.mjs` 锁同一组字面量）。
+    #[test]
+    fn update_status_phases_and_serialization_are_stable() {
+        assert_eq!(phase::IDLE, "idle");
+        assert_eq!(phase::CHECKING, "checking");
+        assert_eq!(phase::UP_TO_DATE, "upToDate");
+        assert_eq!(phase::DOWNLOADING, "downloading");
+        assert_eq!(phase::READY, "ready");
+        assert_eq!(phase::INSTALLING, "installing");
+        assert_eq!(phase::ERROR, "error");
+
+        let idle = UpdateStatus::default();
+        assert_eq!(idle.current, current_version(), "当前版本必须来自 Cargo.toml");
+        assert!(!idle.is_running());
+        let json = serde_json::to_value(&idle).expect("状态必须可序列化");
+        assert_eq!(json["phase"], "idle");
+        assert_eq!(json["current"], current_version());
+        assert!(
+            json.get("bytesPerSec").is_some() && json.get("hasDigest").is_some(),
+            "键名必须是 camelCase（设置页直接读）"
+        );
+        assert!(json.get("bytes_per_sec").is_none());
+
+        for (p, running) in [
+            (phase::CHECKING, true),
+            (phase::DOWNLOADING, true),
+            (phase::INSTALLING, true),
+            (phase::UP_TO_DATE, false),
+            (phase::READY, false),
+            (phase::ERROR, false),
+        ] {
+            let s = UpdateStatus {
+                phase: p,
+                ..UpdateStatus::default()
+            };
+            assert_eq!(s.is_running(), running, "{p} 的 is_running 判据");
+        }
+    }
+
+    /// T14g：下载进度回调的语义——分块推进、单调不减、最后一次是完整大小、
+    /// 声明长度原样透传、超限立即失败（不留半截）。
+    #[test]
+    fn copy_with_progress_reports_each_chunk_and_enforces_the_cap() {
+        let body = vec![0x5au8; 200 * 1024 + 7];
+        let mut reader = std::io::Cursor::new(body.clone());
+        let mut out: Vec<u8> = Vec::new();
+        let mut seen: Vec<u64> = Vec::new();
+        let mut totals: Vec<Option<u64>> = Vec::new();
+        let size = copy_with_progress(
+            &mut reader,
+            &mut out,
+            1024 * 1024,
+            Some(body.len() as u64),
+            &mut |done, total| {
+                seen.push(done);
+                totals.push(total);
+            },
+        )
+        .expect("上限之内必须成功");
+        assert_eq!(size, body.len() as u64);
+        assert_eq!(out, body, "写出的字节必须与输入逐字节一致");
+        assert!(seen.len() >= 3, "200 KiB / 64 KiB 块至少三次回调：{seen:?}");
+        assert!(seen.windows(2).all(|w| w[0] < w[1]), "进度必须严格递增");
+        assert_eq!(seen.last().copied(), Some(body.len() as u64), "最后一次必须是完整大小");
+        assert_eq!(totals[0], Some(body.len() as u64), "声明长度必须原样透传");
+
+        // 超限：立即失败（不会先写满上限再报错），且错误信息带上限
+        let mut reader = std::io::Cursor::new(vec![0u8; 300 * 1024]);
+        let mut out: Vec<u8> = Vec::new();
+        let err = copy_with_progress(&mut reader, &mut out, 128 * 1024, None, &mut |_, _| {})
+            .unwrap_err();
+        assert!(err.contains("体积上限"), "错误必须说明原因：{err}");
+        assert!(out.len() <= 128 * 1024, "超限时写出的字节不得超过上限");
+    }
+
+    /// 安装包路径的准入只认 `config_dir()/updates/` 下的普通文件——状态被改坏也不能变成
+    /// 「执行任意 exe」。这里测负例（不碰真实配置目录）：不存在的路径、updates 目录之外的文件。
+    #[test]
+    fn installer_path_outside_updates_is_rejected() {
+        let outside = std::env::temp_dir().join(format!("fnos-outside-{}.exe", std::process::id()));
+        std::fs::write(&outside, b"MZ").unwrap();
+        assert!(
+            !installer_path_is_trusted(&outside),
+            "updates/ 之外的文件必须拒绝"
+        );
+        let _ = std::fs::remove_file(&outside);
+        assert!(
+            !installer_path_is_trusted(&std::env::temp_dir().join("does-not-exist.exe")),
+            "不存在的路径必须拒绝"
+        );
+        // 源码锁：判据必须真的锚在 updates 目录上（不能只判 is_file）
+        let code = code();
+        assert!(
+            code.contains("config_dir().join(\"updates\").canonicalize()")
+                && code.contains("file.starts_with(&dir)"),
+            "准入必须做「canonicalize 后前缀比对」"
+        );
+    }
+
     /// 「没有 digest」——把认不出的形状当校验值用，等于用垃圾数据做安全判定。
     #[test]
     fn sha256_digest_is_parsed_strictly() {
@@ -911,10 +1150,18 @@ mod tests {
             code.contains("env!(\"CARGO_PKG_VERSION\")"),
             "当前版本必须来自 Cargo.toml（与安装包版本同源），不得手写字面量"
         );
-        assert!(code.contains("check_from_tray"), "托盘入口必须在");
+        // T14g：入口从托盘移到设置页——状态机 + 命令侧 spawn_blocking
+        assert!(
+            code.contains("pub fn run_check") && code.contains("pub fn install_ready"),
+            "设置页入口（run_check / install_ready）必须在"
+        );
+        assert!(
+            code.contains("download_installer_with_progress"),
+            "下载必须走带进度回调的实现（设置页的实时进度条依赖它）"
+        );
         // 用户要求：自动下载安装，而不是打开页面
         assert!(
-            code.contains("download_installer") && code.contains("start_install"),
+            code.contains("download_installer_with_progress") && code.contains("start_install"),
             "必须自动下载并静默安装"
         );
         assert!(

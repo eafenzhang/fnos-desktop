@@ -1,7 +1,7 @@
 {
   "name": "fnos-desktop-shell",
   "private": true,
-  "version": "0.3.18",
+  "version": "0.5.0",
   "type": "module",
   "scripts": {
     "test": "node --test"

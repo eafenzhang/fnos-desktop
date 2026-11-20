@@ -899,8 +899,15 @@ impl Config {
                 }
             })
             .collect();
+        // 重绘映射的键必须同时出现在 `launchpadIconRedrawKeys` 里：上游只在「这张卡片
+        // 确实要重绘」时才读 map（`resolveLaunchpadRedrawPath` 的调用点由 redrawKeys 把关），
+        // 所以孤立的 map 条目是死配置。更要紧的是**合并语义**：`set_config` 对对象是深合并，
+        // 设置页把整张 map 写成 `{}` 清不掉旧键——这里的 `retain` 才是「取消重绘」真正
+        // 落到磁盘的地方。值仍按 R30 的规则校验。
+        let redraw_keys: std::collections::HashSet<String> =
+            m.launchpad_icon_redraw_keys.iter().cloned().collect();
         m.launchpad_icon_redraw_map
-            .retain(|_, v| is_valid_prefect_icon_path(v));
+            .retain(|k, v| redraw_keys.contains(k) && is_valid_prefect_icon_path(v));
         // Finding 1：`homeUrl` 必须是可导航的绝对 http(s) URL，否则回落默认常量。
         // round 0 只判空，于是 `"not a url"` / `"javascript:alert(1)"` 会一路走到
         // `main.rs` 的 `.parse().expect("home url")` → release 下静默启动失败。
@@ -1810,6 +1817,7 @@ mod tests {
                 "fontFamily": "My Font",
                 "enabledOrigins": [1, "http://a", " "],
                 "desktopIconPerColumnEnabled": null,
+                "launchpadIconRedrawKeys": ["a", "b"],
                 "launchpadIconRedrawMap": {"a": "prefect_icon/emby.png", "b": "../x", "c": 1}
               },
               "local": { "customCssCode": "body{}", "loginWallpaperFileName": null },
@@ -2101,6 +2109,8 @@ mod tests {
             ("bslash", "prefect_icon\\emby.png"),
         ] {
             c.mods.launchpad_icon_redraw_map.insert(k.into(), v.into());
+            // 重绘映射的键必须同时在 redrawKeys 里（见 normalize 的 retain）
+            c.mods.launchpad_icon_redraw_keys.push(k.into());
         }
         c.normalize();
         let keys: Vec<String> = c.mods.launchpad_icon_redraw_map.keys().cloned().collect();
@@ -2117,6 +2127,33 @@ mod tests {
         c.normalize();
         let again: Vec<String> = c.mods.launchpad_icon_redraw_map.keys().cloned().collect();
         assert_eq!(again, keys);
+    }
+
+    /// T14g 修复轮 3：**取消重绘**要真的落到磁盘。
+    ///
+    /// `set_config` 对对象是深合并，设置页把整张 map 写成 `{}` 清不掉旧键；而 `normalize`
+    /// 的 retain 要求「map 的键必须在 redrawKeys 里」——所以「redrawKeys 去掉它、map 里
+    /// 残留一条」的这种状态，会在归一化时被清掉。这条测试同时钉住这两件事。
+    #[test]
+    fn redraw_map_is_pruned_to_redraw_keys() {
+        let mut c = Config::default();
+        c.mods
+            .launchpad_icon_redraw_map
+            .insert("/a/icon_1.png".into(), "prefect_icon/emby.png".into());
+        c.mods
+            .launchpad_icon_redraw_map
+            .insert("/a/icon_2.png".into(), "prefect_icon/kodi.png".into());
+        c.mods.launchpad_icon_redraw_keys = vec!["/a/icon_1.png".into()];
+        c.normalize();
+        assert_eq!(
+            c.mods.launchpad_icon_redraw_map.keys().cloned().collect::<Vec<_>>(),
+            vec!["/a/icon_1.png"],
+            "不在 redrawKeys 里的 map 条目必须被清掉（这正是「取消重绘」落盘的方式）"
+        );
+        // 空 redrawKeys → 整张 map 清空
+        c.mods.launchpad_icon_redraw_keys.clear();
+        c.normalize();
+        assert!(c.mods.launchpad_icon_redraw_map.is_empty());
     }
 
     /// 同一路径写两次：后写胜出、文件仍是合法 JSON、不留 `.tmp`。
