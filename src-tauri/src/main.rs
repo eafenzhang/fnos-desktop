@@ -113,6 +113,8 @@ fn main() {
             commands::set_config,
             commands::reload_main,
             commands::open_config_dir,
+            // 关于页「查看」合规件：只认 license / notice，路径由宿主解析（不接收路径）。
+            commands::open_compliance,
             // 关于页外链：走系统默认浏览器（capability 只授权 settings 窗，见
             // capabilities/default.json；build.rs 的 AppManifest::commands 也必须同步）
             commands::open_url,

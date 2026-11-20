@@ -3037,6 +3037,32 @@ pub fn open_config_dir() -> Result<(), String> {
     Ok(())
 }
 
+/// 打开随包的合规件（「关于」页两个路径旁的「查看」按钮）。
+///
+/// **不接收路径**：`kind` 只认 `license` / `notice` 两个值，实际文件由宿主按
+/// [`CompliancePaths`] 自己解析——设置页传不进任何路径，这条命令就不构成「任意文件打开器」。
+///
+/// 用 `notepad.exe` 而不是 explorer：这两份文件**没有扩展名**，explorer 会弹
+/// 「如何打开此文件」让用户自己选；notepad 是确定行为（它们本来就是纯文本）。
+#[tauri::command]
+pub fn open_compliance<R: Runtime>(app: AppHandle<R>, kind: String) -> Result<(), String> {
+    let resolved = CompliancePaths::resolve(&app);
+    let path = match kind.as_str() {
+        "license" => resolved.license,
+        "notice" => resolved.notice,
+        other => return Err(format!("未知的合规件：{other}")),
+    };
+    if !std::path::Path::new(&path).is_file() {
+        return Err(format!("合规件不存在：{path}"));
+    }
+    std::process::Command::new("notepad.exe")
+        .arg(&path)
+        .spawn()
+        .map_err(|e| format!("打开失败：{e}"))?;
+    flog!("[fnos] 已打开合规件：{path}");
+    Ok(())
+}
+
 /// 用**系统默认浏览器**打开外部链接（spec §10：关于页的上游仓库链接）。
 ///
 /// 为什么需要它（Review finding D）：关于页的 `<a>` 在既有架构里是死链——
@@ -4216,11 +4242,12 @@ mod tests {
     /// 这里把它固化成一个每次 `cargo test` 都会跑的机械锁。
     #[test]
     fn every_ipc_command_is_registered_in_all_four_places() {
-        const CMDS: [&str; 15] = [
+        const CMDS: [&str; 16] = [
             "get_config",
             "set_config",
             "reload_main",
             "open_config_dir",
+            "open_compliance",
             "open_url",
             "reset_config",
             "get_page_state",

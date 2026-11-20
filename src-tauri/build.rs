@@ -39,6 +39,8 @@ fn main() {
             "set_config",
             "reload_main",
             "open_config_dir",
+            // 关于页「查看」合规件（只认 license / notice，不接收路径）。
+            "open_compliance",
             "open_url",
             "reset_config",
             "get_page_state",

@@ -728,6 +728,17 @@ function bindActions() {
     });
   }
 
+  // 「关于」页的合规件「查看」：只传 kind（license / notice），路径由宿主解析
+  for (const el of doc.querySelectorAll('[data-compliance]')) {
+    el.addEventListener('click', async () => {
+      try {
+        await api.openCompliance(el.getAttribute('data-compliance'));
+      } catch (e) {
+        notice(`打开失败：${(e && e.message) || e}`, true);
+      }
+    });
+  }
+
   // 恢复默认：两次点击确认（不依赖原生 confirm——WebView2 里它会阻塞整条 UI 线程）
   const reset = doc.getElementById('resetAll');
   if (reset) {

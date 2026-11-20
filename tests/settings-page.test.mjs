@@ -100,7 +100,7 @@ test('阶段 → 文案 / 按钮状态', () => {
 });
 
 test('设置页 → Rust：命令在 main.rs / build.rs / capabilities 三处都齐', () => {
-  for (const cmd of ['get_update_state', 'start_update_check', 'install_update']) {
+  for (const cmd of ['get_update_state', 'start_update_check', 'install_update', 'open_compliance']) {
     assert.ok(RUST_MAIN.includes(`commands::${cmd}`), `main.rs 未注册 ${cmd}`);
     assert.ok(RUST_BUILD.includes(`"${cmd}"`), `build.rs 的命令清单缺 ${cmd}`);
     assert.ok(CAPS.includes(`"allow-${cmd.replace(/_/g, '-')}"`), `capabilities 未授权 ${cmd}`);
@@ -151,6 +151,9 @@ test('上游设置项已移植：每个配置键在本页都有控件', () => {
   for (const key of keys) {
     assert.ok(HTML.includes(`data-patch="${key}"`), `${key} 没有控件`);
   }
+  // 关于页：两份合规件都必须有「查看」按钮（kind 由宿主映射，命令不接收路径）
+  assert.ok(HTML.includes('data-compliance="license"') && HTML.includes('data-compliance="notice"'), '许可/来源声明必须有「查看」按钮');
+  assert.ok(PAGE.includes('openCompliance'), '设置页必须调用 openCompliance');
   // 白名单与壁纸走专用控件（不是 data-patch）
   assert.ok(HTML.includes('id="siteToggle"'), '「为当前站点注入」开关必须存在');
   assert.ok(HTML.includes('id="wallpaperPick"') && HTML.includes('id="wallpaperFile"'), '壁纸导入控件必须存在');

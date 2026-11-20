@@ -42,6 +42,14 @@ export function setConfig(patch) { return invoke('set_config', { patch }); }
 /** `needsReload` 为真时调用：Rust 侧销毁并按新载荷**重建**主窗口（§6.6 勘误）。 */
 export function reloadMain(url) { return invoke('reload_main', { url: url ?? null }); }
 export function openConfigDir() { return invoke('open_config_dir'); }
+/**
+ * 打开随包的合规件（「关于」页两个路径旁的「查看」）。
+ *
+ * `kind` 只认 `'license'` / `'notice'`：宿主自己解析文件位置，**命令不接收路径**——
+ * 它不是一个任意文件打开器。两份文件没有扩展名，宿主用 notepad 打开（explorer 会弹
+ * 「如何打开此文件」）。
+ */
+export function openCompliance(kind) { return invoke('open_compliance', { kind }); }
 export function resetConfig(scope) { return invoke('reset_config', { scope }); }
 /** 用系统默认浏览器打开外部链接（关于页的上游仓库）。Rust 侧只放行 http(s)。 */
 export function openUrl(url) { return invoke('open_url', { url }); }
